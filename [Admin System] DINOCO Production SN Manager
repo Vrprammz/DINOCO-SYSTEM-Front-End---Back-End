@@ -2,6 +2,20 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
  * ║  DB_ID: 1195                                                     ║
+ * ║  Version: V.0.47 (2026-05-08) — R9 Pattern 4: flag-aware cron    ║
+ * ║    helper. NEW dinoco_register_flag_aware_cron($hook, $interval, ║
+ * ║    $master_flag) wraps schedule + auto-unschedule on flag flip   ║
+ * ║    via update_option_<flag> action listener. Closes architectural║
+ * ║    gap where 43 wp_schedule_event hooks across DINOCO had NO     ║
+ * ║    cleanup — flags flipped OFF leaked cron firings forever.      ║
+ * ║    Applied to 4 highest-volume SN crons (low_pool_alert hourly + ║
+ * ║    audit_retention daily + notification_send 15min +             ║
+ * ║    marketplace_timeout 5min) gated by dinoco_sn_system_enabled.  ║
+ * ║    NEW dinoco_sn_reevaluate_flag_aware_crons() listener on       ║
+ * ║    update_option_dinoco_sn_system_enabled + add_option_*. When  ║
+ * ║    admin flips master flag 1→0, next admin_init pass auto-cleans ║
+ * ║    these 4 crons within minutes. Other 38 hooks unchanged —      ║
+ * ║    future rounds migrate per priority.                           ║
  * ║  Version: V.0.46 (2026-05-08) — R9 Pattern 1: 13 cron heartbeat   ║
  * ║    update_option calls now use autoload=false (3rd arg). Was:    ║
  * ║    autoload defaulted to true → bloated WP alloptions cache      ║
@@ -11161,6 +11175,121 @@ if ( ! function_exists( 'dinoco_sn_build_flex_for_notification' ) ) {
     }
 }
 
+/**
+ * R9 Pattern 4 — Flag-aware cron registration helper.
+ *
+ * Problem: 43 wp_schedule_event() hooks across DINOCO have NO unschedule
+ * mechanism. When feature flags flip OFF (e.g., dinoco_sn_system_enabled=0),
+ * crons keep firing forever — burning DB writes, LINE quota, and observability
+ * ingest budget. Only Q21 fraud_aggregate had defensive unschedule (V.0.40).
+ *
+ * Solution: Reusable wrapper that combines schedule-if-flag-on,
+ * unschedule-if-flag-off, AND auto-cleanup on flag flip via update_option
+ * action listener. Works alongside existing dinoco_register_cron() heartbeat
+ * (Round 28 pattern from Health Monitor) — does NOT replace it; both can be
+ * called for the same hook.
+ *
+ * Usage:
+ *   dinoco_register_flag_aware_cron(
+ *       'dinoco_sn_low_pool_alert_cron',
+ *       'hourly',
+ *       'dinoco_sn_system_enabled'
+ *   );
+ *
+ * Behaviour matrix:
+ *   flag enabled  + not scheduled → wp_schedule_event
+ *   flag enabled  + scheduled     → no-op
+ *   flag disabled + scheduled     → wp_unschedule_event (CLEANUP)
+ *   flag disabled + not scheduled → no-op
+ *   $master_flag === null         → always treat as enabled
+ *
+ * Pairs with dinoco_sn_reevaluate_crons() listener registered on
+ * update_option_dinoco_sn_system_enabled — when admin flips flag from 1 → 0,
+ * next admin_init pass auto-cleans the 4 wrapped crons within minutes.
+ *
+ * R9 Pattern 4 scope: applies to 4 SN crons (low_pool_alert, audit_retention,
+ * notification_send, marketplace_timeout) + 1 Push Governance retention cron.
+ * Other 38 hooks remain on legacy schedule-only pattern — future rounds will
+ * migrate per priority.
+ */
+if ( ! function_exists( 'dinoco_register_flag_aware_cron' ) ) {
+    function dinoco_register_flag_aware_cron( $hook, $interval, $master_flag = null ) {
+        if ( ! is_string( $hook ) || $hook === '' ) {
+            return false;
+        }
+        if ( ! is_string( $interval ) || $interval === '' ) {
+            return false;
+        }
+        // function_exists guard: WP scheduler may be unavailable in CLI/early boot
+        if ( ! function_exists( 'wp_next_scheduled' ) || ! function_exists( 'wp_schedule_event' ) ) {
+            return false;
+        }
+
+        $is_enabled = ( $master_flag === null )
+            ? true
+            : (bool) get_option( $master_flag, false );
+        $next = wp_next_scheduled( $hook );
+
+        if ( $is_enabled ) {
+            if ( ! $next ) {
+                wp_schedule_event( time() + 60, $interval, $hook );
+            }
+        } else {
+            // Defensive cleanup — only unschedule if actually scheduled
+            if ( $next ) {
+                wp_unschedule_event( $next, $hook );
+                // Belt & suspenders: clear ALL future occurrences in case multiple
+                // were registered (shouldn't happen, but cheap insurance)
+                wp_clear_scheduled_hook( $hook );
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'info', '[cron] flag-aware unschedule', array(
+                        'hook'        => $hook,
+                        'master_flag' => $master_flag,
+                        'reason'      => 'flag_disabled',
+                    ) );
+                }
+            }
+        }
+
+        return $is_enabled;
+    }
+}
+
+/**
+ * R9 Pattern 4 — Re-evaluate all SN flag-aware crons.
+ *
+ * Called by:
+ *   - update_option_dinoco_sn_system_enabled action (when admin flips flag)
+ *   - Initial init bootstrap (idempotent — already gated by wp_next_scheduled)
+ *
+ * Hook list synced with the inline call sites in the init block below.
+ * If you wire a new cron via dinoco_register_flag_aware_cron, ALSO add it to
+ * this list so flag-flip cleanup catches it.
+ */
+if ( ! function_exists( 'dinoco_sn_reevaluate_flag_aware_crons' ) ) {
+    function dinoco_sn_reevaluate_flag_aware_crons() {
+        if ( ! function_exists( 'wp_get_schedules' ) ) {
+            return;
+        }
+        $sched = wp_get_schedules();
+        $hooks = array(
+            'dinoco_sn_low_pool_alert_cron'    => 'hourly',
+            'dinoco_sn_audit_retention_cron'   => 'daily',
+            'dinoco_sn_notification_send_cron' => isset( $sched['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly',
+            'dinoco_sn_marketplace_timeout_cron' => isset( $sched['five_minutes'] ) ? 'five_minutes'
+                : ( isset( $sched['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly' ),
+        );
+        foreach ( $hooks as $hook => $interval ) {
+            dinoco_register_flag_aware_cron( $hook, $interval, 'dinoco_sn_system_enabled' );
+        }
+    }
+}
+
+// Auto-cleanup on flag flip — fires when admin toggles dinoco_sn_system_enabled
+add_action( 'update_option_dinoco_sn_system_enabled', 'dinoco_sn_reevaluate_flag_aware_crons', 10, 0 );
+// Also handle add_option (first-time set) — same callback
+add_action( 'add_option_dinoco_sn_system_enabled', 'dinoco_sn_reevaluate_flag_aware_crons', 10, 0 );
+
 // Cron registration via registry wrapper (Round 28 pattern with fallback)
 add_action( 'init', function() {
     // V.0.40 HIGH — cron stagger: each daily/15min job offsets by N minutes
@@ -11177,15 +11306,13 @@ add_action( 'init', function() {
     $base_offset = (int) strtotime( 'tomorrow 02:00' );
     if ( ! $base_offset ) $base_offset = time() + 60;
 
-    if ( ! wp_next_scheduled( 'dinoco_sn_low_pool_alert_cron' ) ) {
-        wp_schedule_event( time(), 'hourly', 'dinoco_sn_low_pool_alert_cron' );
-    }
-    if ( ! wp_next_scheduled( 'dinoco_sn_audit_retention_cron' ) ) {
-        // 03:30 to bracket low-traffic window + spread from other 02:* crons
-        $anchor = strtotime( 'tomorrow 03:30' );
-        if ( ! $anchor ) $anchor = $base_offset + 1800;
-        wp_schedule_event( $anchor, 'daily', 'dinoco_sn_audit_retention_cron' );
-    }
+    // R9 Pattern 4 — flag-aware: auto-unschedules when dinoco_sn_system_enabled=0
+    dinoco_register_flag_aware_cron( 'dinoco_sn_low_pool_alert_cron', 'hourly', 'dinoco_sn_system_enabled' );
+    // R9 Pattern 4 — audit_retention: flag-aware. Note: when scheduling fresh,
+    // helper uses time()+60 anchor (not 03:30 stagger) — first run will fire
+    // ~immediately after deploy, subsequent runs at +24h. Acceptable trade-off
+    // since audit_retention is chunked + idempotent + observability-bound.
+    dinoco_register_flag_aware_cron( 'dinoco_sn_audit_retention_cron', 'daily', 'dinoco_sn_system_enabled' );
     // V.0.43 R4 HIGH-3 — Pepper rotation quarterly (every 90 days). Cron fires
     // weekly + callback no-ops if last rotation < 90d ago (no native quarterly
     // WP recurrence). Rotation regenerates pepper option (autoload=false). Old
@@ -11209,11 +11336,12 @@ add_action( 'init', function() {
     if ( ! wp_next_scheduled( 'dinoco_sn_expiry_schedule_cron' ) ) {
         wp_schedule_event( $base_offset, 'daily', 'dinoco_sn_expiry_schedule_cron' );
     }
-    if ( ! wp_next_scheduled( 'dinoco_sn_notification_send_cron' ) ) {
-        // Use 'fifteen_minutes' if registered (B2B Snippet 1) or fallback hourly
-        $sched = wp_get_schedules();
-        $recurrence = isset( $sched['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly';
-        wp_schedule_event( time(), $recurrence, 'dinoco_sn_notification_send_cron' );
+    // R9 Pattern 4 — notification_send: flag-aware. Highest-volume after
+    // marketplace_timeout (15min cadence). Fires often → biggest cleanup win.
+    {
+        $sched_ns = wp_get_schedules();
+        $rec_ns   = isset( $sched_ns['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly';
+        dinoco_register_flag_aware_cron( 'dinoco_sn_notification_send_cron', $rec_ns, 'dinoco_sn_system_enabled' );
     }
     // Phase 3 W9 — F#4 Anniversary (+5min) + F#10 Review Request (+10min)
     if ( ! wp_next_scheduled( 'dinoco_sn_anniversary_schedule_cron' ) ) {
@@ -11242,10 +11370,13 @@ add_action( 'init', function() {
         wp_schedule_event( $weekly_anchor, 'weekly', 'dinoco_sn_demand_forecast_cron' );
     }
     // Phase 5 W16.3 V.0.32 — Marketplace pending payment timeout (every 5 min)
-    if ( ! wp_next_scheduled( 'dinoco_sn_marketplace_timeout_cron' ) ) {
-        $sched = isset( wp_get_schedules()['five_minutes'] ) ? 'five_minutes'
-            : ( isset( wp_get_schedules()['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly' );
-        wp_schedule_event( time(), $sched, 'dinoco_sn_marketplace_timeout_cron' );
+    // R9 Pattern 4 — marketplace_timeout: flag-aware. Fires MOST often (5min)
+    // → biggest cost savings when SN system flag flipped OFF.
+    {
+        $sched_mt = wp_get_schedules();
+        $rec_mt   = isset( $sched_mt['five_minutes'] ) ? 'five_minutes'
+            : ( isset( $sched_mt['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly' );
+        dinoco_register_flag_aware_cron( 'dinoco_sn_marketplace_timeout_cron', $rec_mt, 'dinoco_sn_system_enabled' );
     }
     // V.0.39 PERF — Pool stats pre-compute (every 15 min, fallback hourly)
     if ( ! wp_next_scheduled( 'dinoco_sn_pool_stats_recompute_cron' ) ) {

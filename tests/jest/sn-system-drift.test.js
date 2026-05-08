@@ -5246,8 +5246,16 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
 
         test('wp_schedule_event scheduling block', () => {
             const code = readManager();
-            expect(code).toMatch(/wp_next_scheduled\(\s*'dinoco_sn_marketplace_timeout_cron'/);
-            expect(code).toMatch(/wp_schedule_event\(\s*time\(\),\s*\$sched,\s*'dinoco_sn_marketplace_timeout_cron'/);
+            // R9 P4 refactor: marketplace_timeout_cron now wired via
+            // `dinoco_register_flag_aware_cron()` helper which auto-schedules
+            // when master flag dinoco_sn_system_enabled is on AND auto-
+            // unschedules when flag flips off (orphan cron prevention).
+            // Either pattern is acceptable post-R9.
+            const hasFlagAwarePattern = /dinoco_register_flag_aware_cron\(\s*'dinoco_sn_marketplace_timeout_cron'/.test(code);
+            const hasLegacyPattern =
+                /wp_next_scheduled\(\s*'dinoco_sn_marketplace_timeout_cron'/.test(code) &&
+                /wp_schedule_event\([^)]+'dinoco_sn_marketplace_timeout_cron'/.test(code);
+            expect(hasFlagAwarePattern || hasLegacyPattern).toBe(true);
         });
 
         test('add_action fallback when dinoco_register_cron missing', () => {
