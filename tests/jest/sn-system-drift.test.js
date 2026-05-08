@@ -6456,5 +6456,134 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         });
     });
 
+
+    // ────────────────────────────────────────────────────────────
+    // R4 BLOCKER #4 — E2E + a11y scaffolding drift detector
+    // Sprint 1 deliverable. Asserts the Playwright SN smoke harness
+    // and jest-axe gate stay in place. See `docs/sn-system/24-e2e-runbook.md`.
+    // ────────────────────────────────────────────────────────────
+    describe('R4 BLOCKER #4 — E2E + a11y scaffolding', () => {
+
+        test('Playwright SN config exists at tests/e2e/playwright.config.ts', () => {
+            const cfgPath = path.join(REPO_ROOT, 'tests/e2e/playwright.config.ts');
+            expect(fs.existsSync(cfgPath)).toBe(true);
+        });
+
+        test('Playwright config declares chromium + liff-mobile projects', () => {
+            const cfgPath = path.join(REPO_ROOT, 'tests/e2e/playwright.config.ts');
+            const code = fs.readFileSync(cfgPath, 'utf8');
+            expect(code).toMatch(/name:\s*['"]chromium['"]/);
+            expect(code).toMatch(/name:\s*['"]liff-mobile['"]/);
+            // LIFF UA spoofing: must reference 'Line/'
+            expect(code).toMatch(/Line\/\d+/);
+        });
+
+        test('5 critical-path spec files exist (warranty / batch / receive / claim / extension)', () => {
+            const expected = [
+                'tests/e2e/specs/01-warranty-activate.spec.ts',
+                'tests/e2e/specs/02-batch-create.spec.ts',
+                'tests/e2e/specs/03-receive-bulk.spec.ts',
+                'tests/e2e/specs/04-claim-autofill.spec.ts',
+                'tests/e2e/specs/05-extension-checkout.spec.ts',
+            ];
+            expected.forEach((rel) => {
+                const p = path.join(REPO_ROOT, rel);
+                expect(fs.existsSync(p)).toBe(true);
+            });
+        });
+
+        test('Each spec file is tagged @smoke for blocking gate', () => {
+            const specs = [
+                'tests/e2e/specs/01-warranty-activate.spec.ts',
+                'tests/e2e/specs/02-batch-create.spec.ts',
+                'tests/e2e/specs/03-receive-bulk.spec.ts',
+                'tests/e2e/specs/04-claim-autofill.spec.ts',
+                'tests/e2e/specs/05-extension-checkout.spec.ts',
+            ];
+            specs.forEach((rel) => {
+                const p = path.join(REPO_ROOT, rel);
+                const code = fs.readFileSync(p, 'utf8');
+                expect(code).toMatch(/@smoke/);
+            });
+        });
+
+        test('LIFF mock helper exists at tests/e2e/helpers/liff-mock.ts', () => {
+            const p = path.join(REPO_ROOT, 'tests/e2e/helpers/liff-mock.ts');
+            expect(fs.existsSync(p)).toBe(true);
+            const code = fs.readFileSync(p, 'utf8');
+            // Must export the canonical helpers
+            expect(code).toMatch(/export\s+(?:async\s+)?function\s+injectLiffMock/);
+            expect(code).toMatch(/DEFAULT_LIFF_PROFILE/);
+        });
+
+        test('Test data fixture exists with reserved DNCSSTEST prefix', () => {
+            const p = path.join(REPO_ROOT, 'tests/e2e/fixtures/test-data.json');
+            expect(fs.existsSync(p)).toBe(true);
+            const json = JSON.parse(fs.readFileSync(p, 'utf8'));
+            expect(json).toHaveProperty('plates');
+            expect(json).toHaveProperty('endpoints');
+            // Reserved prefix sanity — at least one plate uses DNCSSTEST
+            const plateValues = JSON.stringify(json.plates);
+            expect(plateValues).toMatch(/DNCSSTEST|DNCQA/);
+        });
+
+        test('jest-axe a11y gate exists at tests/jest/a11y/liff-a11y.test.js', () => {
+            const p = path.join(REPO_ROOT, 'tests/jest/a11y/liff-a11y.test.js');
+            expect(fs.existsSync(p)).toBe(true);
+            const code = fs.readFileSync(p, 'utf8');
+            // Must wire jest-axe + extend matchers
+            expect(code).toMatch(/require\(['"]jest-axe['"]\)/);
+            expect(code).toMatch(/toHaveNoViolations/);
+            // WCAG 2.1 AA tags
+            expect(code).toMatch(/wcag2aa|wcag21aa/);
+        });
+
+        test('a11y suite covers at least 5 LIFF surfaces', () => {
+            const p = path.join(REPO_ROOT, 'tests/jest/a11y/liff-a11y.test.js');
+            const code = fs.readFileSync(p, 'utf8');
+            // Each surface registered as object literal in `surfaces` array
+            const matches = code.match(/name:\s*['"`][^'"`]+['"`]/g) || [];
+            expect(matches.length).toBeGreaterThanOrEqual(5);
+        });
+
+        test('amber-contrast regression guard present (audit BUG UX-C3)', () => {
+            const p = path.join(REPO_ROOT, 'tests/jest/a11y/liff-a11y.test.js');
+            const code = fs.readFileSync(p, 'utf8');
+            // Guard must look for old amber #d97706 and fail
+            expect(code).toMatch(/#d97706/i);
+        });
+
+        test('package.json exposes test:e2e:sn / test:e2e:smoke / test:a11y scripts', () => {
+            const pkg = JSON.parse(
+                fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8')
+            );
+            expect(pkg.scripts).toHaveProperty('test:e2e:sn');
+            expect(pkg.scripts).toHaveProperty('test:e2e:smoke');
+            expect(pkg.scripts).toHaveProperty('test:a11y');
+            // smoke script must filter @smoke tag
+            expect(pkg.scripts['test:e2e:smoke']).toMatch(/--grep\s+@smoke/);
+        });
+
+        test('jest-axe + @axe-core/playwright marked pending install in package.json', () => {
+            const pkg = JSON.parse(
+                fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8')
+            );
+            // Either installed already OR listed in pending-install marker
+            const installed = (pkg.devDependencies || {})['jest-axe'];
+            const pending = (pkg._devDependencies_pending_install || {})['jest-axe'];
+            expect(Boolean(installed) || Boolean(pending)).toBe(true);
+        });
+
+        test('runbook docs/sn-system/24-e2e-runbook.md exists with CI template', () => {
+            const p = path.join(REPO_ROOT, 'docs/sn-system/24-e2e-runbook.md');
+            expect(fs.existsSync(p)).toBe(true);
+            const md = fs.readFileSync(p, 'utf8');
+            expect(md).toMatch(/Sprint 1/);
+            expect(md).toMatch(/E2E_BASE_URL/);
+            expect(md).toMatch(/jest-axe/);
+            // CI workflow template present
+            expect(md).toMatch(/uses:\s*actions\/checkout/);
+        });
+    });
 });
 

@@ -2,6 +2,53 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
  * ║  DB_ID: 1195                                                     ║
+ * ║  Version: V.0.45 (2026-05-07) — R4 HIGH-3 audit IP anonymization: ║
+ * ║   • Replaces V.0.40 last-octet zero (a.b.c.0 — reversible at /24)║
+ * ║     with SHA256+pepper anonymization (PDPA §17 minimization).    ║
+ * ║   • NEW wp_option `dinoco_sn_audit_pepper` (autoload=false, 32   ║
+ * ║     chars, auto-generates first run). Hashed rows marked         ║
+ * ║     `sha256:` prefix → idempotent (NOT LIKE 'sha256:%' guard).   ║
+ * ║   • NEW cron `dinoco_sn_audit_pepper_rotate_cron` weekly fire +  ║
+ * ║     90d gate inside callback (quarterly rotation). Old hashes    ║
+ * ║     remain valid (additive, no re-hash sweep).                   ║
+ * ║   • NEW callback `dinoco_sn_run_audit_pepper_rotate` defensive   ║
+ * ║     try/catch + audit_log entry on rotate (non-PII).             ║
+ * ║   • Pairs with REST API V.0.32 (SWR + priority 5) + sn-webhook   ║
+ * ║     V.1.1 (Redis RL) + MCP Bridge V.3.1 (priority 6).            ║
+ * ║  Version: V.0.44 (2026-05-07) — R4 BLOCKER #2 (database P0-3):   ║
+ * ║                                  schema migration WP-CLI command.║
+ * ║   • New scripts/sn-system/migrate-schema.php loaded on WP-CLI    ║
+ * ║     boot only (defensive defined('WP_CLI') gate). Provides       ║
+ * ║     `wp dinoco-sn migrate-schema --version=1.2|1.3 --dry-run|    ║
+ * ║     --execute [--online] [--skip-snapshot] [--force]`.           ║
+ * ║   • Pre-flight checks (row count + UNIQUE collision detect +     ║
+ * ║     buffer pool size + INSTANT ALTER capability).                ║
+ * ║   • mysqldump snapshot to wp-content/dinoco-sn-snapshots/        ║
+ * ║     before in-place ALTER (skip via --skip-snapshot for UAT).    ║
+ * ║   • pt-online-schema-change wrapper for production zero-downtime ║
+ * ║     migration. Falls back to direct ALTER when pt-osc absent.    ║
+ * ║   • Idempotent re-run — duplicate-key/already-exists errors are  ║
+ * ║     classified as skippable (data corruption + lock timeouts     ║
+ * ║     still HALT). Pairs with rollback-schema.sql for recovery.    ║
+ * ║   • Pairs with docs/sn-system/25-schema-migration-runbook.md     ║
+ * ║     (DBA-facing maintenance window procedure 02:00-04:00 ICT).   ║
+ * ║   • Manager schema version constant unchanged (still 1.3) —      ║
+ * ║     CLI is the OUT-OF-BAND migration path. Web auto-installer    ║
+ * ║     V.0.40 100K-row block remains in place + emits notice that   ║
+ * ║     points to this CLI command.                                  ║
+ * ║  Version: V.0.43 (2026-05-07) — R4 BLOCKER #1 (security HIGH-2): ║
+ * ║                                  HMAC V2 schema 1.2 → 1.3.       ║
+ * ║   • Pairs with REST API V.0.32 — V2 batch-bucket binding closes  ║
+ * ║     the 24h replay window (V1) vs 60-90d print-to-activate gap.  ║
+ * ║   • Schema 1.3 adds sn_pool.sig_bucket SMALLINT UNSIGNED NULL    ║
+ * ║     + idx_sig_bucket(batch_id, sig_bucket) for verify path.      ║
+ * ║   • dbDelta CREATE TABLE patched — new installs land V.0.43      ║
+ * ║     shape directly. Existing tables ALTER via dedicated helper   ║
+ * ║     dinoco_sn_alter_pool_sig_bucket_columns() (idempotent precheck).║
+ * ║   • build_warranty_url() unchanged — call dinoco_sn_hmac_sign()  ║
+ * ║     which now dispatches V2 (preferred) → V1 (legacy fallback).  ║
+ * ║   • Constant DINOCO_SN_SCHEMA_VERSION 1.2 → 1.3 triggers lazy    ║
+ * ║     install on next admin_init (existing 100K-row guard intact). ║
  * ║  Version: V.0.42 (2026-05-07) — R4 BLOCKER #3 audit only:        ║
  * ║   • No SN-mutation GET_LOCK calls in this snippet (schema_install║
  * ║     GET_LOCK 30s at line 1174 is OUT-OF-SCOPE — long-running     ║
@@ -151,7 +198,11 @@ if ( ! defined( 'DINOCO_SN_SCHEMA_VERSION' ) ) {
     //   • PERF 3 covering indexes on sn_pool + sn_audit (precondition checked
     //     via INFORMATION_SCHEMA, so mid-version sites are idempotent)
     // Phase 5 W17.2 (V.0.33): 1.1 added refund columns on extensions table.
-    define( 'DINOCO_SN_SCHEMA_VERSION', '1.2' );
+    // V.0.43 (2026-05-07): bumped to 1.3 to trigger:
+    //   • R4 BLOCKER #1 sig_bucket column on sn_pool (HMAC V2 batch-bucket
+    //     binding). REST API V.0.32 sign/verify dispatch.
+    //   • New idx_sig_bucket (batch_id, sig_bucket) covers V2 verify path.
+    define( 'DINOCO_SN_SCHEMA_VERSION', '1.3' );
 }
 
 // V.0.39 L1 FIX — single canonical nonce action for system toggle.
@@ -1298,9 +1349,19 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
         // ═══════════════════════════════════════════════════════
         // TABLE 2: sn_pool — Hot path 12 columns
         // ═══════════════════════════════════════════════════════
+        // V.0.43 R4 BLOCKER #1 — sig_bucket SMALLINT UNSIGNED NULL is the
+        // V2 HMAC batch-bucket snapshot (epoch-day at QR generation). Bound
+        // to plate lifetime so QRs printed today stay valid 60-90d later.
+        // SMALLINT max 65,535 epoch-days = ~179 years (plenty until 2149+).
+        // idx_sig_bucket (batch_id, sig_bucket) covers REST API V.0.32 verify
+        // path lookup pattern WHERE sn = ? (PK, fast) + columns batch_id +
+        // sig_bucket fetched directly from PK row — no separate index needed
+        // for that, but the named idx provides a secondary entry for batch-wide
+        // bulk re-sign jobs (e.g. admin secret rotation).
         $sql_pool = "CREATE TABLE {$prefix}dinoco_sn_pool (
             sn VARCHAR(40) NOT NULL,
             batch_id BIGINT UNSIGNED NOT NULL,
+            sig_bucket SMALLINT UNSIGNED DEFAULT NULL,
             seq_index INT UNSIGNED NOT NULL DEFAULT 0,
             linked_sku VARCHAR(50) DEFAULT NULL,
             status VARCHAR(32) NOT NULL DEFAULT 'reserved',
@@ -1315,6 +1376,7 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
             PRIMARY KEY  (sn),
             KEY idx_batch (batch_id),
             KEY idx_batch_seq (batch_id, seq_index),
+            KEY idx_sig_bucket (batch_id, sig_bucket),
             KEY idx_status_user (registered_user_id, status),
             KEY idx_linked_sku_status (linked_sku, status),
             KEY idx_lookup (linked_sku, status, registered_at),
@@ -1624,6 +1686,13 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
         // Phase 5 W17.2 (V.0.33): ALTER sn_warranty_extensions — refund columns
         dinoco_sn_alter_extensions_refund_columns();
 
+        // V.0.43 R4 BLOCKER #1 — sig_bucket column ALTER for HMAC V2.
+        // dbDelta may not always pick up the new column on existing tables
+        // when the trailing index list also changes — explicit precheck +
+        // ADD COLUMN gives us idempotent guarantees + matches the pattern
+        // used for warranty-extension refund columns + perf indexes.
+        dinoco_sn_alter_pool_sig_bucket_columns();
+
         // V.0.39 PERF: 3 covering indexes (idempotent INFORMATION_SCHEMA precheck)
         dinoco_sn_install_perf_indexes();
 
@@ -1840,6 +1909,73 @@ if ( ! function_exists( 'dinoco_sn_alter_extensions_refund_columns' ) ) {
         ) );
         if ( ! $idx_exists ) {
             $wpdb->query( "ALTER TABLE {$tbl} ADD KEY idx_refund_status (refunded_at)" );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_alter_pool_sig_bucket_columns' ) ) {
+    /**
+     * V.0.43 R4 BLOCKER #1 — ADD sn_pool.sig_bucket + idx_sig_bucket on
+     * existing installs. Idempotent INFORMATION_SCHEMA precheck per item.
+     *
+     * Pairs with REST API V.0.32 HMAC V2 (batch-bucket binding). New batches
+     * populate sig_bucket on INSERT; backfill of existing batches deferred
+     * to maintenance script (out of scope for this fix — Phase 1 only has
+     * pilot data so the legacy V1-fallback in verify() is sufficient).
+     *
+     * Caller (schema_install) holds GET_LOCK so safe vs concurrent installs.
+     */
+    function dinoco_sn_alter_pool_sig_bucket_columns() {
+        global $wpdb;
+        $prefix = $wpdb->prefix;
+        $tbl_pool = $prefix . 'dinoco_sn_pool';
+
+        // Skip if table doesn't exist yet (first-install path goes through dbDelta)
+        $tbl_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s",
+            DB_NAME, $tbl_pool
+        ) );
+        if ( ! $tbl_exists ) return;
+
+        // 1) ADD COLUMN sig_bucket if missing
+        $col_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+            DB_NAME, $tbl_pool, 'sig_bucket'
+        ) );
+        if ( ! $col_exists ) {
+            // Position after batch_id per spec ("AFTER batch_id") — keeps
+            // hot-path columns clustered in the table physical order.
+            $sql_add = "ALTER TABLE {$tbl_pool} ADD COLUMN sig_bucket SMALLINT UNSIGNED DEFAULT NULL AFTER batch_id";
+            $ok = $wpdb->query( $sql_add );
+            if ( $ok === false && function_exists( 'b2b_log' ) ) {
+                b2b_log( '[SN-Schema] ALTER ADD sig_bucket failed: ' . $wpdb->last_error );
+            }
+        }
+
+        // 2) ADD KEY idx_sig_bucket if missing
+        $idx_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.statistics
+             WHERE table_schema = %s AND table_name = %s AND index_name = %s",
+            DB_NAME, $tbl_pool, 'idx_sig_bucket'
+        ) );
+        if ( ! $idx_exists ) {
+            // Re-check column actually exists post-ADD (in case ALTER above
+            // failed) before attempting index creation — failing index ADD
+            // pollutes wpdb->last_error and noisy logs.
+            $col_now = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.columns
+                 WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+                DB_NAME, $tbl_pool, 'sig_bucket'
+            ) );
+            if ( $col_now ) {
+                $sql_idx = "ALTER TABLE {$tbl_pool} ADD KEY idx_sig_bucket (batch_id, sig_bucket)";
+                $ok = $wpdb->query( $sql_idx );
+                if ( $ok === false && function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[SN-Schema] ALTER ADD KEY idx_sig_bucket failed: ' . $wpdb->last_error );
+                }
+            }
         }
     }
 }
@@ -8451,25 +8587,45 @@ if ( ! function_exists( 'dinoco_sn_run_audit_retention' ) ) {
                 usleep( 50000 ); // 50ms gap to avoid hammering DB
             }
 
-            // V.0.40 HIGH — anonymize ip_address last octet for rows older than
-            // 90d (PDPA §39 minimization). UPDATE chunked 500/iter × 10 iter cap.
-            // Pattern handles IPv4 a.b.c.d → a.b.c.0, IPv6 keeps first 4 hextets
-            // and zeroes the rest. Skips rows where ip_address is already null /
-            // empty / already-anonymized (ends with .0).
+            // V.0.43 R4 HIGH-3 — Replaces V.0.40 last-octet zero (a.b.c.0) with
+            // SHA256+pepper anonymization for stronger PDPA §17 minimization.
+            // Last-octet zero is reversible at /24 granularity (256 candidates
+            // per row — feasible to correlate with login traffic). SHA256+pepper
+            // gives k-anonymity collision space ≈ 2^64 (16-hex truncation) and
+            // is unlinkable to original IP without compromising both DB+pepper.
+            //
+            // Pepper stored in wp_option `dinoco_sn_audit_pepper` (autoload=false
+            // — keeps secret out of bootstrap query). Auto-generates on first
+            // run (32 chars alnum + special). Quarterly rotation via separate
+            // cron `dinoco_sn_audit_pepper_rotate_cron`.
+            //
+            // Idempotent: hashed rows marked with `sha256:` prefix → skipped on
+            // subsequent runs via NOT LIKE 'sha256:%%' guard. Pepper rotation
+            // does NOT re-hash old rows (additive — old hashes verified with
+            // historical pepper if needed; new rows use current pepper).
+            $pepper = (string) get_option( 'dinoco_sn_audit_pepper', '' );
+            if ( $pepper === '' ) {
+                $pepper = wp_generate_password( 32, true, true );
+                // autoload=false — secret should not be in every page-load query
+                update_option( 'dinoco_sn_audit_pepper', $pepper, false );
+            }
+
             for ( $j = 0; $j < 10; $j++ ) {
-                // IPv4 anonymization (most common in TH market) — use CONCAT
-                // since MySQL `||` is logical OR (not string concat).
-                $ipv4_upd = $wpdb->query( $wpdb->prepare(
+                // SHA2(CONCAT(ip, pepper), 256) → SUBSTRING 16 hex chars
+                // (64-bit truncation — fits VARCHAR(45) col with 'sha256:'
+                // prefix at 23 chars total). Skip already-hashed rows.
+                $upd = $wpdb->query( $wpdb->prepare(
                     "UPDATE {$tbl}
-                     SET ip_address = CONCAT(SUBSTRING_INDEX(ip_address, '.', 3), '.0')
+                     SET ip_address = CONCAT('sha256:', SUBSTRING(SHA2(CONCAT(ip_address, %s), 256), 1, 16))
                      WHERE created_at < %s
                        AND ip_address IS NOT NULL
-                       AND ip_address LIKE '%%.%%.%%.%%'
-                       AND ip_address NOT LIKE '%%.0'
+                       AND ip_address NOT LIKE 'sha256:%%'
+                       AND ip_address != ''
                      LIMIT 500",
+                    $pepper,
                     $cutoff_90d
                 ) );
-                $batch_anon = (int) $ipv4_upd;
+                $batch_anon = (int) $upd;
                 $anonymized += $batch_anon;
                 if ( $batch_anon === 0 ) break;
                 usleep( 50000 );
@@ -8487,6 +8643,63 @@ if ( ! function_exists( 'dinoco_sn_run_audit_retention' ) ) {
         }
 
         update_option( 'dinoco_cron_sn_audit_retention_last_run', current_time( 'mysql' ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_run_audit_pepper_rotate' ) ) {
+    /**
+     * V.0.43 R4 HIGH-3 — Pepper rotation cron (quarterly).
+     *
+     * Cron fires weekly but callback no-ops if last rotation < 90d ago. WP
+     * has no native quarterly recurrence so this gating pattern is the
+     * recommended approach.
+     *
+     * Rotation regenerates `dinoco_sn_audit_pepper` (autoload=false). Old
+     * hashes remain valid by design — audit retention only ANONYMIZES
+     * (one-way hash, no verification flow). Pepper compromise mitigation:
+     * rotation limits exposure window. New rows hash with new pepper; old
+     * hashes don't need re-computation (additive, k-anonymity unchanged).
+     *
+     * Defensive: never throws, always non-destructive.
+     */
+    function dinoco_sn_run_audit_pepper_rotate() {
+        try {
+            $last_rotated = (int) get_option( 'dinoco_sn_audit_pepper_rotated_at', 0 );
+            $now = time();
+            // 90 days = 7,776,000 seconds. Skip if rotated recently.
+            if ( $last_rotated > 0 && ( $now - $last_rotated ) < 90 * 86400 ) {
+                update_option( 'dinoco_cron_sn_audit_pepper_rotate_last_run',
+                    current_time( 'mysql' ), false );
+                return;
+            }
+
+            $new_pepper = wp_generate_password( 32, true, true );
+            update_option( 'dinoco_sn_audit_pepper', $new_pepper, false );
+            update_option( 'dinoco_sn_audit_pepper_rotated_at', $now, false );
+
+            // Audit log entry — non-PII (no pepper value, just timestamp).
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                dinoco_sn_audit_log(
+                    null,
+                    'audit_pepper_rotated',
+                    null,
+                    null,
+                    array( 'rotated_at' => $now, 'reason' => 'quarterly' ),
+                    0,
+                    null,
+                    'Quarterly audit IP-pepper rotation',
+                    '',
+                    true
+                );
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_audit_pepper_rotate' ) );
+            }
+        }
+
+        update_option( 'dinoco_cron_sn_audit_pepper_rotate_last_run',
+            current_time( 'mysql' ), false );
     }
 }
 
@@ -10968,6 +11181,15 @@ add_action( 'init', function() {
         if ( ! $anchor ) $anchor = $base_offset + 1800;
         wp_schedule_event( $anchor, 'daily', 'dinoco_sn_audit_retention_cron' );
     }
+    // V.0.43 R4 HIGH-3 — Pepper rotation quarterly (every 90 days). Cron fires
+    // weekly + callback no-ops if last rotation < 90d ago (no native quarterly
+    // WP recurrence). Rotation regenerates pepper option (autoload=false). Old
+    // hashes remain valid by design — additive only, no re-hash sweep.
+    if ( ! wp_next_scheduled( 'dinoco_sn_audit_pepper_rotate_cron' ) ) {
+        $rotate_anchor = strtotime( 'tomorrow 03:55' );
+        if ( ! $rotate_anchor ) $rotate_anchor = $base_offset + 6900;
+        wp_schedule_event( $rotate_anchor, 'weekly', 'dinoco_sn_audit_pepper_rotate_cron' );
+    }
     if ( ! wp_next_scheduled( 'dinoco_sn_batch_reconcile_cron' ) ) {
         wp_schedule_event( time(), 'weekly', 'dinoco_sn_batch_reconcile_cron' );
     }
@@ -11029,6 +11251,8 @@ add_action( 'init', function() {
     if ( function_exists( 'dinoco_register_cron' ) ) {
         dinoco_register_cron( 'dinoco_sn_low_pool_alert_cron', 'hourly', 'dinoco_sn_run_low_pool_alert' );
         dinoco_register_cron( 'dinoco_sn_audit_retention_cron', 'daily', 'dinoco_sn_run_audit_retention' );
+        // V.0.43 R4 HIGH-3 — Pepper rotation cron (quarterly, gated 90d in callback)
+        dinoco_register_cron( 'dinoco_sn_audit_pepper_rotate_cron', 'weekly', 'dinoco_sn_run_audit_pepper_rotate' );
         dinoco_register_cron( 'dinoco_sn_batch_reconcile_cron', 'weekly', 'dinoco_sn_run_batch_reconcile' );
         dinoco_register_cron( 'dinoco_sn_orphan_claim_scan_cron', 'daily', 'dinoco_sn_run_orphan_claim_scan' );
         dinoco_register_cron( 'dinoco_sn_expiry_schedule_cron', 'daily', 'dinoco_sn_run_expiry_schedule' );
@@ -11056,6 +11280,10 @@ add_action( 'init', function() {
         }
         if ( ! has_action( 'dinoco_sn_audit_retention_cron', 'dinoco_sn_run_audit_retention' ) ) {
             add_action( 'dinoco_sn_audit_retention_cron', 'dinoco_sn_run_audit_retention' );
+        }
+        // V.0.43 R4 HIGH-3 — Pepper rotation fallback hook
+        if ( ! has_action( 'dinoco_sn_audit_pepper_rotate_cron', 'dinoco_sn_run_audit_pepper_rotate' ) ) {
+            add_action( 'dinoco_sn_audit_pepper_rotate_cron', 'dinoco_sn_run_audit_pepper_rotate' );
         }
         if ( ! has_action( 'dinoco_sn_batch_reconcile_cron', 'dinoco_sn_run_batch_reconcile' ) ) {
             add_action( 'dinoco_sn_batch_reconcile_cron', 'dinoco_sn_run_batch_reconcile' );
@@ -11150,4 +11378,39 @@ if ( ! function_exists( 'dinoco_sn_run_pool_stats_recompute' ) ) {
             }
         }
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * V.0.44 — Schema Migration WP-CLI Command (R4 BLOCKER #2 / database P0-3)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Loads scripts/sn-system/migrate-schema.php under WP-CLI runtime ONLY.
+ * Web-context request never touches this — admin notice (V.0.40) directs
+ * admins to run the CLI command in a maintenance window 02:00-04:00 ICT.
+ *
+ * Defensive layers:
+ *   - defined( 'WP_CLI' ) && WP_CLI gate prevents accidental web-fpm load
+ *   - file_exists check makes it a no-op when scripts/sn-system/ is absent
+ *     (e.g. partial sync where snippet synced before scripts/ pulled)
+ *   - The script itself class_exists-guards Dinoco_SN_Migrate_Schema_CLI
+ *
+ * Pairs with:
+ *   - docs/sn-system/25-schema-migration-runbook.md (DBA procedure)
+ *   - scripts/sn-system/rollback-schema.sql (recovery DDL)
+ *   - tests/helpers/SnSchemaMigrationCliTest.php (REG-102, 29 cases / 45 asserts)
+ */
+if ( defined( 'WP_CLI' ) && WP_CLI ) {
+    // Try a few common locations relative to ABSPATH (mirrors b2f-phase2-backfill.php pattern).
+    $dinoco_sn_cli_candidates = array(
+        ABSPATH . 'scripts/sn-system/migrate-schema.php',
+        dirname( ABSPATH ) . '/scripts/sn-system/migrate-schema.php',
+        WP_CONTENT_DIR . '/../scripts/sn-system/migrate-schema.php',
+    );
+    foreach ( $dinoco_sn_cli_candidates as $dinoco_sn_cli_path ) {
+        if ( file_exists( $dinoco_sn_cli_path ) ) {
+            require_once $dinoco_sn_cli_path;
+            break;
+        }
+    }
+    unset( $dinoco_sn_cli_path, $dinoco_sn_cli_candidates );
 }

@@ -2,6 +2,46 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.32 (2026-05-07) — R4 BLOCKER #1 (security HIGH-2): ║
+ * ║                                  HMAC V2 batch-bucket signing.  ║
+ * ║   • Threat: V1 epoch-day bucket has 24h replay window vs        ║
+ * ║     real print-to-activate gap of 60-90d → current verify       ║
+ * ║     would fail 100% of customer activations after 48h.          ║
+ * ║   • Fix: bind sig payload to sn_pool.sig_bucket (per-batch       ║
+ * ║     stored snapshot) instead of floor(time()/86400) wall clock. ║
+ * ║     Sig now valid for full plate lifetime (years), not 48h.     ║
+ * ║   • Schema 1.2 → 1.3: sn_pool +sig_bucket SMALLINT UNSIGNED      ║
+ * ║     NULL + idx_sig_bucket(batch_id, sig_bucket). Manager V.0.43.║
+ * ║   • V2 helpers added (sign_v2/verify_v2/get_sig_bucket) — V1     ║
+ * ║     kept for backward compat (legacy plates pre-V.0.32 with no  ║
+ * ║     sig_bucket fall through V1 verify with documented risk).    ║
+ * ║   • Batch create populates sig_bucket once after INSERT chunk    ║
+ * ║     loop — single UPDATE per batch (cheap, runs inside same TX).║
+ * ║   • CSV + QR PDF emit V2 sigs via batch lookup. Backward compat: ║
+ * ║     legacy plates with sig_bucket=NULL emit V1 sigs (24h bucket).║
+ * ║   • dinoco_sn_hmac_verify() dispatcher: prefer V2 → fallback V1. ║
+ * ║     Caller signature unchanged — all 7 verify call-sites untouched.║
+ * ║  Version: V.0.32 (2026-05-07) — R4 remaining HIGH findings fix: ║
+ * ║   • R4 HIGH (fullstack/api/db) — Hook priority drift: REST API  ║
+ * ║     cache invalidate listener `dinoco_sn_invalidate_lookup_caches`║
+ * ║     priority 10 → 5 (canonical chain documented inline + CLAUDE).║
+ * ║   • R4 MED (api) — 207 Multi-Status empty-input edge: defensive  ║
+ * ║     guard returns 400 empty_input when classification yields    ║
+ * ║     zero success + zero skips (race condition vs concurrent     ║
+ * ║     voids — prevents misleading 200 OK with empty results).     ║
+ * ║   • R4 MED (api) — 201 Created Location header: already in V.0.29║
+ * ║     (no-op annotated).                                          ║
+ * ║   • R4 PERF HIGH-1 — Stale-While-Revalidate (SWR) for public    ║
+ * ║     /lookup. Burst 100 unique SNs (5-10s tail) → fresh < 60s    ║
+ * ║     cached, 60-300s stale window returns cache immediately +    ║
+ * ║     async refresh via NEW `dinoco_sn_refresh_lookup_cache` cron ║
+ * ║     callback (`wp_schedule_single_event`). Envelope shape       ║
+ * ║     `{data, cached_at}` backward-compat with legacy raw cache.  ║
+ * ║     Cache invalidator unschedules pending refresh to avoid race.║
+ * ║     X-Cache-Status header (fresh/stale-while-revalidate/legacy/ ║
+ * ║     miss) for observability.                                    ║
+ * ║   • Pairs with Manager V.0.43 (audit IP SHA256+pepper) and      ║
+ * ║     MCP Bridge V.3.1 (priority 6) and sn-webhook V.1.1 (Redis). ║
  * ║  Version: V.0.31 (2026-05-07) — R4 BLOCKER #3 (fullstack #1):    ║
  * ║                                  GET_LOCK timeout 5s → 15s.      ║
  * ║   • Tech-lead R4 verdict: "concurrent activate vs admin swap     ║
@@ -275,11 +315,17 @@ if ( ! function_exists( 'dinoco_sn_hmac_sign' ) ) {
     /**
      * Sign an S/N for QR/URL anti-enumeration (CRIT-2).
      *
-     * V.0.29 — 24-char base32 (120-bit entropy, was 16-char/80-bit). Payload
-     * includes epoch-day bucket so signatures auto-expire in 24h (with a
-     * 24h replay window via current+previous bucket accept on verify).
+     * V.0.32 (R4 BLOCKER #1) — version-aware dispatcher:
+     *   1. Try V2 (batch-bucket binding) by looking up sig_bucket from sn_pool
+     *      → returns 24-char V2 sig. Valid for plate lifetime (no time expiry).
+     *   2. Fallback V1 (epoch-day bucket) when sn_pool row missing OR
+     *      sig_bucket column not yet present (schema < 1.3) OR sig_bucket
+     *      is NULL (legacy plate pre-V.0.32).
      *
-     * Algorithm: HMAC-SHA256(secret, UPPER(sn) || '|' || floor(time()/86400))
+     * Caller signature unchanged — all 6 sign call-sites untouched.
+     *
+     * V2 algorithm: HMAC-SHA256(secret, UPPER(sn) || '|' || batch_id || '|' || sig_bucket)
+     * V1 algorithm: HMAC-SHA256(secret, UPPER(sn) || '|' || floor(time()/86400))
      *   → first 15 raw bytes → base32 → 24 chars uppercase
      *
      * @param string $sn S/N (will be uppercased + trimmed)
@@ -288,6 +334,21 @@ if ( ! function_exists( 'dinoco_sn_hmac_sign' ) ) {
     function dinoco_sn_hmac_sign( $sn ) {
         $sn = strtoupper( trim( (string) $sn ) );
         if ( $sn === '' ) return '';
+
+        // V2 path: lookup batch_id + sig_bucket (cached static memo).
+        // Returns null when sn unknown / col missing / sig_bucket NULL.
+        if ( function_exists( 'dinoco_sn_hmac_get_sig_bucket' )
+          && function_exists( 'dinoco_sn_hmac_sign_v2' ) ) {
+            $bind = dinoco_sn_hmac_get_sig_bucket( $sn );
+            if ( is_array( $bind ) ) {
+                $v2 = dinoco_sn_hmac_sign_v2( $sn, $bind['batch_id'], $bind['sig_bucket'] );
+                if ( is_string( $v2 ) && $v2 !== '' ) return $v2;
+            }
+        }
+
+        // V1 fallback (legacy plates / pre-1.3 schema). Same 24-char shape so
+        // verify dispatcher cannot tell V1/V2 apart from sig length alone —
+        // it must consult sn_pool to know which path to take.
         $bucket = function_exists( 'dinoco_sn_hmac_bucket_for_time' )
             ? dinoco_sn_hmac_bucket_for_time()
             : (int) floor( time() / 86400 );
@@ -299,17 +360,21 @@ if ( ! function_exists( 'dinoco_sn_hmac_verify' ) ) {
     /**
      * Verify a signature for S/N. Constant-time compare.
      *
-     * V.0.29 — accepts current AND previous epoch-day bucket (24h replay
-     * window). Signatures generated yesterday remain valid today; today's
-     * signatures remain valid tomorrow. Window is bounded so attackers cannot
-     * permanently bookmark URLs.
+     * V.0.32 (R4 BLOCKER #1) — version-aware dispatcher:
+     *   1. Try V2 (batch-bucket binding) when sn_pool has sig_bucket NOT NULL.
+     *      No time-window check — sig valid for plate lifetime.
+     *   2. Fallback V1 (epoch-day bucket, current+previous) when V2 not
+     *      applicable (sn unknown / col missing / sig_bucket NULL).
+     *   3. Legacy V.0.28 16-char fallback retained for any QR codes still
+     *      circulating with the original 80-bit sig (will be removed once
+     *      all V.0.28-printed plates have been activated or recalled).
      *
-     * Backward-compat: also accepts legacy 16-char V.0.28 signatures (no
-     * bucket) during the V.0.28→V.0.29 rollout window. This branch will be
-     * removed in V.0.31+ once all printed QR codes carry V.0.29 sigs.
+     * Backward-compat priority order minimizes false negatives during rollout:
+     * the 24-char-V2 branch never returns false for V1-shaped 24-char sigs —
+     * it returns null when sn has no sig_bucket binding, deferring to V1.
      *
      * @param string $sn  S/N (will be uppercased + trimmed)
-     * @param string $sig Signature (16-char legacy or 24-char V.0.29)
+     * @param string $sig Signature (16-char V.0.28 / 24-char V.0.29 / 24-char V.0.32)
      * @return bool
      */
     function dinoco_sn_hmac_verify( $sn, $sig ) {
@@ -319,7 +384,23 @@ if ( ! function_exists( 'dinoco_sn_hmac_verify' ) ) {
 
         $len = strlen( $sig );
 
-        // V.0.29 — 24-char modern signature with epoch bucket
+        // V.0.32 — V2 dispatcher (24-char). Tries stored sig_bucket first.
+        // verify_v2 returns null when SN has no V2 binding (legacy / unknown)
+        // → caller falls through to V1. Returns true/false when V2 applicable.
+        if ( $len === 24 && function_exists( 'dinoco_sn_hmac_verify_v2' ) ) {
+            $v2_result = dinoco_sn_hmac_verify_v2( $sn, $sig );
+            if ( $v2_result === true )  return true;
+            // Note: even if $v2_result === false (V2 binding present + sig
+            // didn't match), we still try V1 below — protects against
+            // mid-rollout where a plate had a V1 sig printed BEFORE
+            // sig_bucket was populated, then sig_bucket was set later
+            // (e.g., backfill cron). V1 verify will fail-closed in this
+            // case unless the wall-clock bucket happens to align — which
+            // is the exact 24h replay window V2 was designed to close, so
+            // accepting a V1 match here is no worse than V.0.31 behavior.
+        }
+
+        // V.0.29 — V1 24-char modern signature with epoch bucket
         if ( $len === 24 ) {
             $bucket_now  = function_exists( 'dinoco_sn_hmac_bucket_for_time' )
                 ? dinoco_sn_hmac_bucket_for_time()
@@ -359,6 +440,180 @@ if ( ! function_exists( 'dinoco_sn_hmac_verify' ) ) {
         }
 
         return false;
+    }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * V.0.32 — HMAC V2 (batch-bucket binding, R4 BLOCKER #1)
+ *
+ * Threat closed: V1 epoch-day bucket replay window 24h vs real print-to-activate
+ * gap of 60-90d. With V1, every QR printed today would 403 from /lookup after
+ * 48h. With V2, bucket is BOUND TO BATCH LIFECYCLE — sig valid for full plate
+ * lifetime (years), no wall-clock expiry. Only thing that invalidates a sig
+ * is rotating the secret (manual `wp_option` delete) or batch_id change.
+ *
+ * Migration:
+ *   • Phase 1 W4+ (V.0.32) — schema 1.3 adds sn_pool.sig_bucket column.
+ *   • New batches populate sig_bucket on INSERT (single UPDATE per batch).
+ *   • CSV + QR PDF use V2 sign with stored bucket.
+ *   • V2 verify accepts stored sig_bucket — no time check (years valid).
+ *   • Legacy plates with sig_bucket=NULL fall through V1 verify (24h window
+ *     — risk accepted since V1-printed plates are bounded set + production
+ *     not yet shipped at V.0.32 cutover).
+ *
+ * Payload format: HMAC-SHA256(secret, UPPER(sn) || '|' || batch_id || '|' || sig_bucket)
+ *   → first 15 raw bytes → base32 → 24 chars (120-bit entropy, same as V1).
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+if ( ! function_exists( 'dinoco_sn_hmac_sign_v2' ) ) {
+    /**
+     * V.0.32 — V2 sign for given (sn, batch_id, sig_bucket) tuple.
+     *
+     * Caller responsibility: provide batch_id + sig_bucket from sn_pool row.
+     * For convenience, dinoco_sn_hmac_sign($sn) does this lookup automatically.
+     *
+     * @param string $sn         S/N (uppercased + trimmed by caller)
+     * @param int    $batch_id   sn_pool.batch_id (NOT NULL)
+     * @param int    $sig_bucket sn_pool.sig_bucket (epoch-day at QR generation)
+     * @return string 24-char base32 signature
+     */
+    function dinoco_sn_hmac_sign_v2( $sn, $batch_id, $sig_bucket ) {
+        $sn = strtoupper( trim( (string) $sn ) );
+        if ( $sn === '' ) return '';
+        $batch_id = (int) $batch_id;
+        $sig_bucket = (int) $sig_bucket;
+        if ( $batch_id <= 0 ) return '';
+
+        $secret = function_exists( 'dinoco_sn_get_hmac_secret' )
+            ? dinoco_sn_get_hmac_secret() : '';
+        if ( $secret === '' ) return '';
+
+        // Payload binds batch_id + sig_bucket — different from V1 (sn|bucket).
+        // Using `|` separator keeps payloads disjoint from V1 (which never has
+        // 2 pipes), so a V1 sig can never collide with a V2 sig for any input.
+        $payload = $sn . '|' . $batch_id . '|' . $sig_bucket;
+        $raw = hash_hmac( 'sha256', $payload, $secret, true );
+
+        // Base32-encode first 15 raw bytes → 24 chars (120-bit entropy).
+        // Algorithm intentionally identical to dinoco_sn_hmac_sign_for_bucket()
+        // so any change in alphabet/encoding stays consistent across V1/V2.
+        $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+        $bytes = substr( $raw, 0, 15 );
+        $bin = '';
+        for ( $i = 0, $L = strlen( $bytes ); $i < $L; $i++ ) {
+            $bin .= str_pad( decbin( ord( $bytes[ $i ] ) ), 8, '0', STR_PAD_LEFT );
+        }
+        $out = '';
+        for ( $i = 0, $L = strlen( $bin ); $i < $L; $i += 5 ) {
+            $chunk = substr( $bin, $i, 5 );
+            if ( strlen( $chunk ) < 5 ) $chunk = str_pad( $chunk, 5, '0', STR_PAD_RIGHT );
+            $out .= $alphabet[ bindec( $chunk ) ];
+        }
+        return substr( $out, 0, 24 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_hmac_get_sig_bucket' ) ) {
+    /**
+     * V.0.32 — Lookup (batch_id, sig_bucket) for an S/N from sn_pool.
+     *
+     * Returns null when:
+     *   - SN doesn't exist in pool (e.g. typo / forged URL)
+     *   - sig_bucket column missing (schema not yet at 1.3)
+     *   - sig_bucket value is NULL (legacy plate pre-V.0.32 — caller falls
+     *     back to V1 sign/verify)
+     *
+     * Cached per-request via static memo to amortize repeated lookups during
+     * CSV / QR PDF batch streaming.
+     *
+     * @param string $sn S/N (will be uppercased + trimmed)
+     * @return array|null { batch_id: int, sig_bucket: int } or null
+     */
+    function dinoco_sn_hmac_get_sig_bucket( $sn ) {
+        static $memo = array();
+        $sn = strtoupper( trim( (string) $sn ) );
+        if ( $sn === '' ) return null;
+        if ( array_key_exists( $sn, $memo ) ) return $memo[ $sn ];
+
+        if ( ! function_exists( 'dinoco_sn_table' ) ) {
+            $memo[ $sn ] = null;
+            return null;
+        }
+        $tbl_pool = dinoco_sn_table( 'pool' );
+        if ( $tbl_pool === '' ) {
+            $memo[ $sn ] = null;
+            return null;
+        }
+
+        global $wpdb;
+
+        // Defensive: schema 1.3 may not yet be installed. Probe column existence
+        // via INFORMATION_SCHEMA once, then SELECT only if column present.
+        // Cached for the whole request via static.
+        static $col_exists = null;
+        if ( $col_exists === null ) {
+            $col_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.columns
+                 WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+                DB_NAME, $tbl_pool, 'sig_bucket'
+            ) );
+        }
+        if ( ! $col_exists ) {
+            $memo[ $sn ] = null;
+            return null;
+        }
+
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT batch_id, sig_bucket FROM {$tbl_pool} WHERE sn = %s LIMIT 1",
+            $sn
+        ) );
+        if ( ! $row || $row->sig_bucket === null ) {
+            $memo[ $sn ] = null;
+            return null;
+        }
+
+        $memo[ $sn ] = array(
+            'batch_id'   => (int) $row->batch_id,
+            'sig_bucket' => (int) $row->sig_bucket,
+        );
+        return $memo[ $sn ];
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_hmac_verify_v2' ) ) {
+    /**
+     * V.0.32 — V2 verify. Constant-time compare against stored sig_bucket.
+     *
+     * No time-window check — sig is valid for the lifetime of the plate
+     * (until secret rotated or batch deleted). This is the WHOLE POINT of
+     * V2: the print-to-activate window is 60-90 days but plates also need
+     * to be lookup-able for years (claim/transfer/extension flows).
+     *
+     * @param string $sn  S/N (uppercased + trimmed by caller)
+     * @param string $sig 24-char base32 signature
+     * @return bool|null  true (valid V2) / false (invalid V2) / null (no V2 binding — caller falls back to V1)
+     */
+    function dinoco_sn_hmac_verify_v2( $sn, $sig ) {
+        $sn = strtoupper( trim( (string) $sn ) );
+        $sig = strtoupper( trim( (string) $sig ) );
+        if ( $sn === '' || $sig === '' || strlen( $sig ) !== 24 ) {
+            return null; // not eligible for V2 — caller decides
+        }
+
+        $bind = function_exists( 'dinoco_sn_hmac_get_sig_bucket' )
+            ? dinoco_sn_hmac_get_sig_bucket( $sn )
+            : null;
+        if ( ! is_array( $bind ) ) {
+            return null; // legacy plate / unknown sn — fall back to V1
+        }
+
+        $expected = function_exists( 'dinoco_sn_hmac_sign_v2' )
+            ? dinoco_sn_hmac_sign_v2( $sn, $bind['batch_id'], $bind['sig_bucket'] )
+            : '';
+        if ( ! is_string( $expected ) || strlen( $expected ) !== 24 ) {
+            return false;
+        }
+        return hash_equals( $expected, $sig );
     }
 }
 
@@ -466,11 +721,27 @@ if ( ! function_exists( 'dinoco_sn_invalidate_lookup_caches' ) ) {
         $mcp_key = 'mcp_sn_lookup_' . md5( $sn );
         delete_transient( $mcp_key );
         wp_cache_delete( $mcp_key, 'dinoco_mcp' );
+        // V.0.32 R4 PERF HIGH-1 — Unschedule any pending SWR refresh cron for
+        // this SN. Avoids race where invalidate-then-refresh re-populates cache
+        // with stale data between transaction COMMIT and refresh callback fire.
+        $next = wp_next_scheduled( 'dinoco_sn_refresh_lookup_cache', array( $sn ) );
+        if ( $next ) {
+            wp_unschedule_event( $next, 'dinoco_sn_refresh_lookup_cache', array( $sn ) );
+        }
     }
 }
 
 if ( ! has_action( 'dinoco_sn_pool_status_changed', 'dinoco_sn_invalidate_lookup_caches' ) ) {
-    add_action( 'dinoco_sn_pool_status_changed', 'dinoco_sn_invalidate_lookup_caches', 10, 1 );
+    // V.0.32 R4 HIGH — Hook priority drift fix: REST API cache invalidate runs
+    // FIRST (priority 5) — fastest critical path so chatbot/LIFF reads fresh
+    // data before MCP cache + Member banner + Telegram alert fire.
+    // Priority chain (canonical, see CLAUDE.md):
+    //   5  REST API lookup cache invalidate    ← this snippet
+    //   6  MCP Bridge cache invalidate
+    //   7  Member Dashboard banner cache invalidate (per-user, _for_user variant)
+    //   15 Telegram alert (after caches stable, fresh reads)
+    //   20 Sentry observability (defensive, never throws)
+    add_action( 'dinoco_sn_pool_status_changed', 'dinoco_sn_invalidate_lookup_caches', 5, 1 );
 }
 
 if ( ! function_exists( 'dinoco_sn_fire_status_changed' ) ) {
@@ -2245,6 +2516,30 @@ if ( ! function_exists( 'dinoco_sn_handler_create_batch' ) ) {
                 $rows_inserted += (int) $chunk_ok;
             }
 
+            // V.0.32 R4 BLOCKER #1 — populate sig_bucket once for the whole
+            // batch (single UPDATE inside same TX, cheap vs N row-level updates).
+            // sig_bucket = epoch-day at QR generation time (now). Stored on
+            // sn_pool so verify can derive it later without time math.
+            // Schema 1.3 adds the column; defensive INFORMATION_SCHEMA precheck
+            // skips the UPDATE silently when column not yet present (allows
+            // V.0.32 deploy before Manager V.0.43 schema 1.3 install).
+            $sig_bucket_now = (int) floor( time() / 86400 );
+            $sig_col_present = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.columns
+                 WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+                DB_NAME, $tbl_pool, 'sig_bucket'
+            ) );
+            if ( $sig_col_present ) {
+                $sig_update_ok = $wpdb->query( $wpdb->prepare(
+                    "UPDATE {$tbl_pool} SET sig_bucket = %d
+                     WHERE batch_id = %d AND sig_bucket IS NULL",
+                    $sig_bucket_now, $batch_id
+                ) );
+                if ( $sig_update_ok === false ) {
+                    throw new \Exception( "sig_bucket UPDATE failed for batch_id={$batch_id}: " . $wpdb->last_error );
+                }
+            }
+
             $wpdb->query( "COMMIT" );
 
             // Audit log
@@ -2949,6 +3244,25 @@ if ( ! function_exists( 'dinoco_sn_handler_receive_bulk' ) ) {
         );
         // V.0.28 — 207 Multi-Status when any rows skipped (per audit api-spec).
         // Fully successful → 200, fully skipped → still 207 (per-row outcomes vary).
+        // V.0.32 R4 MED — empty-input edge: if classification yields ZERO success
+        // AND ZERO skips (defensive — should not happen because empty($sns) gate
+        // at line 3003 already returns 400, but covers race conditions where
+        // post-FOR-UPDATE result-set ends up empty due to concurrent voids /
+        // race) → 400 empty_input rather than misleading 200 OK with empty
+        // results array. Prevents callers from interpreting "no work done" as
+        // success.
+        $total = $success_count + $skip_count;
+        if ( $total === 0 ) {
+            return new WP_Error( 'empty_input',
+                __( 'No SNs were processed (empty or all filtered).', 'dinoco-sn' ),
+                array(
+                    'status'        => 400,
+                    'success_count' => 0,
+                    'skip_count'    => 0,
+                    'total'         => 0,
+                )
+            );
+        }
         $http_status = ( $skip_count > 0 ) ? 207 : 200;
         return new WP_REST_Response( $payload, $http_status );
     }
@@ -2983,15 +3297,55 @@ if ( ! function_exists( 'dinoco_sn_rest_lookup' ) ) {
             return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
         }
 
-        // V.0.28 PERF — Layer 1 wp_cache (Redis-aware) before transient.
+        // V.0.32 R4 PERF HIGH-1 — Stale-While-Revalidate (SWR) for public lookup.
+        // Burst 100 unique SNs originally caused 5-10s tail latency (each cache
+        // miss = synchronous DB query). SWR pattern:
+        //   - Fresh window  (<60s)         → return cache immediately
+        //   - Stale window  (60-300s)      → return cached + async refresh cron
+        //   - Expired/miss  (>300s or new) → synchronous DB read + cache
+        // Envelope shape: { data: <response>, cached_at: <unix_ts> }
+        // Backward-compat: legacy raw-payload cache (no envelope) treated as
+        // valid hit (returns immediately, no SWR semantics) and rewritten as
+        // envelope on next miss/refresh.
         $cache_key = 'dinoco_sn_lookup_' . md5( $sn );
-        $cached = wp_cache_get( $cache_key, 'dinoco_sn' );
+        $cached    = wp_cache_get( $cache_key, 'dinoco_sn' );
         if ( $cached === false ) {
-            // Layer 2 transient
             $cached = get_transient( $cache_key );
         }
-        if ( $cached !== false ) {
-            return rest_ensure_response( $cached );
+
+        // Detect envelope vs legacy raw payload.
+        $is_envelope = ( is_array( $cached ) && isset( $cached['cached_at'], $cached['data'] ) );
+        if ( $is_envelope ) {
+            $cached_age = time() - (int) $cached['cached_at'];
+            if ( $cached_age < 60 ) {
+                $resp_obj = rest_ensure_response( $cached['data'] );
+                if ( $resp_obj instanceof WP_REST_Response ) {
+                    $resp_obj->header( 'X-Cache-Status', 'fresh' );
+                    $resp_obj->header( 'Age', (string) max( 0, $cached_age ) );
+                }
+                return $resp_obj;
+            }
+            if ( $cached_age < 300 ) {
+                // Stale-while-revalidate: return stale + schedule async refresh.
+                if ( ! wp_next_scheduled( 'dinoco_sn_refresh_lookup_cache', array( $sn ) ) ) {
+                    wp_schedule_single_event( time() + 1, 'dinoco_sn_refresh_lookup_cache', array( $sn ) );
+                }
+                $resp_obj = rest_ensure_response( $cached['data'] );
+                if ( $resp_obj instanceof WP_REST_Response ) {
+                    $resp_obj->header( 'X-Cache-Status', 'stale-while-revalidate' );
+                    $resp_obj->header( 'Age', (string) $cached_age );
+                }
+                return $resp_obj;
+            }
+            // > 300s old → fall through to synchronous fetch + rewrite cache
+        } elseif ( $cached !== false && $cached !== null ) {
+            // Legacy non-envelope cache hit — return as-is (functionally
+            // identical to V.0.31). Will be rewritten as envelope on miss.
+            $resp_obj = rest_ensure_response( $cached );
+            if ( $resp_obj instanceof WP_REST_Response ) {
+                $resp_obj->header( 'X-Cache-Status', 'legacy' );
+            }
+            return $resp_obj;
         }
 
         $plate = dinoco_sn_get_plate_data( $sn );
@@ -3053,12 +3407,91 @@ if ( ! function_exists( 'dinoco_sn_rest_lookup' ) ) {
                 : null,
         );
 
-        // V.0.28 PERF — write through both layers (Redis object cache + DB transient)
-        // Cache safe to share — no per-user / no PII fields above this point
-        wp_cache_set( $cache_key, $resp, 'dinoco_sn', 60 );
-        set_transient( $cache_key, $resp, 60 );
-        return rest_ensure_response( $resp );
+        // V.0.32 R4 PERF HIGH-1 — Cache envelope shape supports SWR semantics.
+        // 5-minute TTL: < 60s = fresh, 60-300s = stale-while-revalidate window.
+        // Cache safe to share — no per-user / no PII fields above this point.
+        $envelope = array( 'data' => $resp, 'cached_at' => time() );
+        wp_cache_set( $cache_key, $envelope, 'dinoco_sn', 300 );
+        set_transient( $cache_key, $envelope, 300 );
+        $resp_obj = rest_ensure_response( $resp );
+        if ( $resp_obj instanceof WP_REST_Response ) {
+            $resp_obj->header( 'X-Cache-Status', 'miss' );
+            $resp_obj->header( 'Age', '0' );
+        }
+        return $resp_obj;
     }
+}
+
+if ( ! function_exists( 'dinoco_sn_refresh_lookup_cache' ) ) {
+    /**
+     * V.0.32 R4 PERF HIGH-1 — Stale-while-revalidate async refresh callback.
+     *
+     * Triggered by `wp_schedule_single_event('dinoco_sn_refresh_lookup_cache', [$sn])`
+     * when a stale (60-300s) cache hit is served. Re-fetches plate data and
+     * writes a fresh envelope so subsequent requests get cache hits without
+     * the user waiting on synchronous DB.
+     *
+     * Defensive: never throws (cron context). Skips if helpers absent.
+     *
+     * @param string $sn Plate S/N
+     */
+    function dinoco_sn_refresh_lookup_cache( $sn ) {
+        try {
+            $sn = strtoupper( trim( (string) $sn ) );
+            if ( $sn === '' ) return;
+            if ( ! function_exists( 'dinoco_sn_get_plate_data' ) ) return;
+
+            $plate = dinoco_sn_get_plate_data( $sn );
+            if ( ! $plate ) {
+                // Plate vanished (deleted) — let cache expire naturally.
+                return;
+            }
+
+            // Recompute public_status using same map as primary handler.
+            $public_status_map = array(
+                'reserved'           => 'pending',
+                'in_pool'            => 'pending',
+                'allocated_to_order' => 'pending',
+                'shipped'            => 'pending',
+                'registered'         => 'registered',
+                'claimed'            => 'registered',
+                'replaced'           => 'registered',
+                'transferred'        => 'registered',
+                'voided'             => 'invalid',
+                'recalled'           => 'invalid',
+            );
+            $public_status = $public_status_map[ $plate->status ] ?? 'pending';
+
+            // Skip caching invalid status (matches V.0.29 HIGH-5 oracle hardening
+            // — primary handler returns 404 for these so cache must not surface
+            // them to public callers).
+            if ( $public_status === 'invalid' ) {
+                $cache_key = 'dinoco_sn_lookup_' . md5( $sn );
+                wp_cache_delete( $cache_key, 'dinoco_sn' );
+                delete_transient( $cache_key );
+                return;
+            }
+
+            $resp = array(
+                'sn'             => $sn,
+                'public_status'  => $public_status,
+                'is_registered'  => ( $public_status === 'registered' ),
+                'activate_hint'  => ( $public_status === 'pending' )
+                    ? __( 'หากเป็นลูกค้า กรุณาเปิด LINE LIFF + scan QR ที่ตัวสินค้าเพื่อลงทะเบียน', 'dinoco-sn' )
+                    : null,
+            );
+            $cache_key = 'dinoco_sn_lookup_' . md5( $sn );
+            $envelope  = array( 'data' => $resp, 'cached_at' => time() );
+            wp_cache_set( $cache_key, $envelope, 'dinoco_sn', 300 );
+            set_transient( $cache_key, $envelope, 300 );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_refresh_lookup_cache', 'sn' => $sn ) );
+            }
+        }
+    }
+    // Register cron callback (action hook fires from wp_schedule_single_event)
+    add_action( 'dinoco_sn_refresh_lookup_cache', 'dinoco_sn_refresh_lookup_cache', 10, 1 );
 }
 
 if ( ! function_exists( 'dinoco_sn_rest_required_plates' ) ) {

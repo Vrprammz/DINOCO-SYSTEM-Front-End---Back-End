@@ -1,5 +1,10 @@
 /**
  * sn-webhook.js — WP→Agent webhook listener for sn_pool state changes
+ * V.1.1 — R4 HIGH-2 fix: Redis-backed sliding window rate limit for multi-worker
+ *         scaling. In-process Map sliding window (V.1.0) leaked counters across
+ *         PM2 cluster workers — N workers = N×RATE_LIMIT_MAX effective cap. Now
+ *         uses ioredis INCR + EXPIRE atomic counter with graceful degradation
+ *         to in-process when Redis unavailable.
  * V.1.0 — Phase 4 W14.5 Round 3 (chatbot-rules.md §15.10 / §15.14.4 / R3 Gap 1):
  *         Promoted from W14.5 → W6 NOW (R3 BLOCKER).
  *         Endpoint: POST /webhook/sn-event
@@ -25,25 +30,96 @@
 const { invalidateSnCache, invalidateAllSnCache, getCachedSnLookup } = require("./dinoco-cache");
 
 // ============================================================================
-// In-process rate limit (per-instance — soft cap)
+// V.1.1 R4 HIGH-2 — Redis-backed rate limit (multi-worker scaling)
 // ============================================================================
-// 1000 requests/min sliding window. Counters reset every 60s.
-// Cache invalidation events are high-volume (each plate state flip fires one) —
-// budget allows ~16 events/sec which is well above realistic peak (large recall
-// batch ≈ 100-500 plates/run, throttled WP-side by `wp_schedule_single_event`).
+// 1000 requests/min global cap, atomic via Redis INCR + EXPIRE. Falls back to
+// in-process sliding window if Redis unavailable (graceful degradation —
+// cluster cap becomes per-worker × N, but webhook still functional).
+//
+// Cache invalidation events are high-volume (each plate state flip fires one)
+// — budget allows ~16 events/sec which is well above realistic peak (large
+// recall batch ≈ 100-500 plates/run, throttled WP-side by
+// `wp_schedule_single_event`).
 const RATE_LIMIT_MAX = 1000;
-const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_WINDOW_SEC = 60;
+
+// Try optional Redis client (ioredis). Fall back to Map-based in-process window
+// when Redis driver unavailable or connection fails.
+let _redisClient = null;
+let _redisInitTried = false;
+function _initRedis() {
+  if (_redisInitTried) return _redisClient;
+  _redisInitTried = true;
+  try {
+    // eslint-disable-next-line global-require
+    const Redis = require("ioredis");
+    _redisClient = new Redis({
+      host: process.env.REDIS_HOST || "redis",
+      port: parseInt(process.env.REDIS_PORT || "6379", 10),
+      // Defensive: 1 retry, fail fast — falls back to in-process if down.
+      maxRetriesPerRequest: 1,
+      enableOfflineQueue: false,
+      lazyConnect: true,
+    });
+    _redisClient.on("error", (err) => {
+      // Don't spam — log once per minute window worth of errors
+      if (!_redisClient._lastErrorLog || Date.now() - _redisClient._lastErrorLog > 60000) {
+        console.warn("[SN-Webhook] Redis error (falling back to in-process RL):", err.message);
+        _redisClient._lastErrorLog = Date.now();
+      }
+    });
+    // Trigger lazy connect (async — failures handled via error event above).
+    _redisClient.connect().catch(() => {
+      /* fallback to in-process — no-op */
+    });
+    console.log("[SN-Webhook] Redis client initialized for rate limiting");
+  } catch (e) {
+    console.warn("[SN-Webhook] ioredis not installed — using in-process rate limit:", e.message);
+    _redisClient = null;
+  }
+  return _redisClient;
+}
+
+// In-process fallback (per-instance — same as V.1.0 behavior).
 let rateLimitWindowStart = Date.now();
 let rateLimitCount = 0;
-
-function _checkRateLimit() {
+function _inProcessRateLimit() {
   const now = Date.now();
-  if (now - rateLimitWindowStart >= RATE_LIMIT_WINDOW_MS) {
+  if (now - rateLimitWindowStart >= RATE_LIMIT_WINDOW_SEC * 1000) {
     rateLimitWindowStart = now;
     rateLimitCount = 0;
   }
   rateLimitCount++;
-  return rateLimitCount <= RATE_LIMIT_MAX;
+  return { allowed: rateLimitCount <= RATE_LIMIT_MAX, count: rateLimitCount, source: "in-process" };
+}
+
+/**
+ * Async rate-limit check — Redis preferred, in-process fallback.
+ *
+ * Window key bucket: `sn-webhook:rl:<floor(epoch_sec/60)>` — sliding 60s with
+ * minute-aligned reset (acceptable approximation for high-volume cache-bust
+ * events; tighter sliding window not required for invalidation traffic).
+ *
+ * @returns {Promise<{allowed: boolean, count: number, source: string}>}
+ */
+async function _checkRateLimit() {
+  const redis = _initRedis();
+  if (redis && redis.status === "ready") {
+    try {
+      const bucket = Math.floor(Date.now() / 1000 / RATE_LIMIT_WINDOW_SEC);
+      const key = `sn-webhook:rl:${bucket}`;
+      const count = await redis.incr(key);
+      if (count === 1) {
+        // First hit in window → set TTL (slightly > window to handle clock skew).
+        await redis.expire(key, RATE_LIMIT_WINDOW_SEC + 5);
+      }
+      return { allowed: count <= RATE_LIMIT_MAX, count, source: "redis" };
+    } catch (e) {
+      // Redis transient failure → fall through to in-process.
+      console.warn("[SN-Webhook] Redis RL check failed, falling back:", e.message);
+    }
+  }
+  return _inProcessRateLimit();
 }
 
 // ============================================================================
@@ -130,11 +206,19 @@ async function _logEvent(payload, result) {
 // Express handler — POST /webhook/sn-event
 // ============================================================================
 async function handleSnEvent(req, res) {
-  // Step 1: rate limit (returns 429 — WP can throttle / queue)
+  // Step 1: rate limit (returns 429 — WP can throttle / queue).
+  // V.1.1 — async (Redis-backed) with in-process fallback. Never breaks on
+  // RL check failure — log + treat as allowed (degrade open).
   try {
-    if (!_checkRateLimit()) {
-      console.warn("[SN-Webhook] rate limit exceeded (window=" + RATE_LIMIT_MAX + "/min)");
-      return res.status(429).json({ success: false, error: "rate_limited" });
+    const rl = await _checkRateLimit();
+    if (!rl.allowed) {
+      console.warn(
+        `[SN-Webhook] rate limit exceeded (cap=${RATE_LIMIT_MAX}/${RATE_LIMIT_WINDOW_SEC}s, count=${rl.count}, src=${rl.source})`
+      );
+      return res
+        .status(429)
+        .set("X-RateLimit-Source", rl.source)
+        .json({ success: false, error: "rate_limited", count: rl.count });
     }
   } catch (e) {
     // never break on rate limit logic itself
@@ -216,4 +300,6 @@ module.exports = {
   _verifyBearer,
   _validatePayload,
   _checkRateLimit,
+  _inProcessRateLimit,
+  _initRedis,
 };
