@@ -1,6 +1,26 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.3.10 (2026-05-07) — Boss screenshot audit fix (3 BO admin Flex bugs):              ║
+ * ║    • BUG-A "ร้าน: ไม่ระบุ" — distributor_id ACF ไม่ถูก set ใน Snippet 3 b2b_rest_place_order   ║
+ * ║      (orders link via source_group_id only). NEW helper b2b_bo_resolve_dist_id_from_order()    ║
+ * ║      4-tier fallback: (1) distributor_id ACF — (2) source_group_id → b2b_get_dist_by_group     ║
+ * ║      (3) dist_name ACF (Snippet 3 line 1046+1103 sets this) — (4) parse post_title 'Order      ║
+ * ║      จาก {name} —'. b2b_build_flex_stock_review_admin() + b2b_rest_bo_confirm_full() ใช้ helper║
+ * ║      ทั้งคู่ → audit log dist_id no longer 0 + Flex header แสดงชื่อร้านถูก.                   ║
+ * ║    • BUG-B SKU-only display — admin ตัดสินใจไม่ได้เห็นแค่ "SKU DNCGND37LS · สั่ง 1 · ✓ พอ".    ║
+ * ║      Flex body enriched: product name (truncated 60 chars from b2b_get_product_data['name'])   ║
+ * ║      bold above SKU+qty+bucket line. function_exists guard — fallback to SKU-only if catalog    ║
+ * ║      table missing. Color cue (green/red) preserved on bucket line.                            ║
+ * ║    • BUG-C Duplicate "ยืนยันเต็ม" press — admin no clear feedback so pressed again 1 min later.║
+ * ║      Postback reply enriched with ticket# + dist_name + next-step hint so admin sees clear      ║
+ * ║      correlation in LINE chat: "✅ ยืนยันสต็อกเต็ม #6307 · ร้าน BKK SHOP TEST — กำลังรอลูกค้า   ║
+ * ║      ยืนยันบิล". bo_reject reply enriched ตาม pattern เดียวกัน. Idempotency wrapper (R26) yield ║
+ * ║      cached response on 2nd press → no double-debit/double-notify; this fix prevents the human   ║
+ * ║      ambiguity that triggers the duplicate press.                                              ║
+ * ║    • Backward compat: helper return 'ไม่ระบุ' last-resort เมื่อ all 4 tiers ล้มเหลว.            ║
+ * ║      function_exists() guards ครอบ b2b_get_dist_by_group + b2b_get_product_data. ไม่กระทบ      ║
+ * ║      idempotency wrapper, FSM transition, audit row schema, หรือ R26 contract test.            ║
  * ║  Version: V.3.9 (2026-04-30) — Round 36 batch 14: Idempotency-Key support on bo-reject:        ║
  * ║    • POST /b2b/v1/bo-reject — body hash {order_id, reason}.                                    ║
  * ║      Admin double-click "ปฏิเสธออเดอร์" on Pending Stock Review modal → 2× FSM transition       ║
@@ -1842,7 +1862,17 @@ if ( ! function_exists( 'b2b_rest_bo_confirm_full' ) ) {
             return new WP_Error( 'invalid_status', "Order ต้องอยู่ใน pending_stock_review", array( 'status' => 400 ) );
         }
 
-        $dist_id = (int) get_field( 'distributor_id', $order_id );
+        // V.3.10 BUG-A FIX: resolve dist_id via 4-tier fallback (distributor_id ACF ไม่ถูก set
+        // ใน Snippet 3 b2b_rest_place_order). ก่อนหน้านี้ $dist_id=0 ทำให้ audit log dist_id=0
+        // + idempotency body hash ไม่ scope cross-distributor.
+        $dist_id = 0;
+        if ( function_exists( 'b2b_bo_resolve_dist_id_from_order' ) ) {
+            $dist_info = b2b_bo_resolve_dist_id_from_order( $order_id );
+            $dist_id = (int) $dist_info['dist_id'];
+        } else {
+            // Defensive fallback (helper not yet synced)
+            $dist_id = (int) get_field( 'distributor_id', $order_id );
+        }
 
         // ── V.3.4 Round 26: Idempotency-Key support ──
         // Admin double-click on "ยืนยันเต็ม" Flex button or LINE postback retry can fire 2x.
@@ -3247,14 +3277,70 @@ if ( ! function_exists( 'b2b_bo_run_attempt_log_cleanup' ) ) {
 // SECTION 6: FLEX BUILDERS (4 templates)
 // ═══════════════════════════════════════════════════════════════
 
+/**
+ * V.3.10 BUG-A FIX: 4-tier distributor resolver for b2b_order
+ * Snippet 3 b2b_rest_place_order ไม่เคย set distributor_id ACF (orders link via source_group_id only)
+ * → Flex header + audit log dist_id เคยเป็น 0/empty.
+ *
+ * @param int $order_id b2b_order post ID
+ * @return array { dist_id:int, dist_name:string }  dist_id=0 ถ้า resolve ไม่ได้
+ */
+if ( ! function_exists( 'b2b_bo_resolve_dist_id_from_order' ) ) {
+    function b2b_bo_resolve_dist_id_from_order( $order_id ) {
+        $dist_id   = 0;
+        $dist_name = '';
+
+        // Tier 1: distributor_id ACF (legacy / future code may set this)
+        $dist_id = (int) get_field( 'distributor_id', $order_id );
+
+        // Tier 2: resolve from source_group_id (LINE group) — Snippet 3 sets this on every order
+        if ( ! $dist_id ) {
+            $group_id = get_field( 'source_group_id', $order_id );
+            if ( $group_id && function_exists( 'b2b_get_dist_by_group' ) ) {
+                $dist_post = b2b_get_dist_by_group( $group_id );
+                if ( $dist_post ) {
+                    $dist_id = (int) $dist_post->ID;
+                }
+            }
+        }
+
+        if ( $dist_id ) {
+            $dist_name = (string) get_the_title( $dist_id );
+        }
+
+        // Tier 3: read dist_name ACF directly (Snippet 3 line 1046 + 1103 sets this on every order)
+        if ( $dist_name === '' ) {
+            $acf_name = get_field( 'dist_name', $order_id );
+            if ( $acf_name ) {
+                $dist_name = (string) $acf_name;
+            }
+        }
+
+        // Tier 4: parse from order post_title — format: "Order จาก {dist_name} — {date}"
+        if ( $dist_name === '' ) {
+            $title = get_the_title( $order_id );
+            if ( $title && preg_match( '/Order จาก (.+?) —/u', $title, $m ) ) {
+                $dist_name = trim( $m[1] );
+            }
+        }
+
+        return array(
+            'dist_id'   => $dist_id,
+            'dist_name' => $dist_name !== '' ? $dist_name : 'ไม่ระบุ',
+        );
+    }
+}
+
 if ( ! function_exists( 'b2b_build_flex_stock_review_admin' ) ) {
     /**
      * Admin Flex — stock review with delta (admin-only visibility)
      */
     function b2b_build_flex_stock_review_admin( $order_id ) {
         $ticket_no    = get_the_title( $order_id );
-        $dist_id      = (int) get_field( 'distributor_id', $order_id );
-        $dist_name    = $dist_id ? get_the_title( $dist_id ) : 'ไม่ระบุ';
+        // V.3.10 BUG-A FIX: use 4-tier resolver (distributor_id ACF ไม่ถูก set ใน Snippet 3)
+        $dist_info    = b2b_bo_resolve_dist_id_from_order( $order_id );
+        $dist_id      = (int) $dist_info['dist_id'];
+        $dist_name    = (string) $dist_info['dist_name'];
         $order_text   = get_field( 'order_items', $order_id ) ?: '';
         $parsed_items = b2b_bo_parse_order_items( $order_text );
         $total_value  = (float) get_field( 'total_amount', $order_id );
@@ -3283,16 +3369,35 @@ if ( ! function_exists( 'b2b_build_flex_stock_review_admin' ) ) {
             // Bucket indicator (no exact qty leak)
             $bucket = $is_sufficient ? '✓ พอ' : ( $available === 0 ? '⚠️ หมด' : '⚠️ ไม่พอ (ต้อง split)' );
 
+            // V.3.10 BUG-B FIX: enrich body with product name (admin ตัดสินใจไม่ได้ถ้าเห็นแค่ SKU)
+            $product_name = '';
+            if ( function_exists( 'b2b_get_product_data' ) ) {
+                $pd = b2b_get_product_data( $sku );
+                if ( $pd && ! empty( $pd['name'] ) ) {
+                    $product_name = (string) $pd['name'];
+                    if ( function_exists( 'mb_substr' ) ) {
+                        $product_name = mb_substr( $product_name, 0, 60, 'UTF-8' );
+                    } else {
+                        $product_name = substr( $product_name, 0, 60 );
+                    }
+                }
+            }
+
+            // Line 1: product name (bold) — fallback to SKU only if catalog lookup fails
             $body_contents[] = array(
                 'type'    => 'text',
-                'text'    => "SKU {$sku}",
+                'text'    => $product_name !== '' ? $product_name : "SKU {$sku}",
                 'weight'  => 'bold',
                 'size'    => 'sm',
                 'margin'  => 'md',
+                'wrap'    => true,
             );
+            // Line 2: SKU + qty + bucket indicator (color cue green/red)
             $body_contents[] = array(
                 'type'   => 'text',
-                'text'   => "สั่ง {$qty} · {$bucket}",
+                'text'   => $product_name !== ''
+                    ? "SKU: {$sku} · สั่ง {$qty} · {$bucket}"
+                    : "สั่ง {$qty} · {$bucket}",
                 'size'   => 'xs',
                 'color'  => $is_sufficient ? '#10b981' : '#dc2626',
                 'wrap'   => true,
@@ -3762,8 +3867,34 @@ add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params,
             $req = new WP_REST_Request();
             $req->set_param( 'order_id', $order_id );
             $result = b2b_rest_bo_confirm_full( $req );
-            if ( function_exists( 'b2b_line_reply' ) && ! is_wp_error( $result ) ) {
-                b2b_line_reply( $reply_token, "✅ ยืนยันเต็มแล้ว — ลูกค้าได้รับบิลยืนยัน" );
+
+            // V.3.10 BUG-C FIX: enrich reply with ticket# + dist_name (admin no clear correlation
+            // → pressed "ยืนยันเต็ม" again 1 min later). R26 idempotency wrapper ทำให้ press 2 ปลอดภัย
+            // แต่ admin ยัง confused ทาง UX. Reply ใหม่ให้เห็น ticket# ชัดเจน → admin รู้ว่าทำสำเร็จ.
+            if ( function_exists( 'b2b_line_reply' ) ) {
+                if ( ! is_wp_error( $result ) ) {
+                    $ticket_no = get_the_title( $order_id );
+                    $dist_name = '';
+                    if ( function_exists( 'b2b_bo_resolve_dist_id_from_order' ) ) {
+                        $info = b2b_bo_resolve_dist_id_from_order( $order_id );
+                        $dist_name = (string) $info['dist_name'];
+                    }
+                    $reply_text = "✅ ยืนยันสต็อกเต็ม #{$ticket_no}";
+                    if ( $dist_name !== '' && $dist_name !== 'ไม่ระบุ' ) {
+                        $reply_text .= " · ร้าน {$dist_name}";
+                    }
+                    $reply_text .= "\n— กำลังรอลูกค้ายืนยันบิล";
+                    b2b_line_reply( $reply_token, $reply_text );
+                } else {
+                    // Surface error so admin understands why state didn't change (e.g. invalid_status =
+                    // already confirmed by previous click). Prevents silent confusion → re-press loop.
+                    $err_msg = $result->get_error_message();
+                    $err_code = $result->get_error_code();
+                    $hint = ( $err_code === 'invalid_status' )
+                        ? 'ออเดอร์อาจถูกยืนยัน/ยกเลิกไปแล้ว'
+                        : 'ลองเปิด Admin Dashboard เพื่อตรวจสอบ';
+                    b2b_line_reply( $reply_token, "⚠️ ยืนยันเต็มไม่สำเร็จ #{$order_id}\n{$err_msg}\n({$hint})" );
+                }
             }
         }
         return true;
@@ -3776,8 +3907,30 @@ add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params,
             $req->set_param( 'order_id', $order_id );
             $req->set_param( 'reason', 'admin manual reject' );
             $result = b2b_rest_bo_reject( $req );
-            if ( function_exists( 'b2b_line_reply' ) && ! is_wp_error( $result ) ) {
-                b2b_line_reply( $reply_token, "❌ ปฏิเสธแล้ว — ลูกค้าได้รับแจ้งเตือน" );
+
+            // V.3.10 BUG-C FIX: enrich reply (mirror bo_confirm_full pattern)
+            if ( function_exists( 'b2b_line_reply' ) ) {
+                if ( ! is_wp_error( $result ) ) {
+                    $ticket_no = get_the_title( $order_id );
+                    $dist_name = '';
+                    if ( function_exists( 'b2b_bo_resolve_dist_id_from_order' ) ) {
+                        $info = b2b_bo_resolve_dist_id_from_order( $order_id );
+                        $dist_name = (string) $info['dist_name'];
+                    }
+                    $reply_text = "❌ ปฏิเสธออเดอร์ #{$ticket_no}";
+                    if ( $dist_name !== '' && $dist_name !== 'ไม่ระบุ' ) {
+                        $reply_text .= " · ร้าน {$dist_name}";
+                    }
+                    $reply_text .= "\n— ลูกค้าได้รับแจ้งเตือนแล้ว";
+                    b2b_line_reply( $reply_token, $reply_text );
+                } else {
+                    $err_msg = $result->get_error_message();
+                    $err_code = $result->get_error_code();
+                    $hint = ( $err_code === 'invalid_status' )
+                        ? 'ออเดอร์อาจถูกยืนยัน/ยกเลิกไปแล้ว'
+                        : 'ลองเปิด Admin Dashboard เพื่อตรวจสอบ';
+                    b2b_line_reply( $reply_token, "⚠️ ปฏิเสธไม่สำเร็จ #{$order_id}\n{$err_msg}\n({$hint})" );
+                }
             }
         }
         return true;
