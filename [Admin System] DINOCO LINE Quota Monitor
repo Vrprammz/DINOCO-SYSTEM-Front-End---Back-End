@@ -1,0 +1,237 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO LINE Quota Monitor                        ║
+ * ║  DB_ID: AUTO (set via GitHub Webhook Sync first push)            ║
+ * ║  Version: V.1.0 (2026-05-09) — Boss directive R10 Item 6/9:      ║
+ * ║    auto-verify LINE Premium ฿1,500/mo quota tier daily.          ║
+ * ║                                                                  ║
+ * ║  What it does:                                                   ║
+ * ║    1. Daily 09:00 ICT cron polls /v2/bot/message/quota           ║
+ * ║    2. Stores result in wp_option dinoco_line_quota_status JSON   ║
+ * ║       { type, value, checked_at, http_code, error }              ║
+ * ║    3. If type !== 'limited' OR value < 50000 → Telegram alert    ║
+ * ║       via b2b_tg_send_dedup (1hr dedup) + dinoco_obs_capture     ║
+ * ║    4. Admin shortcode [dinoco_line_quota_status] renders status  ║
+ * ║       card (last check + value + tier + manual recheck button)   ║
+ * ║                                                                  ║
+ * ║  Hard fallback values (LINE Free tier):                          ║
+ * ║    type='limited', value=200 (msg/month broadcast budget)        ║
+ * ║  Premium expected:                                               ║
+ * ║    type='limited', value≥50000 (paid 1,500 THB/month)            ║
+ * ║                                                                  ║
+ * ║  Endpoint reference:                                             ║
+ * ║    GET https://api.line.me/v2/bot/message/quota                  ║
+ * ║    Authorization: Bearer ${B2B_LINE_ACCESS_TOKEN}                ║
+ * ║    Response: {"type":"limited","value":50000} (Premium tier)     ║
+ * ║              {"type":"none"} (Standard tier — no monthly limit)  ║
+ * ║                                                                  ║
+ * ║  Cron registered via dinoco_register_flag_aware_cron when        ║
+ * ║  available (R9 P4 pattern), else falls back to wp_schedule_event.║
+ * ║  Master flag: none — quota verification is independent of SN     ║
+ * ║  system flag because LINE messages flow even when SN is OFF      ║
+ * ║  (B2B + B2F orders also push notifications).                     ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ */
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ────────────────────────────────────────────────────────────────────
+ * 1. CORE — Poll LINE quota endpoint
+ * ──────────────────────────────────────────────────────────────────── */
+
+if ( ! function_exists( 'dinoco_line_quota_poll' ) ) {
+    /**
+     * Poll LINE Messaging API quota endpoint.
+     *
+     * @return array{
+     *   ok:bool, type:string, value:int, http_code:int, error:string,
+     *   checked_at:string
+     * }
+     */
+    function dinoco_line_quota_poll() {
+        $checked_at = current_time( 'mysql' );
+        if ( ! defined( 'B2B_LINE_ACCESS_TOKEN' ) || ! B2B_LINE_ACCESS_TOKEN ) {
+            return array(
+                'ok'         => false,
+                'type'       => '',
+                'value'      => 0,
+                'http_code'  => 0,
+                'error'      => 'B2B_LINE_ACCESS_TOKEN constant missing',
+                'checked_at' => $checked_at,
+            );
+        }
+        $resp = wp_remote_get( 'https://api.line.me/v2/bot/message/quota', array(
+            'timeout' => 15,
+            'headers' => array(
+                'Authorization' => 'Bearer ' . B2B_LINE_ACCESS_TOKEN,
+            ),
+        ) );
+        if ( is_wp_error( $resp ) ) {
+            return array(
+                'ok'         => false,
+                'type'       => '',
+                'value'      => 0,
+                'http_code'  => 0,
+                'error'      => $resp->get_error_message(),
+                'checked_at' => $checked_at,
+            );
+        }
+        $code = (int) wp_remote_retrieve_response_code( $resp );
+        $body = wp_remote_retrieve_body( $resp );
+        $data = json_decode( $body, true );
+        if ( $code !== 200 || ! is_array( $data ) ) {
+            return array(
+                'ok'         => false,
+                'type'       => '',
+                'value'      => 0,
+                'http_code'  => $code,
+                'error'      => 'unexpected response: ' . substr( (string) $body, 0, 200 ),
+                'checked_at' => $checked_at,
+            );
+        }
+        return array(
+            'ok'         => true,
+            'type'       => isset( $data['type'] ) ? (string) $data['type'] : '',
+            'value'      => isset( $data['value'] ) ? (int) $data['value'] : 0,
+            'http_code'  => $code,
+            'error'      => '',
+            'checked_at' => $checked_at,
+        );
+    }
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * 2. CRON CALLBACK — daily 09:00 ICT (anchor)
+ * ──────────────────────────────────────────────────────────────────── */
+
+if ( ! function_exists( 'dinoco_line_quota_run_daily_check' ) ) {
+    function dinoco_line_quota_run_daily_check() {
+        $result = dinoco_line_quota_poll();
+        update_option( 'dinoco_line_quota_status', $result, false );
+        update_option( 'dinoco_cron_line_quota_check_last_run', current_time( 'mysql' ), false );
+
+        // Threshold logic — Premium tier expected = limited + value >= 50000
+        // Free tier = none (or limited + value=200 broadcast budget)
+        $is_premium_ok = $result['ok'] === true
+            && $result['type'] === 'limited'
+            && $result['value'] >= 50000;
+
+        if ( ! $is_premium_ok ) {
+            $msg_lines = array(
+                '⚠️ LINE Quota Alert',
+                'Time: ' . $result['checked_at'],
+                'Status: ' . ( $result['ok'] ? 'OK' : 'FAILED' ),
+                'Type: ' . ( $result['type'] ?: 'n/a' ),
+                'Value: ' . number_format( $result['value'] ),
+                'HTTP: ' . $result['http_code'],
+            );
+            if ( $result['error'] ) {
+                $msg_lines[] = 'Error: ' . $result['error'];
+            }
+            if ( $is_premium_ok === false && $result['ok'] === true ) {
+                $msg_lines[] = '';
+                $msg_lines[] = 'Expected Premium ≥50,000. Got ' . $result['value'] . '.';
+                $msg_lines[] = 'Verify ฿1,500/mo subscription active in LINE Console.';
+            }
+            $msg = implode( "\n", $msg_lines );
+            if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+                // 1hr dedup — alert once per hour even if cron runs more often
+                b2b_tg_send_dedup( 'line_quota_alert', $msg, 3600 );
+            }
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', '[line-quota] alert', $result );
+            }
+        }
+
+        return $result;
+    }
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * 3. CRON REGISTRATION — daily anchor 09:00 ICT
+ * ──────────────────────────────────────────────────────────────────── */
+
+add_action( 'init', function() {
+    if ( ! wp_next_scheduled( 'dinoco_line_quota_check_cron' ) ) {
+        $anchor = (int) strtotime( 'tomorrow 09:00' );
+        if ( ! $anchor ) $anchor = time() + 3600;
+        wp_schedule_event( $anchor, 'daily', 'dinoco_line_quota_check_cron' );
+    }
+} );
+
+if ( function_exists( 'dinoco_register_cron' ) ) {
+    add_action( 'init', function() {
+        dinoco_register_cron( 'dinoco_line_quota_check_cron', 'daily', 'dinoco_line_quota_run_daily_check' );
+    }, 11 );
+} else {
+    add_action( 'dinoco_line_quota_check_cron', 'dinoco_line_quota_run_daily_check' );
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * 4. ADMIN SHORTCODE [dinoco_line_quota_status]
+ * ──────────────────────────────────────────────────────────────────── */
+
+if ( ! function_exists( 'dinoco_line_quota_render_shortcode' ) ) {
+    function dinoco_line_quota_render_shortcode() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<p>คุณไม่มีสิทธิ์ดูข้อมูลนี้</p>';
+        }
+
+        // Manual recheck handler
+        if ( isset( $_POST['dnc_lq_recheck'] ) && check_admin_referer( 'dnc_lq_recheck' ) ) {
+            dinoco_line_quota_run_daily_check();
+        }
+
+        $status = get_option( 'dinoco_line_quota_status', array() );
+        if ( ! is_array( $status ) ) $status = array();
+        $type   = isset( $status['type'] ) ? $status['type'] : '';
+        $value  = isset( $status['value'] ) ? (int) $status['value'] : 0;
+        $when   = isset( $status['checked_at'] ) ? $status['checked_at'] : '—';
+        $ok     = ! empty( $status['ok'] );
+        $is_premium_ok = $ok && $type === 'limited' && $value >= 50000;
+
+        $bg = $is_premium_ok ? '#dcfce7' : '#fef3c7';
+        $border = $is_premium_ok ? '#86efac' : '#fbbf24';
+        $emoji  = $is_premium_ok ? '✅' : '⚠️';
+        $label  = $is_premium_ok ? 'Premium tier active' : 'รอตรวจสอบหรือ quota ไม่ตรงคาด';
+
+        ob_start();
+        ?>
+        <div class="dnc-lq-card" style="background:<?php echo esc_attr( $bg ); ?>;border:1px solid <?php echo esc_attr( $border ); ?>;border-radius:12px;padding:16px;max-width:520px;font-family:Sarabun,system-ui,sans-serif;">
+            <h3 style="margin:0 0 12px;font-size:18px;"><?php echo esc_html( $emoji ); ?> LINE Quota Status</h3>
+            <p style="margin:4px 0;font-weight:600;"><?php echo esc_html( $label ); ?></p>
+            <table style="width:100%;border-collapse:collapse;font-size:14px;margin-top:8px;">
+                <tr><td style="padding:4px 0;color:#4b5563;">ตรวจล่าสุด</td><td style="text-align:right;font-weight:600;"><?php echo esc_html( $when ); ?></td></tr>
+                <tr><td style="padding:4px 0;color:#4b5563;">Type</td><td style="text-align:right;font-weight:600;"><?php echo esc_html( $type ?: '—' ); ?></td></tr>
+                <tr><td style="padding:4px 0;color:#4b5563;">Value</td><td style="text-align:right;font-weight:600;"><?php echo esc_html( number_format( $value ) ); ?> msg/month</td></tr>
+                <tr><td style="padding:4px 0;color:#4b5563;">Expected</td><td style="text-align:right;color:#059669;">≥ 50,000 (Premium)</td></tr>
+                <?php if ( ! empty( $status['error'] ) ) : ?>
+                <tr><td colspan="2" style="padding:8px 0;color:#dc2626;">Error: <?php echo esc_html( $status['error'] ); ?></td></tr>
+                <?php endif; ?>
+            </table>
+            <form method="post" style="margin-top:12px;">
+                <?php wp_nonce_field( 'dnc_lq_recheck' ); ?>
+                <button type="submit" name="dnc_lq_recheck" value="1" style="background:#1f2937;color:#fff;border:0;border-radius:8px;padding:10px 16px;font-weight:600;cursor:pointer;min-height:44px;">↻ ตรวจตอนนี้</button>
+            </form>
+        </div>
+        <?php
+        return ob_get_clean();
+    }
+    add_shortcode( 'dinoco_line_quota_status', 'dinoco_line_quota_render_shortcode' );
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * 5. MODULE REGISTRY (Admin Command Center sidebar nav)
+ * ──────────────────────────────────────────────────────────────────── */
+
+add_filter( 'dinoco_admin_modules', function( $modules ) {
+    if ( ! is_array( $modules ) ) return $modules;
+    $modules[] = array(
+        'id'        => 'line_quota_status',
+        'label'     => 'LINE Quota',
+        'icon'      => '📡',
+        'shortcode' => 'dinoco_line_quota_status',
+        'section'   => 'system',
+        'order'     => 80,
+    );
+    return $modules;
+}, 10, 1 );

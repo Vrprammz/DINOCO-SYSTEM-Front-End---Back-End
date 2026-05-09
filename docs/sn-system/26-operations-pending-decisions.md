@@ -8,21 +8,48 @@
 
 ---
 
-## Quick Index
+## Quick Index — UPDATED 2026-05-09 with boss decisions
 
-| #   | Item                              | Status      | Owner Needed | Days to Decide |
-| --- | --------------------------------- | ----------- | ------------ | -------------- |
-| 1   | White-variant logo upload         | ⏳ awaiting | บอส (assets) | 1              |
-| 2   | F#8 legal email send              | ⏳ awaiting | บอส → ทนาย   | 0 (this week)  |
-| 3   | KPI baseline owner assignment     | ⏳ awaiting | บอส          | 3              |
-| 4   | Q12 skip-pilot risk acceptance    | ⏳ awaiting | บอส          | 1              |
-| 5   | CS Facebook intake script rollout | ⏳ awaiting | CS lead      | 5              |
-| 6   | LINE Premium ฿1,500/mo verify     | 💰 paid     | บอส (verify) | 0              |
-| 7   | Schema migration window           | ⏳ awaiting | บอส (slot)   | 2              |
-| 8   | Frequency cap policy (LINE Push)  | ⏳ awaiting | บอส          | 3              |
-| 9   | PDPA opt-out UI signoff           | ⏳ awaiting | ทนาย         | 5              |
-| 10  | Brand CI tokens (color/font)      | ⏳ awaiting | Designer     | 3              |
-| 11  | Photo OCR Gemini quota tier       | ⏳ awaiting | บอส          | 2              |
+| #   | Item                              | Status (2026-05-09) | Action |
+| --- | --------------------------------- | -------------------- | ------ |
+| 1   | White-variant logo upload         | ✅ DONE — wired      | Snippet 10 V.31.1 + admin_init seed of `dinoco_brand_logo_url_white` |
+| 2   | F#8 legal email send              | ✅ DONE — self-drafted | `28-refund-policy-warranty-extension.md` + `29-tax-invoice-format-vat7.md` (boss said no lawyer needed) |
+| 3   | KPI baseline owner assignment     | ✅ DONE — boss runs   | `31-kpi-baseline-tools-for-boss.md` ready (30 min/day × 7 days) |
+| 4   | Q12 skip-pilot risk acceptance    | ✅ DONE — by directive | Boss said "ทำไปเลยไม่ต้องเซ็น" → marked approved in this doc |
+| 5   | CS Facebook intake script rollout | ✅ DONE — boss teaches | `32-cs-training-material-for-boss.md` (5 sessions × 1hr) |
+| 6   | LINE Premium ฿1,500/mo verify     | ✅ DONE — auto-verify | NEW snippet "DINOCO LINE Quota Monitor" V.1.0 (daily cron + Telegram alert) |
+| 7   | Schema migration window           | 🟡 RUNBOOK READY      | `27-schema-migration-go-live-runbook.md` — boss runs 3 commands when ready |
+| 8   | Frequency cap policy (LINE Push)  | ✅ DONE — unlimited   | Push Gov V.1.6: caps flipped 1/3 → 0/0 per directive "ส่งได้ตลอด" |
+| 9   | PDPA opt-out UI signoff           | ✅ DONE — self-drafted | `30-pdpa-opt-out-wording.md` (boss said no lawyer) |
+| 10  | Brand CI tokens (color/font)      | ✅ DONE — accept current | Boss said "ได้หมด" — keep navy `#1f2937` + green `#10b981` |
+| 11  | Photo OCR Gemini quota tier       | ✅ DONE — start free  | Default to free 60 req/min; auto-upgrade if hit |
+
+### Status legend
+- ✅ DONE = completed in this commit cycle (2026-05-09)
+- 🟡 RUNBOOK READY = boss action pending (5-15 min execute)
+- ⏳ awaiting = (no items at this status anymore)
+
+---
+
+## Boss Directive 2026-05-09 — All 11 Decisions
+
+Boss responded to all 11 items in 1 conversation. Recorded for audit:
+
+| # | Boss answer (verbatim) | Interpretation |
+|---|---|---|
+| 1 | logo URLs given (black + white) | wire white into invoice header — DONE |
+| 2 | "ทำได้เลยไม่ต้องรอทนาย" | team drafts refund policy + tax invoice — DONE |
+| 3 | "บอสเอง" | boss measures KPI baseline — tools READY |
+| 4 | "ทำไปเลยไม่ต้องเซ็น" | skip Q12 risk acceptance form — approved by directive |
+| 5 | "บอส" (จะคุยเอง) | boss teaches CS — training material READY |
+| 6 | "เริ่มลย" (schema migration) | runbook READY for boss to run |
+| 7 | "ส่งได้ตลอด" (LINE freq cap) | unlimited — DONE |
+| 8 | (Photo OCR explained, no override) | start free → upgrade if needed — DONE config |
+| 9 | "ระบบตรวจ" (LINE quota verify) | auto-verify daily cron — DONE |
+| 10 | "ได้หมด" (Brand CI) | accept current — DONE no change |
+| 11 | "ทำต่อไปไม่ต้องใคร" (PDPA wording) | team drafts — DONE |
+
+**Outcome**: 0 BLOCKERs remaining for engineering side. Items 7 (schema) waits boss to run runbook. KPI baseline waits boss to spend 30min/day × 7 days.
 
 ---
 
@@ -278,4 +305,13 @@ open "https://console.cloud.google.com/apis/api/generativelanguage.googleapis.co
 
 ---
 
-_Last updated: 2026-05-08 (R10 + flag-aware mechanical sweep complete) — Auto Mode Active_
+_Last updated: 2026-05-09 (boss responded to all 11 items, all engineering work done same day) — Auto Mode Active_
+
+## Cross-refs to new docs (2026-05-09 batch)
+
+- `27-schema-migration-go-live-runbook.md` — Item 7 step-by-step
+- `28-refund-policy-warranty-extension.md` — Item 2 deliverable 1/2
+- `29-tax-invoice-format-vat7.md` — Item 2 deliverable 2/2
+- `30-pdpa-opt-out-wording.md` — Item 9
+- `31-kpi-baseline-tools-for-boss.md` — Item 3 (boss runs)
+- `32-cs-training-material-for-boss.md` — Item 5 (boss teaches)
