@@ -2,6 +2,16 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.39 (2026-05-10) — Phase 4 W12 F#8 GAP CLOSE:      ║
+ * ║    /marketplace/transactions + /transactions/{id} routes were   ║
+ * ║    consumed by Tab 11 admin UI (8 fetch sites) but never        ║
+ * ║    registered → silent 404 on every load. Now ADD list with     ║
+ * ║    filters (status, q, from, to, limit, offset) + summary       ║
+ * ║    aggregate (sum_paid, sum_refunded, sum_pending) + single     ║
+ * ║    detail with user enrichment. permission_callback =           ║
+ * ║    dinoco_sn_perm_admin (manage_options + nonce gate). All      ║
+ * ║    queries prepared, status enum-validated whitelist. Closes    ║
+ * ║    Phase 4 W12 admin marketplace integration loop.              ║
  * ║  Version: V.0.38 (2026-05-08) — R8 cap consistency + dispatcher:║
  * ║   • B1: /void /swap /recall now accept Q15 delegated approvers  ║
  * ║     (dinoco_sn_approver cap from Role Manager V.0.4) in addition║
@@ -2232,6 +2242,133 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                 ),
             ),
         ) );
+
+        // V.0.39 (2026-05-10) — Phase 4 W12.2 gap fix: /marketplace/transactions
+        // route was consumed by Tab 11 admin UI (8 fetch sites in Manager) but
+        // never registered. Frontend → 404 silent fail.
+        // GET /marketplace/transactions — list with optional filters
+        //   ?status=pending|paid|refunded|cancelled
+        //   ?q=<sn or user phone or user name search>
+        //   ?from=YYYY-MM-DD&to=YYYY-MM-DD
+        //   ?limit=50&offset=0
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/marketplace/transactions', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_marketplace_transactions_list',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'status' => array( 'required' => false, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'q'      => array( 'required' => false, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'from'   => array( 'required' => false, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'to'     => array( 'required' => false, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'limit'  => array( 'required' => false, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+                'offset' => array( 'required' => false, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /marketplace/transactions/{id} — single record detail
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/marketplace/transactions/(?P<id>\d+)', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_marketplace_transactions_detail',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'id' => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_marketplace_transactions_list' ) ) {
+    /**
+     * V.0.39 — admin transaction list. Filters: status, q (sn/phone), from, to.
+     * Returns paginated rows + summary aggregate.
+     */
+    function dinoco_sn_rest_marketplace_transactions_list( $req ) {
+        if ( function_exists( 'dinoco_sn_is_enabled' ) && ! dinoco_sn_is_enabled() ) {
+            return new \WP_Error( 'feature_disabled', 'ระบบ SN ถูกปิดอยู่', array( 'status' => 503 ) );
+        }
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_sn_warranty_extensions';
+
+        $status = $req->get_param( 'status' );
+        $q      = trim( (string) $req->get_param( 'q' ) );
+        $from   = $req->get_param( 'from' );
+        $to     = $req->get_param( 'to' );
+        $limit  = (int) ( $req->get_param( 'limit' ) ?: 50 );
+        $offset = (int) ( $req->get_param( 'offset' ) ?: 0 );
+        $limit  = max( 1, min( 200, $limit ) );
+
+        $where  = array( '1=1' );
+        $params = array();
+        if ( $status && in_array( $status, array( 'pending', 'paid', 'refunded', 'cancelled', 'failed' ), true ) ) {
+            $where[]  = 'payment_status = %s';
+            $params[] = $status;
+        }
+        if ( $q !== '' ) {
+            $like     = '%' . $wpdb->esc_like( $q ) . '%';
+            $where[]  = '(sn LIKE %s OR payment_ref LIKE %s)';
+            $params[] = $like;
+            $params[] = $like;
+        }
+        if ( $from && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $from ) ) {
+            $where[]  = 'created_at >= %s';
+            $params[] = $from . ' 00:00:00';
+        }
+        if ( $to && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $to ) ) {
+            $where[]  = 'created_at <= %s';
+            $params[] = $to . ' 23:59:59';
+        }
+        $where_sql = implode( ' AND ', $where );
+
+        $sql_total = "SELECT COUNT(*) FROM $tbl WHERE $where_sql";
+        $total     = (int) $wpdb->get_var( $params ? $wpdb->prepare( $sql_total, $params ) : $sql_total );
+
+        $sql_sum = "SELECT
+            COALESCE(SUM(CASE WHEN payment_status='paid' THEN price_paid ELSE 0 END), 0) AS sum_paid,
+            COALESCE(SUM(CASE WHEN payment_status='refunded' THEN refund_amount ELSE 0 END), 0) AS sum_refunded,
+            COALESCE(SUM(CASE WHEN payment_status='pending' THEN price_paid ELSE 0 END), 0) AS sum_pending
+            FROM $tbl WHERE $where_sql";
+        $summary = $wpdb->get_row( $params ? $wpdb->prepare( $sql_sum, $params ) : $sql_sum, ARRAY_A );
+
+        $sql_rows = "SELECT id, sn, user_id, extension_months, price_paid, payment_method,
+                            payment_status, payment_ref, warranty_until_old, warranty_until_new,
+                            refund_amount, refunded_at, created_at, paid_at
+                     FROM $tbl WHERE $where_sql
+                     ORDER BY created_at DESC LIMIT %d OFFSET %d";
+        $rows_params = array_merge( $params, array( $limit, $offset ) );
+        $rows = $wpdb->get_results( $wpdb->prepare( $sql_rows, $rows_params ), ARRAY_A );
+
+        return rest_ensure_response( array(
+            'rows'    => $rows ?: array(),
+            'meta'    => array(
+                'total'  => $total,
+                'limit'  => $limit,
+                'offset' => $offset,
+            ),
+            'summary' => $summary ?: array( 'sum_paid' => 0, 'sum_refunded' => 0, 'sum_pending' => 0 ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_marketplace_transactions_detail' ) ) {
+    /**
+     * V.0.39 — admin transaction single record.
+     */
+    function dinoco_sn_rest_marketplace_transactions_detail( $req ) {
+        if ( function_exists( 'dinoco_sn_is_enabled' ) && ! dinoco_sn_is_enabled() ) {
+            return new \WP_Error( 'feature_disabled', 'ระบบ SN ถูกปิดอยู่', array( 'status' => 503 ) );
+        }
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_sn_warranty_extensions';
+        $id  = (int) $req->get_param( 'id' );
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM $tbl WHERE id = %d", $id ), ARRAY_A );
+        if ( ! $row ) {
+            return new \WP_Error( 'not_found', 'ไม่พบรายการ', array( 'status' => 404 ) );
+        }
+        // Enrich with user info (defensive — user may have been deleted)
+        $user = $row['user_id'] ? get_userdata( (int) $row['user_id'] ) : null;
+        $row['user_display_name'] = $user ? $user->display_name : '(ผู้ใช้ถูกลบ)';
+        $row['user_phone']        = $user ? get_user_meta( (int) $row['user_id'], 'dinoco_phone', true ) : '';
+        return rest_ensure_response( $row );
     }
 }
 
