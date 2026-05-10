@@ -6817,7 +6817,9 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             // mutation paths (lines 3528, 6047, 6254-6258, 6439, 6618-6622)
             // still emit direct do_action.
             //
-            // R8 baseline = 17 occurrences (counted automatically 2026-05-08).
+            // R8 baseline = 17. R10/V.0.40 ratchet = 18 — intentional bump for
+            // multi-SKU receive handler (dinoco_sn_handler_receive_multi_sku) which
+            // adds 1 fallback do_action when fire_status_changed is unavailable.
             // Each new round MUST not increase this count without a refactor.
             // Decreasing is ENCOURAGED — drift detector flags regressions.
             const code = readSnFile('[System] DINOCO SN REST API');
@@ -6825,7 +6827,7 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
                 /do_action\(\s*['"]dinoco_sn_pool_status_changed/g
             ) || [];
             // Ratchet: must not grow above current baseline
-            expect(matches.length).toBeLessThanOrEqual(17);
+            expect(matches.length).toBeLessThanOrEqual(18);
         });
 
         test('SN REST API V.0.37+ documents R7 fixes in banner', () => {
@@ -7050,6 +7052,48 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
                 }
             });
             expect(violations).toEqual([]);
+        });
+
+        test('Multi-SKU groups[] discriminator handler exists in REST API V.0.40+', () => {
+            const code = fs.readFileSync(
+                path.join(REPO_ROOT, '[System] DINOCO SN REST API'), 'utf8'
+            );
+            // Function must exist
+            expect(code).toMatch(/function\s+dinoco_sn_handler_receive_multi_sku\s*\(/);
+            // Top of bulk handler must route to multi-SKU when groups[] present
+            expect(code).toMatch(/is_array\(\s*\$groups_input\s*\)\s*&&\s*!\s*empty\(\s*\$groups_input\s*\)/);
+            // Validation: collision detector
+            expect(code).toMatch(/sn_collision_across_groups/);
+            // Cap 1000
+            expect(code).toMatch(/Multi-SKU bulk capped at 1000/);
+            // SKU eligibility check
+            expect(code).toMatch(/sku_not_eligible/);
+            // Atomic transaction
+            expect(code).toMatch(/START TRANSACTION[\s\S]*?COMMIT[\s\S]*?ROLLBACK/);
+            // groups_summary in response
+            expect(code).toMatch(/'groups_summary'\s*=>/);
+            // Route accepts both legacy and groups[] (linked_sku required=>false)
+            expect(code).toMatch(/'linked_sku'\s*=>\s*array\(\s*'required'\s*=>\s*false/);
+            expect(code).toMatch(/'groups'\s*=>\s*array\(\s*'required'\s*=>\s*false/);
+            // mode enum includes 'multi_sku'
+            expect(code).toMatch(/'enum'\s*=>\s*array\([^)]*'multi_sku'/);
+        });
+
+        test('Multi-SKU frontend mode tab + handlers exist in Manager V.0.52+', () => {
+            const code = readSnFile('[Admin System] DINOCO Production SN Manager');
+            // New default mode tab
+            expect(code).toMatch(/data-mode="multi"\s+onclick="dncSnSetReceiveMode\('multi'\)"/);
+            // Multi-row container
+            expect(code).toMatch(/id="dnc-sn-multi-rows"/);
+            // Add row button
+            expect(code).toMatch(/dncSnMultiAddRow\(\)/);
+            // Submit handler with /receive/bulk + groups[]
+            expect(code).toMatch(/window\.dncSnMultiSubmit\s*=\s*function/);
+            expect(code).toMatch(/mode:\s*'multi_sku'/);
+            // Picker row routing — _dncSnActivePickerRowId
+            expect(code).toMatch(/_dncSnActivePickerRowId/);
+            // Cross-row collision detection in summary
+            expect(code).toMatch(/dncSnMultiUpdateSummary/);
         });
 
         test('R10 P4: SN pool_stats_recompute heartbeat normalized to autoload=false (was string \'no\')', () => {

@@ -2,6 +2,17 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.40 (2026-05-10) — Boss UX feedback: 1 batch รับ   ║
+ * ║    หลาย SKU. /receive/bulk extended with `groups[]` discriminator║
+ * ║    {batch_id, groups:[{sku, sns:[]}, ...], mode='multi_sku'}.   ║
+ * ║    Atomic transaction across ALL groups (commit-or-rollback).   ║
+ * ║    Cap 1000 plates/req (10× single-SKU). Validation: collision  ║
+ * ║    detector (same SN in 2 groups → 400), SKU eligibility check  ║
+ * ║    (sn_attach_level !== 'none' OR sn_required=1), single SELECT ║
+ * ║    FOR UPDATE (no N+1), per-SKU UPDATE batched. 207 Multi-Status║
+ * ║    response: { groups_summary[], results[] } per-group + per-SN.║
+ * ║    Backward compat: legacy {linked_sku, sns} body still works   ║
+ * ║    untouched. Closes Phase 1 W2.3 + R10 boss UX feedback.       ║
  * ║  Version: V.0.39 (2026-05-10) — Phase 4 W12 F#8 GAP CLOSE:      ║
  * ║    /marketplace/transactions + /transactions/{id} routes were   ║
  * ║    consumed by Tab 11 admin UI (8 fetch sites) but never        ║
@@ -1520,12 +1531,20 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
             'permission_callback' => 'dinoco_sn_perm_warehouse',
             'args'                => array(
                 'batch_id'   => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
-                'linked_sku' => array( 'required' => true, 'type' => 'string',
+                /* V.0.40 (2026-05-10) — linked_sku + sns now optional when groups[]
+                   is present. Validated in handler (XOR check). Multi-SKU groups[]
+                   path supports up to 1000 plates per request, atomic commit-or-
+                   rollback, 207 Multi-Status response with per-group + per-row
+                   outcomes. Backward compatible — existing single-SKU callers
+                   (RPi scanner, frontend Range mode) continue to work unchanged. */
+                'linked_sku' => array( 'required' => false, 'type' => 'string',
                                        'sanitize_callback' => function( $v ) { return strtoupper( trim( (string) $v ) ); } ),
-                'sns'        => array( 'required' => true, 'type' => 'array',
+                'sns'        => array( 'required' => false, 'type' => 'array',
                                        'items' => array( 'type' => 'string' ) ),
+                'groups'     => array( 'required' => false, 'type' => 'array',
+                                       'description' => 'Multi-SKU groups: [{sku, sns:[]}, ...]' ),
                 'mode'       => array( 'type' => 'string', 'default' => 'range',
-                                       'enum' => array( 'range', 'paste', 'scan' ) ),
+                                       'enum' => array( 'range', 'paste', 'scan', 'multi_sku' ) ),
                 'session_id' => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
             ),
         ) );
@@ -3541,10 +3560,20 @@ if ( ! function_exists( 'dinoco_sn_handler_receive_bulk' ) ) {
         global $wpdb;
 
         $batch_id = (int) $req->get_param( 'batch_id' );
-        $sku = strtoupper( trim( (string) $req->get_param( 'linked_sku' ) ) );
-        $sns_input = (array) $req->get_param( 'sns' );
         $mode = sanitize_text_field( (string) $req->get_param( 'mode' ) ) ?: 'range';
         $session_id = sanitize_text_field( (string) $req->get_param( 'session_id' ) );
+
+        /* V.0.40 (2026-05-10) — Multi-SKU groups[] discriminator (boss UX feedback
+           "1 รอบที่สั้งโรงงานมันควรรับได้หลาย SKU"). When `groups` is present,
+           handler delegates to multi-SKU path; otherwise legacy single-SKU path
+           runs untouched (backward compatible). */
+        $groups_input = $req->get_param( 'groups' );
+        if ( is_array( $groups_input ) && ! empty( $groups_input ) ) {
+            return dinoco_sn_handler_receive_multi_sku( $req, $groups_input, $batch_id, $mode, $session_id );
+        }
+
+        $sku = strtoupper( trim( (string) $req->get_param( 'linked_sku' ) ) );
+        $sns_input = (array) $req->get_param( 'sns' );
 
         // Normalize + dedup
         $sns = array_unique( array_map( function( $s ) {
@@ -3748,6 +3777,289 @@ if ( ! function_exists( 'dinoco_sn_handler_receive_bulk' ) ) {
             );
         }
         $http_status = ( $skip_count > 0 ) ? 207 : 200;
+        return new WP_REST_Response( $payload, $http_status );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_handler_receive_multi_sku' ) ) {
+    /**
+     * V.0.40 (2026-05-10) — Multi-SKU bulk receive handler.
+     *
+     * Body shape: { batch_id, groups: [{sku, sns:[]}, ...], mode?, session_id? }
+     *
+     * Atomicity: ALL groups commit-or-rollback in single transaction.
+     * Cap: total SNs across groups ≤ 1000 (10× single-SKU cap; tested for
+     *      MySQL 75s lock budget on commodity hardware).
+     * Validation order (fail-fast):
+     *   1. Each group has sku + sns[]
+     *   2. Total ≤ 1000
+     *   3. Each SKU eligible (sn_attach_level !== 'none' OR sn_required=1)
+     *   4. No SN appears in 2+ groups (collision detector)
+     *   5. After classification, at least 1 SN must be eligible (else 400 empty_input)
+     *
+     * @param WP_REST_Request $req
+     * @param array $groups_raw groups[] from request body
+     * @param int $batch_id
+     * @param string $mode
+     * @param string $session_id
+     * @return WP_REST_Response|WP_Error
+     */
+    function dinoco_sn_handler_receive_multi_sku( $req, $groups_raw, $batch_id, $mode, $session_id ) {
+        global $wpdb;
+
+        if ( $batch_id <= 0 ) {
+            return new WP_Error( 'invalid_input', __( 'batch_id required', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+
+        // Step 1 — Normalize each group + dedup within group
+        $groups = array();
+        foreach ( $groups_raw as $g ) {
+            if ( ! is_array( $g ) ) continue;
+            $sku = strtoupper( trim( (string) ( $g['sku'] ?? '' ) ) );
+            $sns_in = (array) ( $g['sns'] ?? array() );
+            if ( $sku === '' || empty( $sns_in ) ) continue; // silently drop empty
+            $sns = array_unique( array_map( function( $s ) {
+                return strtoupper( trim( (string) $s ) );
+            }, $sns_in ) );
+            $sns = array_filter( $sns, function( $s ) { return $s !== ''; } );
+            if ( empty( $sns ) ) continue;
+            $groups[] = array( 'sku' => $sku, 'sns' => array_values( $sns ) );
+        }
+
+        if ( empty( $groups ) ) {
+            return new WP_Error( 'empty_input', __( 'All groups empty.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+
+        // Step 2 — Total cap
+        $total_count = 0;
+        foreach ( $groups as $g ) $total_count += count( $g['sns'] );
+        if ( $total_count > 1000 ) {
+            return new WP_Error( 'chunk_too_large',
+                sprintf( __( 'Multi-SKU bulk capped at 1000 plates per request, got %d.', 'dinoco-sn' ), $total_count ),
+                array( 'status' => 400 )
+            );
+        }
+
+        // Step 3 — Cross-group collision detection (same SN in 2 groups)
+        $sn_to_skus = array();
+        foreach ( $groups as $g ) {
+            foreach ( $g['sns'] as $sn ) {
+                if ( ! isset( $sn_to_skus[ $sn ] ) ) $sn_to_skus[ $sn ] = array();
+                $sn_to_skus[ $sn ][] = $g['sku'];
+            }
+        }
+        $collisions = array();
+        foreach ( $sn_to_skus as $sn => $skus ) {
+            $u = array_unique( $skus );
+            if ( count( $u ) > 1 ) {
+                $collisions[] = array( 'sn' => $sn, 'skus' => array_values( $u ) );
+            }
+        }
+        if ( ! empty( $collisions ) ) {
+            return new WP_Error( 'sn_collision_across_groups',
+                __( 'Some S/Ns appear in multiple SKU groups.', 'dinoco-sn' ),
+                array( 'status' => 400, 'collisions' => $collisions )
+            );
+        }
+
+        // Step 4 — SKU eligibility check (sn_attach_level !== 'none' OR sn_required=1)
+        $tbl_products = $wpdb->prefix . 'dinoco_products';
+        $skus_to_check = array_unique( array_column( $groups, 'sku' ) );
+        $sku_placeholders = implode( ',', array_fill( 0, count( $skus_to_check ), '%s' ) );
+        $sku_meta = $wpdb->get_results( $wpdb->prepare(
+            "SELECT sku, sn_attach_level, sn_required FROM {$tbl_products}
+             WHERE sku IN ({$sku_placeholders})",
+            $skus_to_check
+        ), ARRAY_A );
+        $sku_meta_map = array();
+        foreach ( $sku_meta as $r ) { $sku_meta_map[ $r['sku'] ] = $r; }
+        $ineligible = array();
+        foreach ( $skus_to_check as $s ) {
+            if ( ! isset( $sku_meta_map[ $s ] ) ) {
+                $ineligible[] = array( 'sku' => $s, 'reason' => 'sku_not_found' );
+                continue;
+            }
+            $m = $sku_meta_map[ $s ];
+            $level = $m['sn_attach_level'] ?? 'none';
+            $req_flag = (int) ( $m['sn_required'] ?? 0 );
+            if ( $level === 'none' && $req_flag === 0 ) {
+                $ineligible[] = array( 'sku' => $s, 'reason' => 'sn_attach_level_none' );
+            }
+        }
+        if ( ! empty( $ineligible ) ) {
+            return new WP_Error( 'sku_not_eligible',
+                __( 'Some SKUs cannot accept plates.', 'dinoco-sn' ),
+                array( 'status' => 400, 'ineligible_skus' => $ineligible )
+            );
+        }
+
+        // Step 5 — Atomic transaction: per-group classification + UPDATE
+        $tbl_pool = dinoco_sn_table( 'pool' );
+        $tbl_batches = dinoco_sn_table( 'batches' );
+
+        $all_results = array();
+        $groups_summary = array();
+        $eligible_per_group = array(); // sku => [sn1, sn2, ...]
+        $eligible_prev_status = array(); // sn => prev_status
+        $total_success = 0;
+        $total_skip = 0;
+
+        try {
+            $wpdb->query( 'START TRANSACTION' );
+
+            // Single SELECT FOR UPDATE across ALL SNs (deadlock-safe vs N queries)
+            $all_sns = array_keys( $sn_to_skus );
+            $sn_placeholders = implode( ',', array_fill( 0, count( $all_sns ), '%s' ) );
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT sn, status, batch_id, linked_sku FROM {$tbl_pool}
+                 WHERE sn IN ({$sn_placeholders}) FOR UPDATE",
+                $all_sns
+            ), ARRAY_A );
+            $existing = array();
+            foreach ( $rows as $r ) { $existing[ $r['sn'] ] = $r; }
+
+            // Classify per group
+            foreach ( $groups as $g ) {
+                $sku = $g['sku'];
+                $sg_ok = 0;
+                $sg_skip = 0;
+                $eligible_per_group[ $sku ] = array();
+
+                foreach ( $g['sns'] as $sn ) {
+                    if ( ! isset( $existing[ $sn ] ) ) {
+                        $all_results[] = array( 'sn' => $sn, 'sku' => $sku, 'status' => 'skip', 'code' => 'sn_not_found' );
+                        $sg_skip++; continue;
+                    }
+                    $row = $existing[ $sn ];
+                    if ( (int) $row['batch_id'] !== $batch_id ) {
+                        $all_results[] = array( 'sn' => $sn, 'sku' => $sku, 'status' => 'skip', 'code' => 'not_in_batch' );
+                        $sg_skip++; continue;
+                    }
+                    if ( $row['status'] === 'in_pool' ) {
+                        $all_results[] = array( 'sn' => $sn, 'sku' => $sku, 'status' => 'skip',
+                            'code' => 'already_received', 'linked_sku' => $row['linked_sku'] );
+                        $sg_skip++; continue;
+                    }
+                    if ( $row['status'] === 'voided' ) {
+                        $all_results[] = array( 'sn' => $sn, 'sku' => $sku, 'status' => 'skip', 'code' => 'voided' );
+                        $sg_skip++; continue;
+                    }
+                    if ( $row['status'] === 'cancelled_batch' ) {
+                        $all_results[] = array( 'sn' => $sn, 'sku' => $sku, 'status' => 'skip', 'code' => 'cancelled_batch' );
+                        $sg_skip++; continue;
+                    }
+                    if ( $row['status'] !== 'reserved' ) {
+                        $all_results[] = array( 'sn' => $sn, 'sku' => $sku, 'status' => 'skip',
+                            'code' => 'invalid_status', 'current_status' => $row['status'] );
+                        $sg_skip++; continue;
+                    }
+                    $eligible_per_group[ $sku ][] = $sn;
+                    $eligible_prev_status[ $sn ] = $row['status'];
+                }
+                // Note: ok count finalized after UPDATE below
+                $groups_summary[] = array( 'sku' => $sku, 'ok' => 0, 'skip' => $sg_skip );
+                $total_skip += $sg_skip;
+            }
+
+            // Per-SKU batch UPDATE (one query per SKU group)
+            foreach ( $eligible_per_group as $sku => $sns_list ) {
+                if ( empty( $sns_list ) ) continue;
+                $upd_ph = implode( ',', array_fill( 0, count( $sns_list ), '%s' ) );
+                $upd_params = array_merge( array( $sku ), $sns_list );
+                $upd = $wpdb->query( $wpdb->prepare(
+                    "UPDATE {$tbl_pool}
+                     SET status = 'in_pool', linked_sku = %s, prev_status = status
+                     WHERE sn IN ({$upd_ph}) AND status = 'reserved'",
+                    $upd_params
+                ) );
+                if ( $upd === false ) {
+                    throw new \RuntimeException( 'multi-SKU UPDATE failed for sku=' . $sku );
+                }
+                $ok = (int) $upd;
+                $total_success += $ok;
+                foreach ( $sns_list as $sn ) {
+                    $all_results[] = array( 'sn' => $sn, 'sku' => $sku, 'status' => 'ok', 'code' => 'received' );
+                }
+                // Backfill summary ok count
+                foreach ( $groups_summary as &$gs ) {
+                    if ( $gs['sku'] === $sku ) { $gs['ok'] = $ok; break; }
+                }
+                unset( $gs );
+            }
+
+            $wpdb->query( 'COMMIT' );
+
+            // Post-COMMIT side effects (audit + dispatcher)
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                foreach ( $eligible_per_group as $sku => $sns_list ) {
+                    foreach ( $sns_list as $sn ) {
+                        dinoco_sn_audit_log( $sn, 'plate_received',
+                            $eligible_prev_status[ $sn ] ?? 'reserved', 'in_pool', array(
+                                'batch_id'   => $batch_id,
+                                'linked_sku' => $sku,
+                                'mode'       => 'multi_sku',
+                                'session_id' => $session_id,
+                            )
+                        );
+                    }
+                }
+            }
+            foreach ( $eligible_per_group as $sku => $sns_list ) {
+                foreach ( $sns_list as $sn ) {
+                    if ( function_exists( 'dinoco_sn_fire_status_changed' ) ) {
+                        dinoco_sn_fire_status_changed( $sn,
+                            $eligible_prev_status[ $sn ] ?? 'reserved', 'in_pool', 0 );
+                    } else {
+                        do_action( 'dinoco_sn_pool_status_changed', $sn,
+                            $eligible_prev_status[ $sn ] ?? 'reserved', 'in_pool' );
+                    }
+                }
+            }
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array(
+                    'context' => 'sn_receive_multi_sku',
+                    'batch_id' => $batch_id,
+                    'group_count' => count( $groups ),
+                    'total_sns' => $total_count,
+                ) );
+            }
+            return new WP_Error( 'bulk_receive_failed', $e->getMessage(), array(
+                'status' => 500, 'success_count' => 0, 'skip_count' => $total_count,
+            ) );
+        }
+
+        // Update batch counter
+        if ( $total_success > 0 ) {
+            $wpdb->query( $wpdb->prepare(
+                "UPDATE {$tbl_batches} SET qty_received = qty_received + %d,
+                 status = CASE WHEN qty_received + %d >= qty_total THEN 'received_full' ELSE 'received_partial' END
+                 WHERE id = %d",
+                $total_success, $total_success, $batch_id
+            ) );
+        }
+
+        $batch = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl_batches} WHERE id = %d", $batch_id ) );
+
+        $payload = array(
+            'success_count'  => $total_success,
+            'skip_count'     => $total_skip,
+            'total'          => $total_count,
+            'mode'           => 'multi_sku',
+            'groups_summary' => $groups_summary,
+            'results'        => $all_results,
+            'batch'          => $batch ? array(
+                'id'           => $batch_id,
+                'qty_received' => (int) $batch->qty_received,
+                'qty_total'    => (int) $batch->qty_total,
+                'progress_pct' => round( ( $batch->qty_received / max( 1, $batch->qty_total ) ) * 100, 2 ),
+                'status'       => $batch->status,
+            ) : null,
+        );
+
+        // 207 if any skip, 200 if all OK
+        $http_status = ( $total_skip > 0 ) ? 207 : 200;
         return new WP_REST_Response( $payload, $http_status );
     }
 }

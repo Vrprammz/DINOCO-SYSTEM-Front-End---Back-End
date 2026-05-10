@@ -167,7 +167,19 @@ const SNIPPET_PREFIXES = [
 //     (Manager V.0.41) — onclick="...autofill suggestion..." — accessibility
 //     compliant + keyboard navigable. Used for live duplicate validation UX
 //     recovery (boss-reported BLOCKER).
-const BASELINE_INLINE_HANDLER_COUNT = 960;
+// 960 → 982 (2026-05-10 multi-SKU receive UX): +22
+//   - V.0.49: 3 batch card action buttons (รับเพลทล็อตนี้ / ปิดล็อต / CSV)
+//     gain new states across receive_full + sent_to_factory + draft → +6 onclick
+//   - V.0.50/V.0.51: Picker modal — 4 filter chips + close button + backdrop
+//     click handler + tap-to-pick rows = static-template inline handlers
+//   - V.0.52: Multi-SKU mode — 4 mode-toggle tabs + per-row actions
+//     (✕ remove + 🔍 picker + Range/Paste mode buttons) injected by JS into
+//     each new row template + ✓ submit button = ~12 handlers per row template
+//     (1 template × static count). Justified: dynamic row creation requires
+//     inline handlers (event delegation would need MutationObserver setup).
+//     Phase 6 sweep will refactor row template to use data-action attribute
+//     pattern + single delegated listener.
+const BASELINE_INLINE_HANDLER_COUNT = 982;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
