@@ -2,6 +2,14 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
  * ║  DB_ID: 1195                                                     ║
+ * ║  Version: V.0.51 (2026-05-10) — Picker bug fix: V.0.50 ใช้ field  ║
+ * ║    names ผิด → res.items, p.title, p.img ทั้งที่ /stock/list   ║
+ * ║    return res.data, p.name, p.image_url (verified line 2204).   ║
+ * ║    Boss screenshot: "ไม่พบสินค้า · พบ 0 รายการ" → response      ║
+ * ║    parse fail → 0 rows → empty UI. Fix: rename fields + filter  ║
+ * ║    by p.product_type (set/child/leaf/single) แทน sn_attach_     ║
+ * ║    level (ไม่อยู่ใน response). Pagination: 5 pages × 100/page     ║
+ * ║    parallel fetch (max 500 SKUs first open).                    ║
  * ║  Version: V.0.50 (2026-05-10) — Boss UX feedback: SKU input ใน  ║
  * ║    รับเพลท tab ไม่ควรเป็น free-text. Port pattern picker จาก    ║
  * ║    Manual Invoice (V.34.6) — modal เปิดมา + filter chips         ║
@@ -5396,26 +5404,51 @@ if ( ! function_exists( 'dinoco_sn_render_admin_js' ) ) {
                 dncSnRcvRenderPicker();
             };
 
+            /* V.0.51 (2026-05-10) — fix field name mismatches with /dinoco-stock/v1/stock/list:
+               wrong: res.items, p.title, p.img → right: res.data, p.name, p.image_url.
+               sn_attach_level field NOT returned by this endpoint — derive "มีเพลท" filter
+               from product_type IN (set, child, leaf) instead.
+               Pagination: stock/list max per_page=100 — fetch up to 5 pages on first open. */
             function dncSnRcvLoadProducts() {
                 var listEl = document.getElementById('dnc-sn-rcv-picker-list');
                 if (listEl) listEl.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:32px;color:#6b7280;">⏳ กำลังโหลด...</td></tr>';
-                fetch('/wp-json/dinoco-stock/v1/stock/list?limit=500', {
-                    headers: { 'X-WP-Nonce': NONCE },
-                    credentials: 'same-origin',
+
+                function fetchPage(page) {
+                    return fetch('/wp-json/dinoco-stock/v1/stock/list?per_page=100&page=' + page, {
+                        headers: { 'X-WP-Nonce': NONCE },
+                        credentials: 'same-origin',
+                    }).then(function(r) { return r.json(); });
+                }
+
+                fetchPage(1).then(function(res) {
+                    var rows = (res && res.data) ? res.data : [];
+                    var totalPages = (res && res.pages) ? Math.min(5, parseInt(res.pages)) : 1;
+                    if (totalPages <= 1) {
+                        return [rows];
+                    }
+                    // Fetch pages 2..N in parallel
+                    var promises = [];
+                    for (var i = 2; i <= totalPages; i++) {
+                        promises.push(fetchPage(i).then(function(r) {
+                            return (r && r.data) ? r.data : [];
+                        }).catch(function() { return []; }));
+                    }
+                    return Promise.all(promises).then(function(rest) {
+                        return [rows].concat(rest);
+                    });
                 })
-                .then(function(r) { return r.json(); })
-                .then(function(res) {
-                    var rows = (res && res.items) ? res.items : (Array.isArray(res) ? res : []);
-                    // Filter: only plate-bearing SKUs (sn_attach_level !== 'none' OR sn_required=1)
-                    window._dncSnRcvPickerCache = rows.map(function(p) {
+                .then(function(pages) {
+                    var allRows = [].concat.apply([], pages);
+                    window._dncSnRcvPickerCache = allRows.map(function(p) {
                         return {
                             sku: p.sku || '',
-                            title: p.title || p.name || '',
-                            img: p.img || p.image_url || '',
-                            price: p.base_price || p.retail || p.price || 0,
-                            sn_attach_level: p.sn_attach_level || 'none',
-                            sn_required: p.sn_required || 0,
-                            type: p.product_type || p.type || '',
+                            title: p.name || '',
+                            img: p.image_url || '',
+                            type: p.product_type || '',
+                            is_set: !!p.is_set,
+                            is_leaf: !!p.is_leaf,
+                            children_count: parseInt(p.children_count || 0),
+                            parent_sku: p.parent_sku || '',
                         };
                     });
                     dncSnRcvRenderPicker();
@@ -5431,12 +5464,16 @@ if ( ! function_exists( 'dinoco_sn_render_admin_js' ) ) {
                 var filter = window._dncSnRcvPickerFilter || 'plate';
                 var q = (window._dncSnRcvPickerSearch || '').toLowerCase();
                 var rows = window._dncSnRcvPickerCache.filter(function(p) {
+                    /* V.0.51 — filter using product_type from /stock/list response.
+                       "มีเพลท" heuristic: anything that's part of hierarchy (set, child, leaf).
+                       "single" = standalone, default no plate. */
                     if (filter === 'plate') {
-                        if ((p.sn_attach_level === 'none' || !p.sn_attach_level) && !p.sn_required) return false;
+                        var t = p.type || '';
+                        if (t === 'single' || t === '') return false;
                     } else if (filter === 'set') {
-                        if (p.sn_attach_level !== 'set') return false;
+                        if (!p.is_set && p.type !== 'set') return false;
                     } else if (filter === 'leaf') {
-                        if (p.sn_attach_level !== 'leaf' && p.sn_attach_level !== 'child') return false;
+                        if (p.type !== 'child' && p.type !== 'leaf' && p.type !== 'grandchild' && !p.is_leaf) return false;
                     }
                     if (q) {
                         var hay = (p.sku + ' ' + p.title).toLowerCase();
@@ -5445,23 +5482,25 @@ if ( ! function_exists( 'dinoco_sn_render_admin_js' ) ) {
                     return true;
                 });
                 if (!rows.length) {
-                    listEl.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:32px;color:#6b7280;">ไม่พบสินค้า</td></tr>';
+                    listEl.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:32px;color:#6b7280;">ไม่พบสินค้า — ลองเปลี่ยน filter เป็น "ทั้งหมด"</td></tr>';
                     document.getElementById('dnc-sn-rcv-picker-count').textContent = '0';
                     return;
                 }
                 document.getElementById('dnc-sn-rcv-picker-count').textContent = rows.length;
                 listEl.innerHTML = rows.slice(0, 200).map(function(p) {
                     var levelBadge = '';
-                    if (p.sn_attach_level === 'set') levelBadge = '<span style="background:#f3e8ff;color:#7c3aed;font-size:0.7rem;padding:2px 6px;border-radius:8px;margin-left:6px;">SET</span>';
-                    else if (p.sn_attach_level === 'child') levelBadge = '<span style="background:#dbeafe;color:#2563eb;font-size:0.7rem;padding:2px 6px;border-radius:8px;margin-left:6px;">CHILD</span>';
-                    else if (p.sn_attach_level === 'leaf') levelBadge = '<span style="background:#dcfce7;color:#059669;font-size:0.7rem;padding:2px 6px;border-radius:8px;margin-left:6px;">LEAF</span>';
+                    var t = p.type || '';
+                    if (t === 'set' || p.is_set) levelBadge = '<span style="background:#f3e8ff;color:#7c3aed;font-size:0.7rem;padding:2px 6px;border-radius:8px;margin-left:6px;">SET</span>';
+                    else if (t === 'child') levelBadge = '<span style="background:#dbeafe;color:#2563eb;font-size:0.7rem;padding:2px 6px;border-radius:8px;margin-left:6px;">CHILD</span>';
+                    else if (t === 'leaf' || t === 'grandchild' || p.is_leaf) levelBadge = '<span style="background:#dcfce7;color:#059669;font-size:0.7rem;padding:2px 6px;border-radius:8px;margin-left:6px;">LEAF</span>';
+                    else if (t === 'single') levelBadge = '<span style="background:#f3f4f6;color:#6b7280;font-size:0.7rem;padding:2px 6px;border-radius:8px;margin-left:6px;">เดี่ยว</span>';
                     var thumb = p.img
                         ? '<img src="' + escapeHtml(p.img) + '" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:6px;background:#f1f5f9;" loading="lazy">'
                         : '<div style="width:48px;height:48px;background:#f1f5f9;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:1.2rem;">📦</div>';
                     return '<tr style="cursor:pointer;border-bottom:1px solid #f1f5f9;" onclick="dncSnRcvPickProduct(\'' + escapeHtml(p.sku).replace(/'/g, "\\'") + '\',\'' + escapeHtml(p.title).replace(/'/g, "\\'") + '\')">' +
                         '<td style="padding:8px;">' + thumb + '</td>' +
                         '<td style="padding:8px;">' +
-                            '<div style="font-weight:600;font-size:14px;">' + escapeHtml(p.title) + levelBadge + '</div>' +
+                            '<div style="font-weight:600;font-size:14px;color:#1f2937;">' + escapeHtml(p.title) + levelBadge + '</div>' +
                             '<div style="color:#94a3b8;font-size:12px;font-family:monospace;">' + escapeHtml(p.sku) + '</div>' +
                         '</td>' +
                         '<td style="padding:8px;text-align:right;">' +
