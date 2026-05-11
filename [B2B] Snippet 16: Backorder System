@@ -1,6 +1,22 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.3.19 (2026-05-11) — "สินค้าหมดสต็อก" → BO flow (ไม่ใช่ reject!).            ║
+ * ║    Boss reminded: "ระบบ BO ที่สร้างไว้ละ ไม่มีของก็ต้องไปเข้า Flow BO ลงไว้บอกวันที่      ║
+ * ║    สินค้าจะเข้า". V.3.18 reason picker มี "📦 สินค้าหมดสต็อก" ที่ผิด — มันเรียก reject    ║
+ * ║    ยกเลิกออเดอร์ทั้งหมด แทนที่จะ split ไป BO รอของ.                                       ║
+ * ║    Changes:                                                                              ║
+ * ║    (1) ลบ "สินค้าหมดสต็อก" จาก reject options — เหลือ 3 reasons (ยกเลิกการขาย/ราคา/อื่นๆ)║
+ * ║    (2) เพิ่มปุ่ม primary "📦 หมดสต็อก → เข้า BO" (amber bg) บนสุดของ reason picker         ║
+ * ║    (3) NEW Flex `b2b_build_flex_bo_eta_picker` — 4 quick-pick (7/14/30/45 วัน) +         ║
+ * ║        ปุ่ม datetimepicker "เลือกวันที่เอง" (mode=date, range +1 ถึง +180 วัน)              ║
+ * ║    (4) 2 NEW postback handlers:                                                          ║
+ * ║        - bo_to_backorder → push Flex ETA picker                                          ║
+ * ║        - bo_set_eta_all (quick-pick) + bo_set_eta_date (datetimepicker) →                ║
+ * ║          build splits all items qty_bo + eta_days → call b2b_rest_bo_split internal       ║
+ * ║        → existing bo-split flow fires customer Flex `partial_fulfill` พร้อม ETA           ║
+ * ║    Reuse existing BO infrastructure: bo_queue table + ETA cron + bo-fulfill + restock    ║
+ * ║    scan + bo_ready notify → ทำงานครบ flow.                                                ║
  * ║  Version: V.3.18 (2026-05-11) — 🔴 CRITICAL: customer reject notify silent fail + add  ║
  * ║    reason picker. Boss reported: admin กด "❌ ยกเลิกออเดอร์" → กลุ่มตัวแทนไม่ได้รับ      ║
  * ║    แจ้งเตือน + ไม่มีเหตุผล. Root cause: b2b_bo_notify_customer_rejected() ใช้           ║
@@ -4043,14 +4059,29 @@ if ( ! function_exists( 'b2b_build_flex_bo_reject_reasons' ) ) {
                 ),
             );
 
+        // V.3.19 (2026-05-11): สินค้าหมดสต็อกแยกไป "BO Flow" (ไม่ใช่ reject) —
+        // ลูกค้ารอของ + ได้ ETA. 3 reasons เหลือสำหรับ actual cancellation only.
         $reasons = array(
-            array( 'emoji' => '📦', 'label' => 'สินค้าหมดสต็อก',       'value' => 'สินค้าหมดสต็อก' ),
             array( 'emoji' => '🚫', 'label' => 'สินค้ายกเลิกการขาย',  'value' => 'สินค้ายกเลิกการขาย' ),
             array( 'emoji' => '💰', 'label' => 'ราคาผิดพลาด',          'value' => 'ราคาผิดพลาด' ),
             array( 'emoji' => '❓', 'label' => 'อื่นๆ (แชทรายละเอียด)', 'value' => 'อื่นๆ' ),
         );
 
         $buttons = array();
+        // 🆕 Primary action: BO flow (highlight green — recommended path เมื่อ stock issue)
+        $buttons[] = array(
+            'type'   => 'button',
+            'style'  => 'primary',
+            'color'  => '#f59e0b',  // amber — ไม่ใช่ destructive แต่ requires attention
+            'action' => array(
+                'type'        => 'postback',
+                'label'       => '📦 หมดสต็อก → เข้า BO',
+                'data'        => "action=bo_to_backorder&order_id={$order_id}",
+                'displayText' => "ส่งเข้า BO รอของ #{$order_id}",
+            ),
+        );
+        $buttons[] = array( 'type' => 'separator', 'margin' => 'sm' );
+        // Reject options (actual cancellation)
         foreach ( $reasons as $r ) {
             $btn_label = "{$r['emoji']} {$r['label']}";
             // Truncate label to 20 chars (LINE Flex button label limit)
@@ -4080,6 +4111,86 @@ if ( ! function_exists( 'b2b_build_flex_bo_reject_reasons' ) ) {
                     'contents' => array(
                         array( 'type' => 'text', 'text' => "กรุณาเลือกเหตุผลปฏิเสธออเดอร์ #{$ticket_no}", 'size' => 'sm', 'color' => '#1f2937', 'wrap' => true ),
                         array( 'type' => 'text', 'text' => 'ลูกค้าจะได้รับแจ้งเตือนพร้อมเหตุผล', 'size' => 'xs', 'color' => '#6b7280', 'wrap' => true, 'margin' => 'xs' ),
+                    ),
+                ),
+                'footer' => array(
+                    'type' => 'box', 'layout' => 'vertical', 'spacing' => 'sm',
+                    'contents' => $buttons,
+                ),
+            ),
+        );
+    }
+}
+
+// V.3.19 (2026-05-11): NEW ETA picker — admin เลือกวันที่สินค้าจะเข้า → call bo-split
+// กับ all items qty_bo (= ทุกชิ้นเข้า BO รอของ) + ETA → customer ได้ Flex partial_fulfill
+// ที่บอก "รอ N วัน + ETA วันที่ X"
+if ( ! function_exists( 'b2b_build_flex_bo_eta_picker' ) ) {
+    function b2b_build_flex_bo_eta_picker( $order_id ) {
+        $order_id = (int) $order_id;
+        $ticket_no = get_the_title( $order_id );
+
+        $header = function_exists( 'b2b_flex_logo_header' )
+            ? b2b_flex_logo_header( '📅 สินค้าจะเข้าเมื่อไร?', "ออเดอร์ #{$order_id}", '#f59e0b', '#ffffff' )
+            : array(
+                'type' => 'box', 'layout' => 'vertical',
+                'backgroundColor' => '#f59e0b', 'paddingAll' => '16px',
+                'contents' => array(
+                    array( 'type' => 'text', 'text' => '📅 สินค้าจะเข้าเมื่อไร?', 'color' => '#ffffff', 'weight' => 'bold', 'size' => 'md', 'wrap' => true ),
+                    array( 'type' => 'text', 'text' => "ออเดอร์ #{$order_id}", 'color' => '#fef3c7', 'size' => 'xs', 'margin' => 'xs', 'wrap' => true ),
+                ),
+            );
+
+        // ETA quick-pick (วันจากวันนี้)
+        $eta_options = array(
+            array( 'days' => 7,  'label' => '📅 รอ 7 วัน' ),
+            array( 'days' => 14, 'label' => '📅 รอ 14 วัน' ),
+            array( 'days' => 30, 'label' => '📅 รอ 30 วัน' ),
+            array( 'days' => 45, 'label' => '📅 รอ 45 วัน' ),
+        );
+
+        $buttons = array();
+        foreach ( $eta_options as $opt ) {
+            $eta_date = date_i18n( 'j M Y', strtotime( "+{$opt['days']} days", current_time( 'timestamp' ) ) );
+            $buttons[] = array(
+                'type'   => 'button',
+                'style'  => 'secondary',
+                'action' => array(
+                    'type'        => 'postback',
+                    'label'       => $opt['label'],
+                    'data'        => "action=bo_set_eta_all&order_id={$order_id}&eta_days={$opt['days']}",
+                    'displayText' => "ส่ง #{$order_id} เข้า BO · ETA {$eta_date}",
+                ),
+            );
+        }
+
+        // ปุ่ม "เลือกวันที่เอง" — LINE datetimepicker (mode=date)
+        $buttons[] = array(
+            'type'   => 'button',
+            'style'  => 'primary',
+            'color'  => '#1e3a8a',
+            'action' => array(
+                'type'    => 'datetimepicker',
+                'label'   => '📆 เลือกวันที่เอง',
+                'data'    => "action=bo_set_eta_date&order_id={$order_id}",
+                'mode'    => 'date',
+                'initial' => date( 'Y-m-d', strtotime( '+14 days', current_time( 'timestamp' ) ) ),
+                'min'     => date( 'Y-m-d', current_time( 'timestamp' ) ),
+                'max'     => date( 'Y-m-d', strtotime( '+180 days', current_time( 'timestamp' ) ) ),
+            ),
+        );
+
+        return array(
+            'type'    => 'flex',
+            'altText' => "📅 เลือก ETA สินค้า #{$order_id}",
+            'contents' => array(
+                'type' => 'bubble',
+                'header' => $header,
+                'body' => array(
+                    'type' => 'box', 'layout' => 'vertical', 'spacing' => 'sm',
+                    'contents' => array(
+                        array( 'type' => 'text', 'text' => "ลูกค้าจะได้รับแจ้งว่ารอของ #{$ticket_no}", 'size' => 'sm', 'color' => '#1f2937', 'wrap' => true ),
+                        array( 'type' => 'text', 'text' => 'พร้อมวันที่คาดว่าจะได้รับสินค้า', 'size' => 'xs', 'color' => '#6b7280', 'wrap' => true, 'margin' => 'xs' ),
                     ),
                 ),
                 'footer' => array(
@@ -4243,6 +4354,86 @@ add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params,
                         : 'ลองเปิด Admin Dashboard เพื่อตรวจสอบ';
                     b2b_line_reply( $reply_token, "⚠️ ยืนยันเต็มไม่สำเร็จ #{$order_id}\n{$err_msg}\n({$hint})" );
                 }
+            }
+        }
+        return true;
+    }
+
+    // V.3.19 (2026-05-11): NEW postback bo_to_backorder — สินค้าหมดสต็อก, route ไป BO flow
+    // (ไม่ใช่ reject!). แสดง Flex ETA picker → admin เลือก ETA → call bo-split with all qty_bo
+    if ( $action === 'bo_to_backorder' ) {
+        $order_id = (int) ( $params['order_id'] ?? 0 );
+        if ( $order_id && function_exists( 'b2b_build_flex_bo_eta_picker' ) ) {
+            $picker = b2b_build_flex_bo_eta_picker( $order_id );
+            if ( $picker && function_exists( 'b2b_push_raw_to_admin' ) ) {
+                b2b_push_raw_to_admin( array( $picker ) );
+            }
+        }
+        return true;
+    }
+
+    // V.3.19: bo_set_eta_all — admin เลือก ETA quick-pick (7/14/30/45 วัน) → all items → BO
+    if ( $action === 'bo_set_eta_all' || $action === 'bo_set_eta_date' ) {
+        $order_id = (int) ( $params['order_id'] ?? 0 );
+        if ( ! $order_id ) return true;
+
+        // Compute ETA days from params
+        $eta_days = 0;
+        if ( $action === 'bo_set_eta_all' ) {
+            $eta_days = (int) ( $params['eta_days'] ?? 0 );
+        } else {
+            // datetimepicker → postback.params.date = "YYYY-MM-DD"
+            $picked_date = sanitize_text_field( $params['date'] ?? '' );
+            if ( $picked_date && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $picked_date ) ) {
+                $ts_today = strtotime( date( 'Y-m-d', current_time( 'timestamp' ) ) );
+                $ts_eta   = strtotime( $picked_date );
+                $eta_days = max( 1, (int) round( ( $ts_eta - $ts_today ) / 86400 ) );
+            }
+        }
+        if ( $eta_days < 1 || $eta_days > 365 ) {
+            if ( function_exists( 'b2b_line_reply' ) ) {
+                b2b_line_reply( $reply_token, "⚠️ ETA ไม่ถูกต้อง (1-365 วัน)" );
+            }
+            return true;
+        }
+
+        // Build splits: all items qty_bo (qty_fulfill=0)
+        $order_text   = get_field( 'order_items', $order_id ) ?: '';
+        $parsed_items = function_exists( 'b2b_bo_parse_order_items' ) ? b2b_bo_parse_order_items( $order_text ) : array();
+        if ( empty( $parsed_items ) ) {
+            if ( function_exists( 'b2b_line_reply' ) ) {
+                b2b_line_reply( $reply_token, "⚠️ ไม่พบรายการสินค้าใน #{$order_id}" );
+            }
+            return true;
+        }
+        $splits = array();
+        foreach ( $parsed_items as $pi ) {
+            $splits[] = array(
+                'sku'         => (string) $pi['sku'],
+                'qty_fulfill' => 0,
+                'qty_bo'      => (int) $pi['qty'],
+                'eta_days'    => $eta_days,
+            );
+        }
+
+        // Call bo-split internal
+        $req = new WP_REST_Request();
+        $req->set_param( 'order_id', $order_id );
+        $req->set_param( 'splits', $splits );
+        $result = function_exists( 'b2b_rest_bo_split' ) ? b2b_rest_bo_split( $req ) : null;
+
+        if ( function_exists( 'b2b_line_reply' ) ) {
+            $eta_date_text = date_i18n( 'j M Y', strtotime( "+{$eta_days} days", current_time( 'timestamp' ) ) );
+            if ( ! is_wp_error( $result ) && $result !== null ) {
+                $ticket_no = get_the_title( $order_id );
+                b2b_line_reply( $reply_token,
+                    "📦 ส่งเข้า BO #{$ticket_no}\n" .
+                    "ETA: {$eta_date_text} (รอ {$eta_days} วัน)\n" .
+                    "— ลูกค้าได้รับแจ้งเตือนแล้ว"
+                );
+            } else {
+                $err_msg = is_wp_error( $result ) ? $result->get_error_message() : 'unknown error';
+                b2b_line_reply( $reply_token, "⚠️ ส่งเข้า BO ไม่สำเร็จ #{$order_id}\n{$err_msg}" );
             }
         }
         return true;

@@ -112,8 +112,7 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
         const code = read('s16');
         // Reason picker builder exists
         expect(code).toMatch(/function b2b_build_flex_bo_reject_reasons/);
-        // 4 quick-pick reasons present
-        expect(code).toMatch(/สินค้าหมดสต็อก/);
+        // 3 reject reasons (V.3.19: หมดสต็อก moved to BO flow, not reject)
         expect(code).toMatch(/สินค้ายกเลิกการขาย/);
         expect(code).toMatch(/ราคาผิดพลาด/);
         // Footer button now triggers picker (not direct reject)
@@ -125,6 +124,31 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
         expect(stripped).toMatch(/action=bo_reject_picker&order_id=/);
         // Postback handler dispatches bo_reject_picker
         expect(stripped).toMatch(/\$action === ['"]bo_reject_picker['"]/);
+    });
+
+    test('Snippet 16 V.3.19 — "หมดสต็อก" routes to BO flow (not reject) + ETA picker', () => {
+        const code = read('s16');
+        // ETA picker Flex builder exists
+        expect(code).toMatch(/function b2b_build_flex_bo_eta_picker/);
+        // 4 ETA quick-pick options + datetimepicker
+        expect(code).toMatch(/รอ 7 วัน/);
+        expect(code).toMatch(/รอ 14 วัน/);
+        expect(code).toMatch(/รอ 30 วัน/);
+        expect(code).toMatch(/รอ 45 วัน/);
+        expect(code).toMatch(/'type'\s*=>\s*'datetimepicker'/);
+        expect(code).toMatch(/'mode'\s*=>\s*'date'/);
+        // Reason picker has "หมดสต็อก → BO" button (NOT reject)
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        expect(stripped).toMatch(/action=bo_to_backorder&order_id=/);
+        // Postback handlers exist
+        expect(stripped).toMatch(/\$action === ['"]bo_to_backorder['"]/);
+        expect(stripped).toMatch(/\$action === ['"]bo_set_eta_all['"]/);
+        // bo_set_eta_all/date routes to b2b_rest_bo_split (existing BO infrastructure)
+        expect(stripped).toMatch(/b2b_rest_bo_split\s*\(\s*\$req\s*\)/);
     });
 
     test('Snippet 16 V.3.17 — button labels updated per ux-ui-expert (no "ยืนยันเต็ม" / "ปฏิเสธ")', () => {
