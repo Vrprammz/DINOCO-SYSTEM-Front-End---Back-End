@@ -1,6 +1,20 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.3.22 (2026-05-11) — DEEP REVIEW round 2 fixes (1 critical + 2 BLOCKER + 2  ║
+ * ║    HIGH ที่ V.3.21 ครอบไม่ทัน — บอสรายงาน Order #6311 "ไม่มี Flex กลับมาห้องตัวแทน"):    ║
+ * ║    🎯 V.3.21: _b2b_rest_bo_confirm_full_inner เพิ่ม customer Flex stock_confirmed push  ║
+ * ║       (BO confirm_full ไม่เคย notify ลูกค้า — ลูกค้า stuck รอ Flex ที่ไม่มา)            ║
+ * ║    🔴 B1: Snippet 2 V.34.33 b2b_action_confirm_bill รับ partial_fulfilled status        ║
+ * ║       เดิม allow แค่ awaiting_confirm → ลูกค้า bo-split ได้ Flex "ยืนยันบิล" แต่กดไม่ได้  ║
+ * ║       (is_billed guard ที่มีอยู่ป้องกัน double-debt อยู่แล้ว — ไม่ต้องเพิ่ม)               ║
+ * ║    🔴 B2: bo_cancel_item ที่ทุก BO row cancel หมด → state awaiting_confirm → push        ║
+ * ║       customer Flex stock_confirmed (mirror V.3.21 pattern) ลูกค้ารู้ว่ายืนยันบิลได้แล้ว.   ║
+ * ║    🟠 H1: bo_undo_split → customer text notify "กลับไปรอตรวจสต็อกใหม่"                    ║
+ * ║    🟠 H2: bo_to_backorder status guard — admin กดซ้ำหลัง split สำเร็จ → friendly reply  ║
+ * ║       แทน ETA picker ที่ทำ flow fail invalid_status.                                      ║
+ * ║    🟡 M1: Snippet 2 status_th array เพิ่ม pending_stock_review + partial_fulfilled       ║
+ * ║       (เดิมโชว์ raw key ลูกค้างง).                                                         ║
  * ║  Version: V.3.20 (2026-05-11) — fullstack-developer code review fixes (1 BLOCKER + 3   ║
  * ║    HIGH + 2 MEDIUM ที่ผมพลาดใน V.3.13-V.3.19):                                          ║
  * ║    🔴 B1: Snippet 2 V.34.32 admin postback gate ก่อน filter dispatch (BO actions ใหม่    ║
@@ -2078,6 +2092,34 @@ if ( ! function_exists( '_b2b_rest_bo_confirm_full_inner' ) ) {
         // V.1.9 PERF-H4: pending_review_count drops → invalidate summary cache
         b2b_bo_invalidate_summary_cache();
 
+        // 🎯 V.3.21 (2026-05-11) CRITICAL FIX: บอสรายงาน Order #6311 — admin กด
+        // "ส่งครบทุกชิ้น" → admin group ได้ "✅ ยืนยันสต็อกเต็ม รอลูกค้ายืนยันบิล" แต่
+        // กลุ่ม BKK SHOP TEST ไม่มี Flex ยืนยันบิลกลับมาเลย → ลูกค้า stuck.
+        // Root cause: BO flow ไม่ได้เลียน pattern ของ legacy b2b_action_stock_confirm
+        // (Snippet 2 line 1044) ที่ push Flex `stock_confirmed` ให้ลูกค้า. FSM transition
+        // ไป awaiting_confirm ไม่ trigger customer notify hook โดยอัตโนมัติ.
+        // Fix: push Flex stock_confirmed ตรงนี้ — same pattern + same builder.
+        $group_id = function_exists( 'b2b_bo_resolve_customer_group_id' )
+            ? b2b_bo_resolve_customer_group_id( $order_id )
+            : (string) get_field( 'source_group_id', $order_id );
+        if ( $group_id && function_exists( 'b2b_build_flex_stock_confirmed' ) ) {
+            $total      = floatval( get_field( 'total_amount', $order_id ) );
+            $order_text = get_field( 'order_items', $order_id ) ?: '';
+            $flex = b2b_build_flex_stock_confirmed( $order_id, $total, $order_text );
+            if ( $flex ) {
+                if ( function_exists( 'b2b_push_guaranteed' ) ) {
+                    b2b_push_guaranteed( $group_id, array( $flex ), $order_id, 'stock_confirmed' );
+                } elseif ( function_exists( 'b2b_line_push_raw' ) ) {
+                    b2b_line_push_raw( $group_id, array( $flex ) );
+                }
+                if ( function_exists('b2b_log') ) b2b_log( '[BO-ConfirmFull] customer Flex stock_confirmed pushed #' . $order_id . ' group=' . substr($group_id,0,8) );
+            } else {
+                if ( function_exists('b2b_log') ) b2b_log( '[BO-ConfirmFull] WARN: stock_confirmed Flex builder returned empty #' . $order_id );
+            }
+        } else {
+            if ( function_exists('b2b_log') ) b2b_log( '[BO-ConfirmFull] WARN: no group_id or builder unavailable #' . $order_id );
+        }
+
         return rest_ensure_response( array( 'success' => true, 'order_id' => $order_id, 'status' => 'awaiting_confirm' ) );
     }
 }
@@ -2398,6 +2440,21 @@ if ( ! function_exists( '_b2b_rest_bo_undo_split_inner' ) ) {
 
         // V.1.9 PERF-H4: counts shifted (pending_review_count ↑, bo_pending_count ↓) → invalidate
         b2b_bo_invalidate_summary_cache();
+
+        // 🟠 V.3.22 (2026-05-11) HIGH H1 fix: ลูกค้าได้ Flex partial_fulfill "ยืนยันบิล" แล้ว
+        // → admin undo split → state revert → ลูกค้ากดยืนยันบิล → reject "ดำเนินการไปแล้ว".
+        // ส่ง text แจ้งให้รู้ว่ารอตรวจสต็อกใหม่.
+        $cust_gid = function_exists( 'b2b_bo_resolve_customer_group_id' )
+            ? b2b_bo_resolve_customer_group_id( $order_id )
+            : (string) get_field( 'source_group_id', $order_id );
+        if ( $cust_gid && function_exists( 'b2b_line_push' ) ) {
+            $ticket_no = get_the_title( $order_id );
+            b2b_line_push( $cust_gid,
+                "⏳ ออเดอร์ #{$ticket_no} กลับไปรอแอดมินตรวจสอบสต็อกใหม่\n" .
+                "(แอดมินขอแก้ไขรายการ — รอแจ้งผลใหม่อีกครั้งภายใน 2-4 ชม.)"
+            );
+            if ( function_exists('b2b_log') ) b2b_log( '[BO-UndoSplit] customer notify revert #' . $order_id );
+        }
 
         return rest_ensure_response( array( 'success' => true, 'order_id' => $order_id, 'status' => 'pending_stock_review' ) );
     }
@@ -2976,9 +3033,29 @@ if ( ! function_exists( 'b2b_rest_bo_cancel_item' ) ) {
             if ( $dist_id && function_exists( 'b2b_recalculate_debt' ) ) {
                 b2b_recalculate_debt( $dist_id );
             }
+
+            // 🔴 V.3.22 (2026-05-11) BLOCKER B2 fix: ทุก BO ถูก cancel หมด → state
+            // awaiting_confirm — ต้อง push customer Flex "ยืนยันบิล" เลียน confirm_full path.
+            // เดิมลูกค้าได้แค่ bo_cancelled Flex per item → ไม่รู้ว่าออเดอร์พร้อมยืนยันบิลแล้ว.
+            $cust_gid = function_exists( 'b2b_bo_resolve_customer_group_id' )
+                ? b2b_bo_resolve_customer_group_id( $order_id )
+                : (string) get_field( 'source_group_id', $order_id );
+            if ( $cust_gid && function_exists( 'b2b_build_flex_stock_confirmed' ) ) {
+                $bo_total      = floatval( get_field( 'total_amount', $order_id ) );
+                $bo_order_text = get_field( 'order_items', $order_id ) ?: '';
+                $confirm_flex  = b2b_build_flex_stock_confirmed( $order_id, $bo_total, $bo_order_text );
+                if ( $confirm_flex ) {
+                    if ( function_exists( 'b2b_push_guaranteed' ) ) {
+                        b2b_push_guaranteed( $cust_gid, array( $confirm_flex ), $order_id, 'stock_confirmed_after_cancel' );
+                    } elseif ( function_exists( 'b2b_line_push_raw' ) ) {
+                        b2b_line_push_raw( $cust_gid, array( $confirm_flex ) );
+                    }
+                    if ( function_exists('b2b_log') ) b2b_log( '[BO-CancelItem] all resolved → push stock_confirmed Flex #' . $order_id );
+                }
+            }
         }
 
-        // Notify customer
+        // Notify customer (per-item cancelled notice — ยังคงไว้คู่กับ stock_confirmed Flex ด้านบน)
         if ( function_exists( 'b2b_bo_notify_customer_bo_cancelled' ) && $row_before ) {
             b2b_bo_notify_customer_bo_cancelled( $order_id, $row_before, $reason );
         }
@@ -4386,6 +4463,27 @@ add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params,
         $order_id = (int) ( $params['order_id'] ?? 0 );
         if ( ! $order_id ) {
             b2b_log( '[BO-Backorder] missing order_id in postback' );
+            return true;
+        }
+        // 🟠 V.3.22 (2026-05-11) HIGH H2 fix: status guard ก่อน push ETA picker.
+        // เดิม admin กดซ้ำ "หมดสต็อก → BO" หลัง confirm_full / split สำเร็จแล้ว →
+        // ETA picker ขึ้นใหม่ → admin เลือก → fail invalid_status. ตรวจ status ก่อน
+        // → admin reply friendly ทันที.
+        $current_status = get_field( 'order_status', $order_id );
+        if ( $current_status !== 'pending_stock_review' ) {
+            $st_th = array(
+                'awaiting_confirm'  => 'รอลูกค้ายืนยันบิล',
+                'partial_fulfilled' => 'แยกส่งบางส่วน (รอ BO) แล้ว',
+                'cancelled'         => 'ถูกยกเลิกแล้ว',
+                'awaiting_payment'  => 'รอชำระเงิน',
+                'paid'              => 'ชำระแล้ว',
+                'shipped'           => 'จัดส่งแล้ว',
+                'completed'         => 'เสร็จสิ้น',
+            );
+            $st_label = $st_th[$current_status] ?? $current_status;
+            if ( function_exists( 'b2b_line_reply' ) ) {
+                b2b_line_reply( $reply_token, "ℹ️ ออเดอร์ #{$order_id} ไม่อยู่ในขั้นตอนรอตรวจสต็อกแล้ว\n(สถานะปัจจุบัน: {$st_label})" );
+            }
             return true;
         }
         if ( function_exists( 'b2b_build_flex_bo_eta_picker' ) ) {

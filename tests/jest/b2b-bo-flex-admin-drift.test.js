@@ -270,6 +270,71 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
         expect(stripped).toMatch(/past-date rejected/);
     });
 
+    test('Snippet 16 V.3.21 — bo_confirm_full pushes customer stock_confirmed Flex (CRITICAL fix #6311)', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // _b2b_rest_bo_confirm_full_inner must call b2b_build_flex_stock_confirmed for customer
+        const innerFn = stripped.match(/function _b2b_rest_bo_confirm_full_inner[\s\S]{0,3000}?return rest_ensure_response/);
+        expect(innerFn).not.toBeNull();
+        expect(innerFn[0]).toMatch(/b2b_build_flex_stock_confirmed/);
+        expect(innerFn[0]).toMatch(/b2b_bo_resolve_customer_group_id/);
+    });
+
+    test('Snippet 2 V.34.33 — b2b_action_confirm_bill accepts partial_fulfilled (BLOCKER B1)', () => {
+        const s2 = fs.readFileSync(path.join(REPO_ROOT, '[B2B] Snippet 2: LINE Webhook Gateway & Order Creator'), 'utf8');
+        const stripped = s2
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // Must check both awaiting_confirm + partial_fulfilled
+        expect(stripped).toMatch(/in_array\(\s*\$status\s*,\s*array\(\s*'awaiting_confirm'\s*,\s*'partial_fulfilled'/);
+        // status_th array has new BO labels
+        expect(stripped).toMatch(/'pending_stock_review'\s*=>\s*'แอดมินกำลังตรวจสต็อก'/);
+        expect(stripped).toMatch(/'partial_fulfilled'\s*=>\s*'จัดส่งบางส่วน/);
+    });
+
+    test('Snippet 16 V.3.22 — bo_cancel_item all_resolved pushes stock_confirmed (BLOCKER B2)', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // bo_cancel_item all-resolved branch must have stock_confirmed_after_cancel push
+        expect(stripped).toMatch(/stock_confirmed_after_cancel/);
+    });
+
+    test('Snippet 16 V.3.22 — bo_undo_split notifies customer (HIGH H1)', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // undo_split block must push text to customer about revert
+        const undoFn = stripped.match(/'undo_split'[\s\S]{0,2000}?return rest_ensure_response[^)]*pending_stock_review/);
+        expect(undoFn).not.toBeNull();
+        expect(undoFn[0]).toMatch(/กลับไปรอแอดมินตรวจสอบสต็อก/);
+    });
+
+    test('Snippet 16 V.3.22 — bo_to_backorder status guard (HIGH H2)', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // bo_to_backorder must check status — search broader chunk after action match
+        const handler = stripped.match(/\$action === 'bo_to_backorder'[\s\S]{0,2500}/);
+        expect(handler).not.toBeNull();
+        expect(handler[0]).toMatch(/\$current_status\s*!==\s*'pending_stock_review'/);
+    });
+
     test('Snippet 14 FSM has pending_stock_review state with admin transitions', () => {
         const code = read('s14');
         const psrBlock = code.match(/['"]pending_stock_review['"]\s*=>\s*array\(([\s\S]*?)\),\s*\n\s*['"]/);
