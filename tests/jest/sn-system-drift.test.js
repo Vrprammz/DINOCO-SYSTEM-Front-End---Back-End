@@ -783,6 +783,90 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(fs.existsSync(testFile)).toBe(true);
     });
 
+    test('Phase 6 — Inventory Edit Product modal: SN plate configuration UI (boss feedback)', () => {
+        // Boss feedback (2026-05-08): "ระบบ รับเพลทเข้าใจสินค้า แม่ ลูก หลาน หรือเดี่ยวไหม?
+        // เราไม่ได้ออก เพลท ให้กับสินค้าทุกชิ้น" → admin needs per-SKU plate level config.
+        // Source of truth = wp_dinoco_products.sn_attach_level/sn_required/sn_qty_per_unit.
+        const invFile = path.join(REPO_ROOT, '[Admin System] DINOCO Global Inventory Database');
+        const code = fs.readFileSync(invFile, 'utf8');
+
+        // V.46.1 marker in version header
+        expect(code).toMatch(/V\.46\.1.*Phase 6 SN Plate Configuration/);
+
+        // Edit Product modal has SN Plate Configuration section (4 radio options)
+        expect(code).toMatch(/name="sn_attach_level"\s+value="none"/);
+        expect(code).toMatch(/name="sn_attach_level"\s+value="set"/);
+        expect(code).toMatch(/name="sn_attach_level"\s+value="child"/);
+        expect(code).toMatch(/name="sn_attach_level"\s+value="leaf"/);
+
+        // sn_required checkbox + sn_qty_per_unit input
+        expect(code).toContain('id="cat-sn-required"');
+        expect(code).toContain('id="cat-sn-qty-per-unit"');
+
+        // Backend save handler reads POST fields + writes to wp_dinoco_products
+        expect(code).toMatch(/\$_POST\[\s*['"]sn_attach_level['"]\s*\]/);
+        expect(code).toMatch(/\$_POST\[\s*['"]sn_required['"]\s*\]/);
+        expect(code).toMatch(/\$_POST\[\s*['"]sn_qty_per_unit['"]\s*\]/);
+
+        // Defensive SHOW COLUMNS check before writing (graceful no-op if column not migrated)
+        expect(code).toMatch(/SHOW COLUMNS FROM[\s\S]{0,80}LIKE 'sn_attach_level'/);
+
+        // Whitelist validation (only 4 valid enum values)
+        expect(code).toMatch(/\[\s*'none'\s*,\s*'set'\s*,\s*'child'\s*,\s*'leaf'\s*\]/);
+
+        // sn_qty_per_unit clamped 1..99
+        expect(code).toMatch(/max\(\s*1\s*,\s*min\(\s*99/);
+
+        // Frontend JS loads existing values in openEditCatalogModal
+        expect(code).toMatch(/input\[name="sn_attach_level"\]\[value="'\+\s*snLevel/);
+
+        // Frontend JS sends POST fields in saveCatalogItem
+        expect(code).toMatch(/sn_attach_level:\s*snLevel/);
+        expect(code).toMatch(/sn_required:\s*snRequired/);
+        expect(code).toMatch(/sn_qty_per_unit:\s*String\(\s*snQtyPerUnit\s*\)/);
+    });
+
+    test('Phase 6 — /stock/list REST response includes sn_attach_level fields', () => {
+        // Multi-SKU picker (SN Manager V.0.53) reads sn_attach_level from /stock/list.
+        // Source = canonical Inventory custom table (NOT product_type heuristic).
+        const invFile = path.join(REPO_ROOT, '[Admin System] DINOCO Global Inventory Database');
+        const code = fs.readFileSync(invFile, 'utf8');
+
+        // /stock/list handler returns 3 SN fields in item shape
+        expect(code).toMatch(/'sn_attach_level'\s*=>/);
+        expect(code).toMatch(/'sn_required'\s*=>/);
+        expect(code).toMatch(/'sn_qty_per_unit'\s*=>/);
+
+        // get_catalog fast-path also surfaces SN fields
+        const snCols = code.match(/sn_attach_level/g);
+        expect(snCols).not.toBeNull();
+        expect(snCols.length).toBeGreaterThanOrEqual(5); // modal + save + 2 reads + JS handlers
+    });
+
+    test('Phase 6 — SN Manager Multi-SKU picker uses sn_attach_level filter (not heuristic)', () => {
+        // V.0.53 migrates picker filter from p.product_type heuristic → canonical
+        // p.sn_attach_level returned by /stock/list (Inventory source of truth).
+        const managerFile = path.join(REPO_ROOT, '[Admin System] DINOCO Production SN Manager');
+        const code = fs.readFileSync(managerFile, 'utf8');
+
+        // V.0.53 marker in version header
+        expect(code).toMatch(/V\.0\.53.*Phase 6 SN plate hierarchy/);
+
+        // Picker filter logic reads sn_attach_level
+        expect(code).toMatch(/p\.sn_attach_level/);
+
+        // Plate level badge rendering (SET/CHILD/LEAF + qty multiplier)
+        expect(code).toMatch(/snLvl\s*===\s*'set'/);
+        expect(code).toMatch(/snLvl\s*===\s*'child'/);
+        expect(code).toMatch(/snLvl\s*===\s*'leaf'/);
+
+        // qty multiplier shown when sn_qty_per_unit > 1
+        expect(code).toMatch(/sn_qty_per_unit\s*>\s*1/);
+
+        // "ไม่ใช้เพลท" fallback label for sn_attach_level === 'none' (and !sn_required)
+        expect(code).toContain('ไม่ใช้เพลท');
+    });
+
     test('Round 3 — Factory QR generation: CSV +QR Content URL column, QR PDF removed', () => {
         const rest = readSnippet('rest');
         const manager = readSnippet('manager');
