@@ -2917,14 +2917,19 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toContain('pending_verification');
         });
 
-        test('Quick action row has 5 buttons (claim/transfer/call/extend/stolen)', () => {
+        test('Asset card actions: 4 data-action attrs (V.31.4 S1 redesign — extend is primary CTA, claim/transfer/call/stolen in overflow)', () => {
             const code = readAssets();
-            ['claim', 'transfer', 'call', 'extend', 'stolen'].forEach((action) => {
+            // V.31.4 S1 redesign: single state-driven primary CTA + overflow has rest.
+            // `extend` action no longer has data-action attr (it's the primary CTA button
+            // without data-action since the action is contextual based on card_state).
+            // 4 actions remain in overflow with data-action: claim/transfer/call/stolen.
+            ['claim', 'transfer', 'call', 'stolen'].forEach((action) => {
                 expect(code).toContain(`data-action="${action}"`);
             });
-            // Quick actions container with role=group
-            expect(code).toContain('dnc-sn-asset-card-quick-actions');
-            expect(code).toContain('role="group"');
+            // V.31.4 introduces primary CTA wrapper (was: dnc-sn-asset-card-quick-actions)
+            expect(code).toContain('dnc-sn-asset-card-primary-cta');
+            // Overflow menu container kept
+            expect(code).toContain('dnc-sn-asset-card-overflow');
         });
 
         test('Touch targets ≥44px on action buttons', () => {
