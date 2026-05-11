@@ -94,6 +94,39 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
         expect(match[1]).toMatch(/b2b_build_flex_stock_review_admin/);
     });
 
+    test('Snippet 16 V.3.18 — customer reject notify uses b2b_line_push_raw (not broken b2b_line_push_text)', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // notify_customer_rejected must NOT reference broken b2b_line_push_text in active code
+        expect(stripped).not.toMatch(/function_exists\(\s*['"]b2b_line_push_text['"]/);
+        // Must use working push function
+        expect(stripped).toMatch(/function b2b_bo_notify_customer_rejected/);
+        expect(stripped).toMatch(/b2b_line_push_raw/);
+    });
+
+    test('Snippet 16 V.3.18 — reason picker Flex exists + reject postback goes through picker', () => {
+        const code = read('s16');
+        // Reason picker builder exists
+        expect(code).toMatch(/function b2b_build_flex_bo_reject_reasons/);
+        // 4 quick-pick reasons present
+        expect(code).toMatch(/สินค้าหมดสต็อก/);
+        expect(code).toMatch(/สินค้ายกเลิกการขาย/);
+        expect(code).toMatch(/ราคาผิดพลาด/);
+        // Footer button now triggers picker (not direct reject)
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        expect(stripped).toMatch(/action=bo_reject_picker&order_id=/);
+        // Postback handler dispatches bo_reject_picker
+        expect(stripped).toMatch(/\$action === ['"]bo_reject_picker['"]/);
+    });
+
     test('Snippet 16 V.3.17 — button labels updated per ux-ui-expert (no "ยืนยันเต็ม" / "ปฏิเสธ")', () => {
         const code = read('s16');
         // Strip block comments (legitimately reference old labels in version header prose)
