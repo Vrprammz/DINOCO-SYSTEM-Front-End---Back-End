@@ -84,15 +84,30 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
         expect(match[1]).toMatch(/!\s*\$flex\s*\|\|\s*!\s*is_array\(\s*\$flex\s*\)/);
     });
 
-    test('Snippet 16 V.3.14 — text fallback push (belt-and-suspenders for silent Flex failure)', () => {
+    test('Snippet 16 V.3.17 — text fallback REMOVED per UX feedback (Flex only + altText handles a11y)', () => {
         const code = read('s16');
         const match = code.match(/function b2b_bo_notify_admin_stock_review\([^)]*\)\s*\{([\s\S]*?)b2b_push_guaranteed/);
         expect(match).not.toBeNull();
-        // Text fallback fires BEFORE Flex push attempt
-        expect(match[1]).toMatch(/b2b_push_to_admin\(\s*\$text_msg\s*\)/);
-        expect(match[1]).toMatch(/🔔 รอตรวจสต็อก/);
-        expect(match[1]).toMatch(/Backorders/);
-        expect(match[1]).toMatch(/\[BO-Notify-Text\]/);
+        // Text fallback should NOT fire (V.3.17 removed — duplicate noise per boss feedback)
+        expect(match[1]).not.toMatch(/b2b_push_to_admin\(\s*\$text_msg\s*\)/);
+        // But function body still has Flex push path
+        expect(match[1]).toMatch(/b2b_build_flex_stock_review_admin/);
+    });
+
+    test('Snippet 16 V.3.17 — button labels updated per ux-ui-expert (no "ยืนยันเต็ม" / "ปฏิเสธ")', () => {
+        const code = read('s16');
+        // Strip block comments (legitimately reference old labels in version header prose)
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // New labels should appear in active code
+        expect(stripped).toMatch(/'label'\s*=>\s*'✅ ส่งครบทุกชิ้น'/);
+        expect(stripped).toMatch(/'label'\s*=>\s*'❌ ยกเลิกออเดอร์'/);
+        expect(stripped).toMatch(/'label'\s*=>\s*'🔀 แยกส่งบางส่วน'/);
+        // Old confusing labels should not appear as button labels in active code
+        expect(stripped).not.toMatch(/'label'\s*=>\s*'✅ ยืนยันเต็ม'/);
     });
 
     test('Snippet 14 FSM transition table has draft→pending_stock_review with customer actor', () => {
