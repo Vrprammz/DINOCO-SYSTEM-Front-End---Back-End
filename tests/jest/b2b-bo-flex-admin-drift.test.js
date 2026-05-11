@@ -354,6 +354,35 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
         expect(fulfillDebt[0]).toMatch(/update_field\(\s*'is_billed'\s*,\s*true/);
     });
 
+    test('Snippet 16 V.3.24 — stock_review admin Flex มีรูปสินค้า + qty xxl + ไม่มี discount breakdown', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // Function builder
+        const builder = stripped.match(/function b2b_build_flex_stock_review_admin\([\s\S]*?\n\s{0,4}\}\s*\n\s*\}/);
+        expect(builder).not.toBeNull();
+        // (a) รูปสินค้า: image type + aspectMode cover + aspectRatio 1:1
+        expect(builder[0]).toMatch(/'type'\s*=>\s*'image'/);
+        expect(builder[0]).toMatch(/'aspectMode'\s*=>\s*'cover'/);
+        expect(builder[0]).toMatch(/'aspectRatio'\s*=>\s*'1:1'/);
+        // (b) Image source: b2b_get_product_data ['image_url'] + https guard
+        expect(builder[0]).toMatch(/\$pd\['image_url'\]/);
+        expect(builder[0]).toMatch(/strpos\(\s*\(string\)\s*\$pd\['image_url'\][^)]*https:/);
+        // (c) จำนวน xxl bold — "× N"
+        expect(builder[0]).toMatch(/['"]× \{\$qty\}['"]/);
+        expect(builder[0]).toMatch(/'size'\s*=>\s*'xxl'/);
+        // (d) Bubble size mega
+        expect(builder[0]).toMatch(/'size'\s*=>\s*'mega'/);
+        // (e) ไม่มี % discount หรือ breakdown — ไม่ควรมี "ราคาจำหน่าย", "ส่วนลดตัวแทน"
+        expect(builder[0]).not.toMatch(/ราคาจำหน่าย/);
+        expect(builder[0]).not.toMatch(/ส่วนลดตัวแทน/);
+        // (f) ยอดรวมยังมี
+        expect(builder[0]).toMatch(/ยอดรวม/);
+    });
+
     test('Snippet 14 FSM has pending_stock_review state with admin transitions', () => {
         const code = read('s14');
         const psrBlock = code.match(/['"]pending_stock_review['"]\s*=>\s*array\(([\s\S]*?)\),\s*\n\s*['"]/);
