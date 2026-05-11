@@ -193,7 +193,11 @@ const SNIPPET_PREFIXES = [
 //     inside empty-state <tr><td> with onclick auto-flips picker filter.
 //     Single inline handler — alternative would be a dynamically injected
 //     <button> via JS which is more code for same UX. Acceptable.
-const BASELINE_INLINE_HANDLER_COUNT = 986;
+// 986 → 987 (2026-05-08 Phase 8 Polish B S7 Buddhist year helper): +1
+//   - Activation LIFF V.0.16 date picker gains onchange handler that
+//     updates Buddhist year live below the input. Inline preferred
+//     because handler is single-purpose + scoped to one element.
+const BASELINE_INLINE_HANDLER_COUNT = 987;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
