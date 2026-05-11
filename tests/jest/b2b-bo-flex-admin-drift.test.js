@@ -103,6 +103,34 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
         expect(draftBlock[1]).toMatch(/['"]pending_stock_review['"]\s*=>\s*['"]customer['"]/);
     });
 
+    test('LINE Flex schema — NO null color anywhere (LINE rejects HTTP 400)', () => {
+        const s16 = read('s16');
+        // Strip block comments (/** ... */) and line comments (// ...) — version headers
+        // legitimately document the historical bad pattern in Thai prose
+        const stripped = s16
+            .replace(/\/\*[\s\S]*?\*\//g, '')  // remove block comments
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        expect(stripped).not.toMatch(/'color'\s*=>\s*[^,#'\n]*\?\s*null\s*:/);
+        expect(stripped).not.toMatch(/'color'\s*=>\s*null\s*,/);
+    });
+
+    test('LINE Flex schema — NO opacity on text component (LINE rejects HTTP 400)', () => {
+        const s1 = read('s1');
+        // Catch active 'opacity' => N.M in text component (not in comments)
+        // Strip comments first
+        const code = s1.split('\n').filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*')).join('\n');
+        expect(code).not.toMatch(/'opacity'\s*=>\s*0\.\d+/);
+    });
+
+    test('Snippet 7 — Flex retry exhausted alert uses double-quoted \\n (not literal)', () => {
+        const s7 = fs.readFileSync(path.join(REPO_ROOT, '[B2B] Snippet 7: Cron Jobs - Dunning + Summary + Rank'), 'utf8');
+        // Should NOT match single-quoted \n (which would be literal "\\n" in LINE)
+        const singleQuotedBad = s7.match(/'❌ Flex ส่งไม่สำเร็จ[^']*\\n[^']*'/);
+        expect(singleQuotedBad).toBeNull();
+    });
+
     test('Snippet 14 FSM has pending_stock_review state with admin transitions', () => {
         const code = read('s14');
         const psrBlock = code.match(/['"]pending_stock_review['"]\s*=>\s*array\(([\s\S]*?)\),\s*\n\s*['"]/);
