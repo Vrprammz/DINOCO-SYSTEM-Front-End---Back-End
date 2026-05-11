@@ -69,7 +69,8 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
 
     test('Snippet 16 b2b_bo_notify_admin_stock_review uses b2b_push_guaranteed for retry queue', () => {
         const code = read('s16');
-        const match = code.match(/function b2b_bo_notify_admin_stock_review\([^)]*\)\s*\{([\s\S]*?)\n\s{0,4}\}\s*\n\s*\}/);
+        // Match entire function body (allow nested } from arrays)
+        const match = code.match(/function b2b_bo_notify_admin_stock_review\([^)]*\)\s*\{([\s\S]*?)\n\s{0,4}\}\s*\n\s*\}\s*\n/);
         expect(match).not.toBeNull();
         expect(match[1]).toMatch(/b2b_push_guaranteed/);
         expect(match[1]).toMatch(/bo_stock_review/); // flex_type tag for cron retry filter
@@ -77,9 +78,21 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
 
     test('Snippet 16 BO notify has empty-Flex guard (prevents push of falsy payload)', () => {
         const code = read('s16');
+        // Empty-Flex guard exists somewhere in function body
         const match = code.match(/function b2b_bo_notify_admin_stock_review\([^)]*\)\s*\{([\s\S]*?)b2b_push_guaranteed/);
         expect(match).not.toBeNull();
         expect(match[1]).toMatch(/!\s*\$flex\s*\|\|\s*!\s*is_array\(\s*\$flex\s*\)/);
+    });
+
+    test('Snippet 16 V.3.14 — text fallback push (belt-and-suspenders for silent Flex failure)', () => {
+        const code = read('s16');
+        const match = code.match(/function b2b_bo_notify_admin_stock_review\([^)]*\)\s*\{([\s\S]*?)b2b_push_guaranteed/);
+        expect(match).not.toBeNull();
+        // Text fallback fires BEFORE Flex push attempt
+        expect(match[1]).toMatch(/b2b_push_to_admin\(\s*\$text_msg\s*\)/);
+        expect(match[1]).toMatch(/🔔 รอตรวจสต็อก/);
+        expect(match[1]).toMatch(/Backorders/);
+        expect(match[1]).toMatch(/\[BO-Notify-Text\]/);
     });
 
     test('Snippet 14 FSM transition table has draft→pending_stock_review with customer actor', () => {
