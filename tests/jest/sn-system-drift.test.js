@@ -1077,8 +1077,11 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(callback).toContain('WARRANTY_ACTIVATE_SN');
         expect(callback).toMatch(/\/warranty\/activate\//);
 
-        // Defensive guard: empty constants → red error (not broken button)
-        expect(liff).toMatch(/ระบบ LINE Login ไม่พร้อมใช้งาน/);
+        // Defensive guard: empty constants → friendly card (V.0.13 C1 HOTFIX,
+        // V.0.12 had raw "DINOCO_LINE_CHANNEL_ID" constant name in error — trust break).
+        // Now shows yellow card "ระบบลงทะเบียนกำลังปรับปรุง" with LINE Admin deep-link.
+        expect(liff).toMatch(/ระบบลงทะเบียนกำลังปรับปรุง/);
+        expect(liff).toMatch(/lin\.ee\/dinoco/);
 
         // Plan doc exists
         const planDoc = path.join(REPO_ROOT, 'docs/sn-system/14-first-time-login-flow.md');
