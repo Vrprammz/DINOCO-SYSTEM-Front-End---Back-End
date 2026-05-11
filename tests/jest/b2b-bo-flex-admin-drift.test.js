@@ -335,6 +335,25 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
         expect(handler[0]).toMatch(/\$current_status\s*!==\s*'pending_stock_review'/);
     });
 
+    test('Snippet 16 V.3.23 — bo-split + bo-fulfill set is_billed=true (double-debt regression guard)', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // bo-split: after debt_add success → set is_billed=true + due_date
+        const splitDebt = stripped.match(/b2b_debt_add\(\s*\$dist_id\s*,\s*\$confirmed_value[\s\S]{0,800}/);
+        expect(splitDebt).not.toBeNull();
+        expect(splitDebt[0]).toMatch(/update_field\(\s*'is_billed'\s*,\s*true/);
+        expect(splitDebt[0]).toMatch(/update_field\(\s*'due_date'/);
+
+        // bo-fulfill: after debt_add success → set is_billed=true (idempotent guard)
+        const fulfillDebt = stripped.match(/b2b_debt_add\(\s*\$dist_id\s*,\s*\$line_value[\s\S]{0,1200}/);
+        expect(fulfillDebt).not.toBeNull();
+        expect(fulfillDebt[0]).toMatch(/update_field\(\s*'is_billed'\s*,\s*true/);
+    });
+
     test('Snippet 14 FSM has pending_stock_review state with admin transitions', () => {
         const code = read('s14');
         const psrBlock = code.match(/['"]pending_stock_review['"]\s*=>\s*array\(([\s\S]*?)\),\s*\n\s*['"]/);
