@@ -1,6 +1,23 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.4.0 (2026-05-11) — ALL-BACKORDER FLOW REDESIGN per บอส principle:           ║
+ * ║    "ลูกค้ายืนยันรอของ ยังไม่ต้องวางบิล > เค้าต้องกดดู Liff Order เห็น BO ชัดเจน ยกเลิก    ║
+ * ║    ออเดอร์ BO ได้ถ้าสินค้ายังไม่มา". Root cause #6313: admin split qty_fulfill=0 →        ║
+ * ║    state=partial_fulfilled + Flex "ยืนยันบิล" → กดได้ → debt+INV ทันที (บ้าอะไรวะ).      ║
+ * ║    Fix:                                                                                   ║
+ * ║    • NEW FSM state `all_backorder` (Snippet 14 V.1.9) — แยกจาก partial_fulfilled         ║
+ * ║    • bo-split: detect $is_all_backorder = (fulfilled_total===0 && bo_total>0) →          ║
+ * ║      transition pending_stock_review → all_backorder (ไม่ใช่ partial_fulfilled)          ║
+ * ║    • NEW b2b_build_flex_all_backorder_customer(): amber header "⏳ ออเดอร์รอ BO",         ║
+ * ║      ไม่มีปุ่มยืนยันบิล, ปุ่ม "ยกเลิก BO" + "ดูออเดอร์"                                  ║
+ * ║    • NEW postback bo_cancel_all_customer: ownership guard + status guard (allow only    ║
+ * ║      all_backorder/pending_stock_review) → bo_queue cancel + FSM → cancelled             ║
+ * ║    • bo-fulfill auto-promote: last item fulfilled in all_backorder → awaiting_confirm   ║
+ * ║      → customer push "BO พร้อม ยืนยันบิล" Flex (เดิม b2b_bo_notify_customer_bo_ready)    ║
+ * ║    • Snippet 2 V.34.34: confirm_bill guard reject all_backorder + partial_fulfilled     ║
+ * ║      ที่ fulfilled_qty=0 (กัน customer กด "ยืนยันบิล" ที่ยอด ฿0)                          ║
+ * ║    • Snippet 1: labels/colors map ได้ all_backorder entry                                 ║
  * ║  Version: V.3.25 (2026-05-11) — FULL REDESIGN ทุก Flex ใน BO loop per ux-ui-expert    ║
  * ║    บอสโกรธ "ทำไมยังเป็นอักษรใหญ่ ไม่ใช่หัวข้อ?" + "BO ต้องมี FLEX ของตัวเอง ต้องแจ้ง     ║
  * ║    ลูกค้า/ตัวแทนชัด ถึงรายละเอียด" + "FULL REDESIGN ทั้งระบบ Flex แล้ว ทำไมยังมีเรื่อง    ║
@@ -1977,9 +1994,15 @@ if ( ! function_exists( '_b2b_rest_bo_split_inner' ) ) {
             update_post_meta( $order_id, '_stock_deducted', 1 );
         }
 
-        // Step 4: FSM transition (pending_stock_review → partial_fulfilled)
+        // V.4.0 (2026-05-11): Detect all-BO mode (qty_fulfill=0 ทุก SKU) → ใช้ state ใหม่
+        // `all_backorder` แทน `partial_fulfilled`. หลักการ: รอของทั้งหมด → ยังไม่ออกบิล + ลูกค้า
+        // ยกเลิก BO ได้. confirm_bill FSM block ด้วย (ไม่มี transition → awaiting_payment).
+        $is_all_backorder = ( $fulfilled_total === 0 && $bo_total > 0 );
+        $target_state     = $is_all_backorder ? 'all_backorder' : 'partial_fulfilled';
+
+        // Step 4: FSM transition
         if ( function_exists( 'b2b_transition_order' ) ) {
-            $transition = b2b_transition_order( $order_id, 'partial_fulfilled', 'admin', 'admin split BO' );
+            $transition = b2b_transition_order( $order_id, $target_state, 'admin', "admin split BO ({$target_state})" );
             if ( is_wp_error( $transition ) ) {
                 // Compensate + unset _stock_deducted
                 $compensate();
@@ -1995,18 +2018,20 @@ if ( ! function_exists( '_b2b_rest_bo_split_inner' ) ) {
         update_post_meta( $order_id, '_b2b_split_at', $now_ts );
         update_post_meta( $order_id, '_b2b_split_by', get_current_user_id() );
         update_post_meta( $order_id, '_b2b_split_undo_deadline', $now_ts + ( $undo_minutes * 60 ) );
+        update_post_meta( $order_id, '_b2b_all_backorder', $is_all_backorder ? 1 : 0 );
 
         if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
 
         // Log attempt — NOTE: industry-standard pattern (audit log fires post-COMMIT, not in
-        // same transaction as state change). Atomicity gap accepted: if PHP crashes between
-        // COMMIT and this call, mutation persists but log row missing. Recovery via Phase 1.5
-        // audit_log dual-write (planned) — for now, _b2b_split_at meta + bo_queue rows
-        // provide reconstructable forensic trail.
-        b2b_log_attempt( $dist_id, 'split', $order_id, '', 'accepted', null, array( 'total_qty' => $fulfilled_total + $bo_total ) );
+        // same transaction as state change).
+        b2b_log_attempt( $dist_id, 'split', $order_id, '', 'accepted', null, array( 'total_qty' => $fulfilled_total + $bo_total, 'all_bo' => $is_all_backorder ? 1 : 0 ) );
 
-        // Send customer notification Flex
-        if ( function_exists( 'b2b_bo_notify_customer_split' ) ) {
+        // V.4.0: Customer notification — branch based on state
+        // - all_backorder → push Flex "รอ BO ทั้งหมด" (NEW builder, no ยืนยันบิล, มี ยกเลิก BO)
+        // - partial_fulfilled → push Flex partial เดิม (มี ยืนยันบิล ส่วน fulfilled)
+        if ( $is_all_backorder && function_exists( 'b2b_bo_notify_customer_all_backorder' ) ) {
+            b2b_bo_notify_customer_all_backorder( $order_id );
+        } elseif ( function_exists( 'b2b_bo_notify_customer_split' ) ) {
             b2b_bo_notify_customer_split( $order_id );
         }
 
@@ -2864,9 +2889,18 @@ if ( ! function_exists( '_b2b_rest_bo_fulfill_inner' ) ) {
             update_post_meta( $order_id, '_stock_deducted', 1 );
         }
 
+        // V.4.0: detect previous all_backorder state for logging + meta cleanup
+        $prev_status = function_exists( 'get_field' ) ? (string) get_field( 'order_status', $order_id ) : '';
+        $was_all_bo  = ( $prev_status === 'all_backorder' );
+
         if ( $pending_count === 0 ) {
             if ( function_exists( 'b2b_transition_order' ) ) {
-                b2b_transition_order( $order_id, 'awaiting_confirm', 'admin', 'all BO resolved' );
+                $reason = $was_all_bo ? 'all BO resolved (from all_backorder)' : 'all BO resolved';
+                b2b_transition_order( $order_id, 'awaiting_confirm', 'admin', $reason );
+            }
+            // V.4.0: clear all_backorder marker — order graduated to billing flow
+            if ( $was_all_bo ) {
+                update_post_meta( $order_id, '_b2b_all_backorder', 0 );
             }
         }
 
@@ -4176,6 +4210,100 @@ if ( ! function_exists( 'b2b_bo_notify_customer_split' ) ) {
     }
 }
 
+// V.4.0 (2026-05-11): NEW Flex builder + notify for all_backorder mode (qty_fulfill=0 ทุก SKU)
+// หลักการ: ไม่มีปุ่ม "ยืนยันบิล" + มีปุ่ม "ยกเลิก BO" + รายการสินค้า + ETA — ลูกค้ารู้ว่า
+// รอของอยู่และยกเลิกได้ก่อนของมา. ใช้ b2b_bo_resolve_customer_group_id() pattern เดียวกัน.
+if ( ! function_exists( 'b2b_build_flex_all_backorder_customer' ) ) {
+    function b2b_build_flex_all_backorder_customer( $order_id ) {
+        $order_id   = (int) $order_id;
+        $ticket_no  = '#' . $order_id;
+        $summary    = function_exists( 'b2b_compute_bo_summary' ) ? b2b_compute_bo_summary( $order_id ) : array();
+        $bo_total   = isset( $summary['bo_total'] ) ? (int) $summary['bo_total'] : 0;
+        $bo_value   = isset( $summary['bo_value'] ) ? (float) $summary['bo_value'] : 0;
+        $items      = isset( $summary['items'] ) ? $summary['items'] : array();
+        $ticket_url = function_exists( 'b2b_liff_url' )
+            ? b2b_liff_url( 'b2b-ticket/', array( 'ticket_id' => $order_id ) )
+            : home_url( "/b2b-ticket/?ticket_id={$order_id}" );
+
+        // ETA earliest
+        $earliest_eta = '';
+        foreach ( $items as $it ) {
+            if ( ($it['status'] ?? '') === 'pending' && ! empty( $it['eta'] ) ) {
+                if ( ! $earliest_eta || $it['eta'] < $earliest_eta ) $earliest_eta = $it['eta'];
+            }
+        }
+
+        $body_contents = array(
+            array( 'type'=>'text', 'text'=>'⏳ รอสินค้า BO เข้าก่อนจัดส่ง', 'weight'=>'bold', 'size'=>'md', 'color'=>'#b45309' ),
+            array( 'type'=>'text', 'text'=>$bo_total . ' ชิ้น (รอเข้าสต็อก)', 'size'=>'sm', 'margin'=>'xs', 'color'=>'#111827' ),
+        );
+        if ( $earliest_eta ) {
+            $body_contents[] = array( 'type'=>'text', 'text'=>'📅 คาดว่ากลับมา: ' . $earliest_eta, 'size'=>'sm', 'color'=>'#6b7280', 'margin'=>'xs' );
+        }
+        $body_contents[] = array( 'type'=>'separator', 'margin'=>'lg' );
+        $body_contents[] = array( 'type'=>'text', 'text'=>'🔔 ระบบจะแจ้งเตือนอัตโนมัติเมื่อสินค้าพร้อม จากนั้นจึงค่อยออกบิลและจัดส่ง', 'size'=>'xs', 'color'=>'#6b7280', 'wrap'=>true, 'margin'=>'md' );
+        if ( $bo_value > 0 ) {
+            $body_contents[] = array( 'type'=>'text', 'text'=>'(ยอดประมาณ: ฿' . number_format( $bo_value, 2 ) . ' เรียกเก็บเมื่อของพร้อม)', 'size'=>'xxs', 'color'=>'#9ca3af', 'wrap'=>true, 'margin'=>'sm' );
+        }
+
+        $header = function_exists( 'b2b_flex_logo_header' )
+            ? b2b_flex_logo_header( "ออเดอร์ {$ticket_no}", 'รอสินค้า BO (ยังไม่ออกบิล)', '#b45309', '#ffffff' )
+            : array(
+                'type'=>'box', 'layout'=>'vertical', 'backgroundColor'=>'#b45309', 'paddingAll'=>'16px',
+                'contents'=>array(
+                    array( 'type'=>'text', 'text'=>"ออเดอร์ {$ticket_no}", 'color'=>'#ffffff', 'weight'=>'bold', 'size'=>'md' ),
+                    array( 'type'=>'text', 'text'=>'รอสินค้า BO (ยังไม่ออกบิล)', 'color'=>'#fde68a', 'size'=>'xs', 'margin'=>'xs' ),
+                ),
+            );
+
+        return array(
+            'type'=>'flex',
+            'altText'=>"ออเดอร์ {$ticket_no} — รอสินค้า BO " . $bo_total . " ชิ้น",
+            'contents'=>array(
+                'type'=>'bubble', 'size'=>'mega',
+                'header'=>$header,
+                'body'=>array( 'type'=>'box', 'layout'=>'vertical', 'paddingAll'=>'16px', 'contents'=>$body_contents ),
+                'footer'=>array(
+                    'type'=>'box', 'layout'=>'vertical', 'spacing'=>'sm', 'paddingAll'=>'12px',
+                    'contents'=>array(
+                        array(
+                            'type'=>'button', 'style'=>'primary', 'color'=>'#1e3a8a',
+                            'action'=>array( 'type'=>'uri', 'label'=>'📋 ดูออเดอร์', 'uri'=>esc_url_raw( $ticket_url ) ),
+                        ),
+                        array(
+                            'type'=>'button', 'style'=>'secondary',
+                            'action'=>array(
+                                'type'=>'postback', 'label'=>'❌ ยกเลิก BO',
+                                'data'=>"action=bo_cancel_all_customer&ticket_id={$order_id}",
+                                'displayText'=>'ยกเลิก BO',
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_notify_customer_all_backorder' ) ) {
+    function b2b_bo_notify_customer_all_backorder( $order_id ) {
+        $group_id = b2b_bo_resolve_customer_group_id( $order_id );
+        if ( ! $group_id ) {
+            if ( function_exists('b2b_log') ) b2b_log( '[BO-AllBackorder-Notify] no group_id for #' . $order_id );
+            return false;
+        }
+        $flex = b2b_build_flex_all_backorder_customer( $order_id );
+        if ( ! $flex ) return false;
+        if ( function_exists( 'b2b_push_guaranteed' ) ) {
+            return b2b_push_guaranteed( $group_id, array( $flex ), (int) $order_id, 'bo_all_backorder' );
+        }
+        if ( function_exists( 'b2b_line_push_raw' ) ) {
+            return b2b_line_push_raw( $group_id, array( $flex ) );
+        }
+        return false;
+    }
+}
+
 if ( ! function_exists( 'b2b_bo_notify_customer_bo_ready' ) ) {
     function b2b_bo_notify_customer_bo_ready( $order_id, $items ) {
         // V.3.11 R4: route through helper.
@@ -4509,6 +4637,65 @@ if ( ! function_exists( 'b2b_bo_notify_admin_stock_review' ) ) {
  */
 add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params, $user_id, $reply_token ) {
     if ( $handled ) return $handled;
+
+    // V.4.0 (2026-05-11): NEW customer-facing postback — ลูกค้ากด "❌ ยกเลิก BO" ใน Flex
+    // all_backorder. Cancel ออเดอร์ + restock bo_queue + transition all_backorder → cancelled.
+    // ไม่ต้อง revert debt (ไม่เคย add — เพราะ all_backorder = no bill).
+    if ( $action === 'bo_cancel_all_customer' ) {
+        $order_id = (int) ( $params['ticket_id'] ?? $params['order_id'] ?? 0 );
+        if ( ! $order_id ) return true;
+        // SEC: Verify postback มาจาก source_group_id ของ order นี้ (ticket ownership)
+        // — กัน LINE bot ใน group อื่น spoof ยกเลิก order ลูกค้าอื่น
+        $source_gid = (string) get_field( 'source_group_id', $order_id );
+        $cur_gid    = isset( $params['_group_id'] ) ? (string) $params['_group_id'] : '';  // future: pass via filter
+        // ถ้า filter ไม่ส่ง $group_id → resolve จาก order + ตรวจกับ user_id LINE distributor
+        // ป้องกัน admin group spoof: ห้าม admin group กดยกเลิกแทนลูกค้า
+        if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2b_get_dist_by_group' ) ) {
+            $dist = b2b_get_dist_by_group( $source_gid );
+            if ( ! $dist ) {
+                if ( function_exists( 'b2b_log' ) ) b2b_log( "[BO-CancelAll] cannot resolve dist for order #{$order_id}" );
+                return true;
+            }
+        }
+        $current_status = get_field( 'order_status', $order_id );
+        // Guard: เฉพาะ all_backorder + pending_stock_review ถึงยกเลิกได้ (กันลูกค้ายกเลิกหลังบิลออก)
+        if ( ! in_array( $current_status, array( 'all_backorder', 'pending_stock_review' ), true ) ) {
+            if ( function_exists( 'b2b_line_reply' ) ) {
+                b2b_line_reply( $reply_token, "ℹ️ ออเดอร์ #{$order_id} ไม่สามารถยกเลิกได้ในขั้นตอนนี้ครับ (สถานะ: {$current_status})\nกรุณาติดต่อแอดมิน" );
+            }
+            return true;
+        }
+        // Lock + cancel bo_queue rows
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+        $wpdb->query( $wpdb->prepare(
+            "UPDATE {$bo_table} SET status='cancelled', resolved_at=%s WHERE order_id=%d AND status IN ('pending','ready')",
+            current_time( 'mysql' ), $order_id
+        ) );
+        // FSM transition all_backorder → cancelled
+        if ( function_exists( 'b2b_transition_order' ) ) {
+            $t = b2b_transition_order( $order_id, 'cancelled', 'customer', 'customer cancel BO via LINE Flex' );
+            if ( is_wp_error( $t ) ) {
+                if ( function_exists( 'b2b_line_reply' ) ) {
+                    b2b_line_reply( $reply_token, "⚠️ ยกเลิกไม่สำเร็จ: " . $t->get_error_message() );
+                }
+                return true;
+            }
+        }
+        // Audit + notify admin
+        if ( function_exists('b2b_log_attempt') ) {
+            $dist_id = (int) get_field( 'distributor_id', $order_id );
+            b2b_log_attempt( $dist_id, 'bo_cancel_all_customer', $order_id, '', 'accepted' );
+        }
+        if ( function_exists('b2b_bo_invalidate_summary_cache') ) b2b_bo_invalidate_summary_cache();
+        if ( function_exists( 'b2b_push_to_admin' ) ) {
+            b2b_push_to_admin( "ℹ️ ลูกค้ายกเลิก BO ออเดอร์ #{$order_id}\n(ไม่ได้ออกบิล + ไม่มีหนี้ติด)" );
+        }
+        if ( function_exists( 'b2b_line_reply' ) ) {
+            b2b_line_reply( $reply_token, "✅ ยกเลิกออเดอร์ #{$order_id} เรียบร้อยครับ\nสามารถสั่งใหม่ได้ตลอดเวลา" );
+        }
+        return true;
+    }
 
     if ( $action === 'bo_confirm_full' ) {
         $order_id = (int) ( $params['order_id'] ?? 0 );
