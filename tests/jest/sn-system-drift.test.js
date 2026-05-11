@@ -843,6 +843,81 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(snCols.length).toBeGreaterThanOrEqual(5); // modal + save + 2 reads + JS handlers
     });
 
+    test('Phase 6.5 — UX audit fixes (CRITICAL C1+C2+C3 + SHOULD-FIX S6+S7)', () => {
+        // ux-ui-expert agent audit 2026-05-08 closed:
+        //   C1: customer LIFF scan button (live html5-qrcode lazy-load)
+        //   C2: Multi-SKU submit event.target fragility (stable id pattern)
+        //   C3: 8+ native confirm/alert → _snCfm/_snAlert helpers
+        //   S6: Multi-SKU row removal confirm when row has data
+        //   S7: Picker truncation banner when >500 SKUs (5-page cap exceeded)
+        const liff = readSnippet('liff');
+        const manager = readSnippet('manager');
+        const inv = path.join(REPO_ROOT, '[Admin System] DINOCO Global Inventory Database');
+        const invCode = fs.readFileSync(inv, 'utf8');
+
+        // C1 — LIFF live QR scanner via lazy-load html5-qrcode (NOT stub alert).
+        // Strip PHP/JS comments before checking — version header may reference
+        // the old stub literal as history annotation.
+        const liffCode = liff
+            .replace(/\/\*[\s\S]*?\*\//g, '')   // /* ... */ comments
+            .replace(/\/\/.*$/gm, '');           // // line comments
+        expect(liffCode).not.toMatch(/alert\(\s*['"]Scanner กำลังพัฒนา/);
+        expect(liff).toContain('html5-qrcode@2.3.8');
+        expect(liff).toMatch(/_dncSnQrInstance/);
+        expect(liff).toContain('dncSnLoadQrLib');
+        expect(liff).toContain('dncSnStopScan');
+        expect(liff).toMatch(/Html5Qrcode/);
+        expect(liff).toMatch(/facingMode:\s*['"]environment['"]/);
+        expect(liff).toMatch(/dncSnExtractSn/); // URL form + raw S/N parser
+
+        // C2 — Multi-SKU submit uses stable button id (NOT event.target closure)
+        expect(manager).toContain('id="dnc-sn-multi-submit-btn"');
+        expect(manager).toMatch(/document\.getElementById\(['"]dnc-sn-multi-submit-btn['"]\)/);
+        // Verify event.target pattern is gone from submit
+        const submitBlock = manager.match(/dncSnMultiSubmit\s*=\s*function[\s\S]{0,3500}?^\s*\};/m);
+        if (submitBlock) {
+            expect(submitBlock[0]).not.toMatch(/event\s*&&\s*event\.target/);
+        }
+
+        // C3 — _snCfm/_snAlert helpers defined + used (≥5 call sites each)
+        expect(manager).toMatch(/function\s+_snCfm\s*\(/);
+        expect(manager).toMatch(/function\s+_snAlert\s*\(/);
+        expect(manager).toMatch(/window\.dinocoModal\s*&&\s*window\.dinocoModal\.confirm/);
+        expect(manager).toMatch(/window\.dinocoModal\s*&&\s*window\.dinocoModal\.alert/);
+        const snCfmCallCount = (manager.match(/_snCfm\(/g) || []).length;
+        const snAlertCallCount = (manager.match(/_snAlert\(/g) || []).length;
+        expect(snCfmCallCount).toBeGreaterThanOrEqual(5);
+        expect(snAlertCallCount).toBeGreaterThanOrEqual(8);
+
+        // S6 — row removal confirm only when row has data
+        expect(manager).toMatch(/dncSnMultiRemoveRow\s*=\s*function/);
+        // Confirm prompt mentions "มีข้อมูล" + sku/sns check
+        const removeBlock = manager.match(/dncSnMultiRemoveRow\s*=\s*function[\s\S]{0,1200}?^\s*\};/m);
+        if (removeBlock) {
+            expect(removeBlock[0]).toMatch(/hasData/);
+            expect(removeBlock[0]).toMatch(/_snCfm/);
+        }
+
+        // S7 — picker truncation banner when serverPages > 5
+        expect(manager).toContain('_dncSnRcvPickerTruncated');
+        expect(manager).toContain('_dncSnRcvPickerServerPages');
+        expect(manager).toMatch(/dnc-sn-rcv-picker-truncated-banner/);
+        expect(manager).toMatch(/แสดง 500 จาก/);
+        expect(manager).toMatch(/PAGE_CAP\s*=\s*5/);
+
+        // Inventory V.46.2 — SN section collapse via <details> + summary chip
+        expect(invCode).toContain('id="cedit-sn-details"');
+        expect(invCode).toMatch(/<details\s+id="cedit-sn-details"/);
+        expect(invCode).toContain('cat-sn-summary-chip');
+        expect(invCode).toContain('updateSnSummaryChip');
+        // Thai-first labels aligned with hierarchy taxonomy
+        expect(invCode).toMatch(/ติดที่ชุดหลัก/);
+        expect(invCode).toMatch(/ติดที่ชิ้นส่วน/);
+        expect(invCode).toMatch(/ติดที่ชิ้นส่วนย่อย/);
+        // Auto-expand when SKU has plate config
+        expect(invCode).toMatch(/\$\(['"]#cedit-sn-details['"]\)\.prop\(['"]open['"],\s*hasConfig\)/);
+    });
+
     test('Phase 6 — SN Manager Multi-SKU picker uses sn_attach_level filter (not heuristic)', () => {
         // V.0.53 migrates picker filter from p.product_type heuristic → canonical
         // p.sn_attach_level returned by /stock/list (Inventory source of truth).

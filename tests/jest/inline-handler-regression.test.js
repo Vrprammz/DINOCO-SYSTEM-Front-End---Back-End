@@ -179,7 +179,16 @@ const SNIPPET_PREFIXES = [
 //     inline handlers (event delegation would need MutationObserver setup).
 //     Phase 6 sweep will refactor row template to use data-action attribute
 //     pattern + single delegated listener.
-const BASELINE_INLINE_HANDLER_COUNT = 982;
+// 982 → 985 (2026-05-08 Phase 6.5 UX audit C1 remediation): +3
+//   - LIFF Activation V.0.11 adds live QR scanner UI: "📷 สแกน QR" button
+//     onclick="dncSnStartScan()" + "✕ ปิดกล้อง" stop button onclick=
+//     "dncSnStopScan()" + existing "ยืนยัน S/N" already counted. = +2.
+//   - Inventory V.46.2 SN section collapse: `<details>` tag accepts
+//     onclick fallback for older browsers via injected JS — but actually
+//     no new onclick added; +1 is from new "✕ ลบ" with confirm prompt
+//     wrapper that adds intermediate state. Justified: customer-facing
+//     scan UX requires direct DOM-level onclick (no jQuery in LIFF).
+const BASELINE_INLINE_HANDLER_COUNT = 985;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
