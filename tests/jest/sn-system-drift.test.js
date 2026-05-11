@@ -843,6 +843,65 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(snCols.length).toBeGreaterThanOrEqual(5); // modal + save + 2 reads + JS handlers
     });
 
+    test('R3 Deep Review HOTFIX — Phase 6.5 self-inflicted regressions (BUG-1/2/3/4/5/6/7)', () => {
+        // code-reviewer agent caught 3 CRITICAL + 3 HIGH bugs in V.0.54/V.0.11 work
+        // that PHPUnit/Jest didn't detect (runtime/DOM/Promise contract issues).
+        const liff = readSnippet('liff');
+        const manager = readSnippet('manager');
+        const rest = readSnippet('rest');
+
+        // BUG-1 — _snCfm/_snAlert correct Modal Helpers API
+        //   Modal Helpers V.1.0 expects `message` field (not `content`)
+        //   and returns Promise directly (no onConfirm/onCancel callbacks)
+        // Capture each function body from declaration to next `function _sn` (or end-of-IIFE marker)
+        const snCfmMatch = manager.match(/function\s+_snCfm\(title,\s*content\)\s*\{[\s\S]*?(?=\n\s+function\s+_snAlert|\n\s+\/\/\s+V\.0\.38)/);
+        expect(snCfmMatch).not.toBeNull();
+        expect(snCfmMatch[0]).toMatch(/message:\s*content/);
+        expect(snCfmMatch[0]).not.toMatch(/onConfirm:/);
+        expect(snCfmMatch[0]).not.toMatch(/onCancel:/);
+        expect(snCfmMatch[0]).toMatch(/return\s+window\.dinocoModal\.confirm/);
+
+        const snAlertMatch = manager.match(/function\s+_snAlert\(title,\s*content\)\s*\{[\s\S]*?(?=\n\s+\/\/\s+V\.0\.38)/);
+        expect(snAlertMatch).not.toBeNull();
+        expect(snAlertMatch[0]).toMatch(/message:\s*content/);
+        expect(snAlertMatch[0]).not.toMatch(/content:\s*content/); // wrong V.0.54 pattern
+        expect(snAlertMatch[0]).toMatch(/return\s+window\.dinocoModal\.alert/);
+
+        // BUG-2 — picker zero-state when 0 SKUs have sn_attach_level configured
+        expect(manager).toMatch(/configuredCount\s*===?\s*0\s*&&\s*cacheSize\s*>\s*0/);
+        expect(manager).toMatch(/ยังไม่มี SKU ที่ตั้งค่า/);
+
+        // BUG-3 — banner insertion uses valid DOM (above table, not inside tbody)
+        expect(manager).not.toMatch(/wrap\.insertBefore\(\s*b\s*,\s*listEl\s*\)/);
+        expect(manager).toMatch(/listEl\.closest\(\s*['"]table['"]\s*\)/);
+        // BUG-9 — banner removed across renders (no stale 500/N+ text)
+        expect(manager).toMatch(/stale\s*=\s*document\.getElementById\(['"]dnc-sn-rcv-picker-truncated-banner['"]\)/);
+        expect(manager).toMatch(/if\s*\(\s*stale\s*\)\s*stale\.remove\(\)/);
+
+        // BUG-4 — LIFF scanner cleanup on visibilitychange + pagehide
+        expect(liff).toMatch(/document\.addEventListener\(\s*['"]visibilitychange['"]/);
+        expect(liff).toMatch(/window\.addEventListener\(\s*['"]pagehide['"]/);
+        expect(liff).toMatch(/document\.hidden\s*&&\s*_dncSnQrInstance/);
+
+        // BUG-5 — local var capture BEFORE nulling shared (race safety)
+        expect(liff).toMatch(/var\s+inst\s*=\s*_dncSnQrInstance\s*;\s*_dncSnQrInstance\s*=\s*null/);
+        // No more null-deref in .then(clear)
+        expect(liff).not.toMatch(/_dncSnQrInstance\.stop\(\)\.then\(function\(\)\s*\{\s*_dncSnQrInstance\.clear/);
+
+        // BUG-6 — SRI hash on html5-qrcode CDN script tag
+        expect(liff).toMatch(/s\.integrity\s*=\s*['"]sha384-/);
+        expect(liff).toMatch(/crossOrigin\s*=\s*['"]anonymous['"]/);
+        expect(liff).toMatch(/referrerPolicy\s*=\s*['"]no-referrer['"]/);
+
+        // BUG-7 — /receive/bulk idempotency hash includes groups[]
+        expect(rest).toMatch(/groups_normalized/);
+        expect(rest).toMatch(/usort\(\s*\$groups_normalized/);
+        expect(rest).toMatch(/'groups'\s*=>\s*\$groups_normalized/);
+        // BUG-7 PHPUnit companion exists
+        const bug7Test = path.join(REPO_ROOT, 'tests/helpers/SnReceiveBulkGroupsIdempotencyTest.php');
+        expect(fs.existsSync(bug7Test)).toBe(true);
+    });
+
     test('Phase 6.5 — UX audit fixes (CRITICAL C1+C2+C3 + SHOULD-FIX S6+S7)', () => {
         // ux-ui-expert agent audit 2026-05-08 closed:
         //   C1: customer LIFF scan button (live html5-qrcode lazy-load)

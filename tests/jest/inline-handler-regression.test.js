@@ -188,7 +188,12 @@ const SNIPPET_PREFIXES = [
 //     no new onclick added; +1 is from new "✕ ลบ" with confirm prompt
 //     wrapper that adds intermediate state. Justified: customer-facing
 //     scan UX requires direct DOM-level onclick (no jQuery in LIFF).
-const BASELINE_INLINE_HANDLER_COUNT = 985;
+// 985 → 986 (2026-05-08 R3 BUG-2 picker zero-state fix): +1
+//   - SN Manager V.0.55 adds "ดู SKU ทั้งหมด (N)" recovery button
+//     inside empty-state <tr><td> with onclick auto-flips picker filter.
+//     Single inline handler — alternative would be a dynamically injected
+//     <button> via JS which is more code for same UX. Acceptable.
+const BASELINE_INLINE_HANDLER_COUNT = 986;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
