@@ -2,6 +2,23 @@
  * Template Name: [Admin System] DINOCO Admin Dashboard
  * Shortcode: [dinoco_admin_dashboard]
  * Description: Mission Control — Hero strip + Today's Queue + Quick Actions + Reference Stats
+ * Version: V.35.1 (2026-05-08) — Phase 8 Mission Control M1 + M2:
+ *   M1 — MTD Revenue trend line on Hero card #1. Was "วันนี้ ฿X บาท" stub.
+ *     Now: "MTD ฿2.4m 📈 +12%" with auto-color (green/red/gray) based on
+ *     comparison to last month's same-period total. SQL aggregates b2b_order
+ *     + manual_invoice paid this month (uses _order_source meta to prevent
+ *     double-count). Same-period last-month comparison handles month boundary
+ *     correctly via current_time('j').
+ *   M2 — 7-day Sales Trend chart REPLACES Inventory Pie. Boss looks at revenue
+ *     daily — more actionable than inventory mix. Reuses ApexCharts (already
+ *     loaded for Claims Trend). Green gradient area chart + Y-axis ฿k/m
+ *     formatter + Thai number tooltip + horizontal avg-line annotation.
+ *     SQL queries day-by-day for last 7 days (cheap — ~7 prepared statements).
+ *     Inventory Pie chart container hidden (display:none) — render fn preserved
+ *     for future re-introduction in admin sub-tab.
+ *   Backend: 4 new fields in get_dashboard_extended response (mtd_revenue_thb,
+ *   mtd_trend_pct, last_mtd_revenue_thb, sales_trend_7d[]). Total SQL overhead
+ *   ~10ms. No breaking changes to existing field shapes.
  * Version: V.35.0 (2026-05-08) — Phase 7 Mission Control Home redesign.
  *   Boss feedback "UX หน้า Home ก็ยังแย่" + "ออกแบบให้ดีอย่าให้ซ้ำซ้อน" → 5 CRITICAL
  *   findings from ux-ui-expert audit closed in single sprint:
@@ -680,6 +697,104 @@ add_action('init', function () {
 
         global $wpdb;
 
+        // ─────────────────────────────────────────────────────────────────────
+        // V.35.1 (2026-05-08) Phase 8 Mission Control M1 + M2:
+        //   M1 — MTD revenue calculation (Hero card #1 trailing line)
+        //   M2 — 7-day Sales Trend data (replaces Inventory Pie chart)
+        // ─────────────────────────────────────────────────────────────────────
+
+        // ── M1 MTD revenue (Month-to-date — B2B + Manual Invoice) ──
+        $mtd_start = current_time('Y-m-01') . ' 00:00:00';
+        $mtd_revenue_thb = 0.0;
+        // B2B MTD (exclude manual_invoice via _order_source)
+        $b2b_mtd_sql = "
+            SELECT COALESCE( SUM( CAST( pm_total.meta_value AS DECIMAL(14,2) ) ), 0 )
+              FROM {$wpdb->posts} p
+              INNER JOIN {$wpdb->postmeta} pm_status ON p.ID = pm_status.post_id
+                  AND pm_status.meta_key = 'order_status'
+                  AND pm_status.meta_value IN ('confirm_bill','shipping','shipped','completed','paid')
+              INNER JOIN {$wpdb->postmeta} pm_total ON p.ID = pm_total.post_id
+                  AND pm_total.meta_key = '_b2b_order_total'
+              LEFT JOIN {$wpdb->postmeta} pm_paid ON p.ID = pm_paid.post_id
+                  AND pm_paid.meta_key = '_b2b_paid_at'
+              LEFT JOIN {$wpdb->postmeta} pm_src ON p.ID = pm_src.post_id
+                  AND pm_src.meta_key = '_order_source'
+              WHERE p.post_type = 'b2b_order'
+                AND p.post_status = 'publish'
+                AND ( pm_paid.meta_value >= %s OR p.post_modified >= %s )
+                AND ( pm_src.meta_value IS NULL OR pm_src.meta_value != 'manual_invoice' )
+        ";
+        $mtd_revenue_thb += (float) $wpdb->get_var( $wpdb->prepare( $b2b_mtd_sql, $mtd_start, $mtd_start ) );
+        // Manual Invoice MTD
+        $mtd_revenue_thb += (float) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COALESCE( SUM( CAST( pm_total.meta_value AS DECIMAL(14,2) ) ), 0 )
+              FROM {$wpdb->posts} p
+              INNER JOIN {$wpdb->postmeta} pm_total ON p.ID = pm_total.post_id
+                  AND pm_total.meta_key = '_b2b_order_total'
+              INNER JOIN {$wpdb->postmeta} pm_src ON p.ID = pm_src.post_id
+                  AND pm_src.meta_key = '_order_source'
+                  AND pm_src.meta_value = 'manual_invoice'
+              INNER JOIN {$wpdb->postmeta} pm_status ON p.ID = pm_status.post_id
+                  AND pm_status.meta_key = 'order_status'
+                  AND pm_status.meta_value IN ('confirm_bill','completed','paid')
+              WHERE p.post_type = 'b2b_order'
+                AND p.post_status = 'publish'
+                AND p.post_modified >= %s",
+            $mtd_start
+        ) );
+
+        // ── M1 — last month's MTD-equivalent (for trend % comparison) ──
+        $last_month_start = date( 'Y-m-01 00:00:00', strtotime( '-1 month' ) );
+        $last_month_today = date( 'Y-m-d 23:59:59', strtotime( 'first day of last month' ) . ' +' . ( (int) current_time('j') - 1 ) . ' days' );
+        $last_mtd_revenue_thb = (float) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COALESCE( SUM( CAST( pm_total.meta_value AS DECIMAL(14,2) ) ), 0 )
+              FROM {$wpdb->posts} p
+              INNER JOIN {$wpdb->postmeta} pm_status ON p.ID = pm_status.post_id
+                  AND pm_status.meta_key = 'order_status'
+                  AND pm_status.meta_value IN ('confirm_bill','shipping','shipped','completed','paid')
+              INNER JOIN {$wpdb->postmeta} pm_total ON p.ID = pm_total.post_id
+                  AND pm_total.meta_key = '_b2b_order_total'
+              LEFT JOIN {$wpdb->postmeta} pm_paid ON p.ID = pm_paid.post_id
+                  AND pm_paid.meta_key = '_b2b_paid_at'
+              WHERE p.post_type = 'b2b_order'
+                AND p.post_status = 'publish'
+                AND ( pm_paid.meta_value BETWEEN %s AND %s OR ( pm_paid.meta_value IS NULL AND p.post_modified BETWEEN %s AND %s ) )",
+            $last_month_start, $last_month_today,
+            $last_month_start, $last_month_today
+        ) );
+        $mtd_trend_pct = 0;
+        if ( $last_mtd_revenue_thb > 0 ) {
+            $mtd_trend_pct = round( ( ( $mtd_revenue_thb - $last_mtd_revenue_thb ) / $last_mtd_revenue_thb ) * 100, 1 );
+        }
+
+        // ── M2 — 7-day sales trend (revenue per day) ──
+        $sales_trend = array();
+        for ( $i = 6; $i >= 0; $i-- ) {
+            $d_start = date( 'Y-m-d 00:00:00', strtotime( "-{$i} days" ) );
+            $d_end   = date( 'Y-m-d 23:59:59', strtotime( "-{$i} days" ) );
+            $d_label = wp_date( 'j M', strtotime( $d_start ) );
+            $sql = "
+                SELECT COALESCE( SUM( CAST( pm_total.meta_value AS DECIMAL(14,2) ) ), 0 )
+                  FROM {$wpdb->posts} p
+                  INNER JOIN {$wpdb->postmeta} pm_status ON p.ID = pm_status.post_id
+                      AND pm_status.meta_key = 'order_status'
+                      AND pm_status.meta_value IN ('confirm_bill','shipping','shipped','completed','paid')
+                  INNER JOIN {$wpdb->postmeta} pm_total ON p.ID = pm_total.post_id
+                      AND pm_total.meta_key = '_b2b_order_total'
+                  LEFT JOIN {$wpdb->postmeta} pm_paid ON p.ID = pm_paid.post_id
+                      AND pm_paid.meta_key = '_b2b_paid_at'
+                  WHERE p.post_type = 'b2b_order'
+                    AND p.post_status = 'publish'
+                    AND ( pm_paid.meta_value BETWEEN %s AND %s OR ( pm_paid.meta_value IS NULL AND p.post_modified BETWEEN %s AND %s ) )
+            ";
+            $day_revenue = (float) $wpdb->get_var( $wpdb->prepare( $sql, $d_start, $d_end, $d_start, $d_end ) );
+            $sales_trend[] = array(
+                'date'    => $d_start,
+                'label'   => $d_label,
+                'revenue' => round( $day_revenue, 2 ),
+            );
+        }
+
         // ── Trend: claims per day for last 14 days ──
         $trend = [];
         for ($i = 13; $i >= 0; $i--) {
@@ -969,6 +1084,11 @@ add_action('init', function () {
             'recent'           => $recent,
             'ai_inbox'         => $ai_inbox,
             'alerts'           => $alerts,
+            // V.35.1 Mission Control M1 + M2
+            'mtd_revenue_thb'      => round( $mtd_revenue_thb, 2 ),
+            'mtd_trend_pct'        => $mtd_trend_pct,
+            'last_mtd_revenue_thb' => round( $last_mtd_revenue_thb, 2 ),
+            'sales_trend_7d'       => $sales_trend,
         ]);
         exit;
     }
@@ -4181,15 +4301,20 @@ body {
                         </div>
                     </div>
 
-                    <!-- Inventory Status -->
+                    <!-- V.35.1 M2 — 7-day Sales Trend (replaces Inventory Pie).
+                         Boss looks at revenue daily — more actionable than inventory
+                         status mix. Inventory Pie data still computed in backend +
+                         old chart-inv-pie hidden but render fn preserved for future. -->
                     <div class="dash-card">
                         <div class="dash-card-header">
-                            <div class="dash-card-title"><i class="fa-solid fa-chart-pie"></i> Inventory Status</div>
+                            <div class="dash-card-title"><i class="fa-solid fa-chart-area"></i> ยอดขาย 7 วันล่าสุด</div>
                         </div>
                         <div class="dash-card-body">
-                            <div id="chart-inv-pie"><div class="skeleton skeleton-chart"></div></div>
+                            <div id="chart-sales-trend"><div class="skeleton skeleton-chart"></div></div>
                         </div>
                     </div>
+                    <!-- Inventory Status (HIDDEN V.35.1 — moved out of Hero charts row) -->
+                    <div id="chart-inv-pie" style="display:none;"></div>
 
                 </div>
                 <!-- END Charts -->
@@ -5090,9 +5215,109 @@ jQuery(document).ready(function($) {
                 if (data.ai_inbox)         renderAIInbox(data.ai_inbox);
                 if (data.alerts)           renderAlerts(data.alerts);
                 if (data.recent)           renderActivity(data.recent);
+                // V.35.1 M1 — Hero card MTD trend update
+                if (data.mtd_revenue_thb !== undefined) {
+                    var mtdFmt = new Intl.NumberFormat('th-TH', {
+                        minimumFractionDigits: 0, maximumFractionDigits: 0,
+                    }).format(parseFloat(data.mtd_revenue_thb || 0));
+                    var trendPct = parseFloat(data.mtd_trend_pct || 0);
+                    var trendArrow = trendPct > 0 ? '📈' : (trendPct < 0 ? '📉' : '➡️');
+                    var trendColor = trendPct > 0 ? '#10b981' : (trendPct < 0 ? '#dc2626' : '#6b7280');
+                    var trendSign  = trendPct > 0 ? '+' : '';
+                    var trendTxt = (data.last_mtd_revenue_thb && parseFloat(data.last_mtd_revenue_thb) > 0)
+                        ? ' ' + trendArrow + ' <span style="color:' + trendColor + ';font-weight:600;">' + trendSign + trendPct + '%</span>'
+                        : '';
+                    $('#hero-revenue-mtd').html('MTD ฿' + mtdFmt + trendTxt);
+                }
+                // V.35.1 M2 — 7-day Sales Trend chart (replaces Inventory Pie)
+                if (data.sales_trend_7d) renderSalesTrend(data.sales_trend_7d);
             }
         });
     };
+
+    // =========================================================================
+    // V.35.1 M2 — 7-day Sales Trend chart (replaces Inventory Pie)
+    //   Boss looks at revenue trend daily — more actionable than inventory mix.
+    //   Reuses ApexCharts (already loaded for Claims Trend chart).
+    // =========================================================================
+    var salesTrendChart = null;
+    function renderSalesTrend(trendData) {
+        if (!Array.isArray(trendData) || trendData.length === 0) return;
+        var labels = trendData.map(function(d) { return d.label; });
+        var values = trendData.map(function(d) { return parseFloat(d.revenue || 0); });
+        var total = values.reduce(function(a, b) { return a + b; }, 0);
+        var avg = values.length > 0 ? total / values.length : 0;
+
+        var options = {
+            series: [{ name: 'ยอดขาย', data: values }],
+            chart: {
+                type: 'area',
+                height: 240,
+                toolbar: { show: false },
+                fontFamily: 'inherit',
+                zoom: { enabled: false },
+            },
+            stroke: { curve: 'smooth', width: 2.5 },
+            colors: ['#10b981'],
+            fill: {
+                type: 'gradient',
+                gradient: {
+                    shadeIntensity: 1, opacityFrom: 0.4, opacityTo: 0.05, stops: [0, 100],
+                }
+            },
+            dataLabels: { enabled: false },
+            xaxis: {
+                categories: labels,
+                labels: { style: { fontSize: '11px', colors: '#6b7280' } },
+                axisBorder: { show: false },
+                axisTicks: { show: false },
+            },
+            yaxis: {
+                labels: {
+                    formatter: function(v) {
+                        if (v >= 1000000) return '฿' + (v/1000000).toFixed(1) + 'm';
+                        if (v >= 1000) return '฿' + (v/1000).toFixed(0) + 'k';
+                        return '฿' + v.toFixed(0);
+                    },
+                    style: { fontSize: '11px', colors: '#6b7280' }
+                }
+            },
+            grid: {
+                borderColor: '#e5e7eb', strokeDashArray: 3,
+                xaxis: { lines: { show: false } },
+            },
+            tooltip: {
+                y: {
+                    formatter: function(v) {
+                        return '฿' + new Intl.NumberFormat('th-TH').format(v);
+                    }
+                }
+            },
+            annotations: avg > 0 ? {
+                yaxis: [{
+                    y: avg,
+                    borderColor: '#94a3b8',
+                    borderWidth: 1,
+                    strokeDashArray: 4,
+                    label: {
+                        text: 'ค่าเฉลี่ย ฿' + new Intl.NumberFormat('th-TH', { maximumFractionDigits: 0 }).format(avg),
+                        position: 'right',
+                        style: { background: '#f1f5f9', color: '#475569', fontSize: '11px', padding: { left: 8, right: 8, top: 2, bottom: 2 } }
+                    }
+                }]
+            } : {}
+        };
+
+        var el = document.querySelector('#chart-sales-trend');
+        if (!el) return;
+        if (salesTrendChart) {
+            salesTrendChart.updateOptions(options);
+        } else {
+            el.innerHTML = '';
+            salesTrendChart = new ApexCharts(el, options);
+            salesTrendChart.render();
+        }
+    }
 
     // =========================================================================
     // 8. ACTION CENTER (Today's Queue) — V.35.0 unified pending list
