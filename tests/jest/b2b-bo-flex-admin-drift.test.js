@@ -383,6 +383,64 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
         expect(builder[0]).toMatch(/ยอดรวม/);
     });
 
+    test('Snippet 16 V.3.25 — Full Redesign: ห้ามใช้ get_the_title() ใน Flex builders', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // Flex builder functions (7) — แต่ละตัวห้ามเรียก get_the_title($order_id) ใน body
+        const builderNames = [
+            'b2b_build_flex_partial_fulfill_customer',
+            'b2b_build_flex_bo_ready_customer',
+            'b2b_build_flex_bo_cancelled_customer',
+            'b2b_build_flex_bo_reject_reasons',
+            'b2b_build_flex_bo_eta_picker',
+            'b2b_build_flex_stock_review_admin',
+        ];
+        builderNames.forEach((fnName) => {
+            const re = new RegExp(`function ${fnName}\\([\\s\\S]{0,3000}?get_the_title\\(\\s*\\$order_id`);
+            expect(stripped).not.toMatch(re);
+        });
+    });
+
+    test('Snippet 16 V.3.25 — partial_fulfill conditional render (ซ่อน section 0 + ปุ่มยืนยันบิล)', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        const fn = stripped.match(/function b2b_build_flex_partial_fulfill_customer[\s\S]*?\n\s{0,4}\}\s*\n\s*\}/);
+        expect(fn).not.toBeNull();
+        // has_fulfill + has_bo conditional vars
+        expect(fn[0]).toMatch(/\$has_fulfill/);
+        expect(fn[0]).toMatch(/\$has_bo/);
+        // Footer button "ยืนยันบิล" must be inside has_fulfill check
+        expect(fn[0]).toMatch(/if\s*\(\s*\$has_fulfill\s*\)\s*\{[\s\S]{0,500}?ยืนยันบิล/);
+    });
+
+    test('Snippet 16 V.3.25 — bo_ready + bo_cancelled มีรูปสินค้า 80×80 cover', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        ['b2b_build_flex_bo_ready_customer', 'b2b_build_flex_bo_cancelled_customer'].forEach((fnName) => {
+            const re = new RegExp(`function ${fnName}[\\s\\S]{0,5000}?'type'\\s*=>\\s*'image'`);
+            expect(stripped).toMatch(re);
+        });
+    });
+
+    test('Snippet 16 V.3.25 — bo_cancelled มี reason label map Thai', () => {
+        const code = read('s16');
+        expect(code).toMatch(/'oos_long'\s*=>\s*'สินค้าหมด/);
+        expect(code).toMatch(/'discontinued'\s*=>\s*'สินค้าเลิกผลิต'/);
+        expect(code).toMatch(/'price_change'\s*=>\s*'ราคาเปลี่ยน'/);
+    });
+
     test('Snippet 14 FSM has pending_stock_review state with admin transitions', () => {
         const code = read('s14');
         const psrBlock = code.match(/['"]pending_stock_review['"]\s*=>\s*array\(([\s\S]*?)\),\s*\n\s*['"]/);
