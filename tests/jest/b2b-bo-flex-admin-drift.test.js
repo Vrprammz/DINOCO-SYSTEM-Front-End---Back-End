@@ -203,6 +203,73 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
         expect(singleQuotedBad).toBeNull();
     });
 
+    test('Snippet 2 V.34.32 — BO admin postback SEC gate ก่อน filter dispatch (BLOCKER B1)', () => {
+        const s2 = fs.readFileSync(path.join(REPO_ROOT, '[B2B] Snippet 2: LINE Webhook Gateway & Order Creator'), 'utf8');
+        // Must have $bo_admin_actions array
+        expect(s2).toMatch(/\$bo_admin_actions\s*=\s*array\(/);
+        // 6 BO admin actions whitelisted
+        expect(s2).toMatch(/'bo_confirm_full'/);
+        expect(s2).toMatch(/'bo_reject_picker'/);
+        expect(s2).toMatch(/'bo_to_backorder'/);
+        expect(s2).toMatch(/'bo_set_eta_all'/);
+        expect(s2).toMatch(/'bo_set_eta_date'/);
+        // Gate uses B2B_ADMIN_GROUP_ID + silent drop (return) for non-admin
+        expect(s2).toMatch(/B2B_ADMIN_GROUP_ID/);
+        expect(s2).toMatch(/\[BO-SEC\]\s*Blocked/);
+        // Gate must appear BEFORE apply_filters('b2b_webhook_postback_action')
+        const gateIdx = s2.search(/\$bo_admin_actions\s*=\s*array/);
+        const filterIdx = s2.search(/apply_filters\(\s*'b2b_webhook_postback_action'/);
+        expect(gateIdx).toBeGreaterThan(-1);
+        expect(filterIdx).toBeGreaterThan(-1);
+        expect(gateIdx).toBeLessThan(filterIdx);
+    });
+
+    test('Snippet 16 V.3.20 — empty Flex fallback text alert (H1 observability)', () => {
+        const code = read('s16');
+        const match = code.match(/function b2b_bo_notify_admin_stock_review\([^)]*\)\s*\{([\s\S]*?)b2b_push_guaranteed/);
+        expect(match).not.toBeNull();
+        // Empty Flex branch must push fallback text to admin (not silent return)
+        expect(match[1]).toMatch(/empty Flex.*fallback text/);
+        expect(match[1]).toMatch(/b2b_push_to_admin\(/);
+        expect(match[1]).toMatch(/Backorders tab/);
+    });
+
+    test('Snippet 16 V.3.20 — bo_to_backorder + bo_reject_picker ใช้ reply_raw (H2 quota save)', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // Count occurrences of b2b_line_reply_raw — should be ≥ 2 (bo_to_backorder + bo_reject_picker)
+        const replyRawCount = (stripped.match(/b2b_line_reply_raw\(\s*\$reply_token/g) || []).length;
+        expect(replyRawCount).toBeGreaterThanOrEqual(2);
+        // Both action blocks must contain reply_raw — verify within respective if-action blocks
+        // by extracting larger chunks (until next "if ( \$action" or end-of-function)
+        const backorder = stripped.match(/\$action === ['"]bo_to_backorder['"][\s\S]{0,1500}?b2b_line_reply_raw/);
+        expect(backorder).not.toBeNull();
+        const picker = stripped.match(/\$action === ['"]bo_reject_picker['"][\s\S]{0,1500}?b2b_line_reply_raw/);
+        expect(picker).not.toBeNull();
+    });
+
+    test('Snippet 16 V.3.20 — synthetic X-Idempotency-Key on internal bo-split call (H3)', () => {
+        const code = read('s16');
+        // Must inject idempotency header before calling b2b_rest_bo_split
+        expect(code).toMatch(/X-Idempotency-Key[\s\S]{0,200}bo-eta-\{?\$?order_id/);
+    });
+
+    test('Snippet 16 V.3.20 — past-date guard ใน bo_set_eta_date (M3)', () => {
+        const code = read('s16');
+        const stripped = code
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .split('\n')
+            .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+            .join('\n');
+        // Must reject past dates explicitly (not clamp to 1)
+        expect(stripped).toMatch(/\$ts_eta\s*<\s*\$ts_today/);
+        expect(stripped).toMatch(/past-date rejected/);
+    });
+
     test('Snippet 14 FSM has pending_stock_review state with admin transitions', () => {
         const code = read('s14');
         const psrBlock = code.match(/['"]pending_stock_review['"]\s*=>\s*array\(([\s\S]*?)\),\s*\n\s*['"]/);

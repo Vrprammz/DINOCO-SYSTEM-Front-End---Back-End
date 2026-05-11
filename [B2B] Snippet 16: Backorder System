@@ -1,6 +1,18 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.3.20 (2026-05-11) — fullstack-developer code review fixes (1 BLOCKER + 3   ║
+ * ║    HIGH + 2 MEDIUM ที่ผมพลาดใน V.3.13-V.3.19):                                          ║
+ * ║    🔴 B1: Snippet 2 V.34.32 admin postback gate ก่อน filter dispatch (BO actions ใหม่    ║
+ * ║        ไม่ได้อยู่ใน $admin_actions list → bot ในกลุ่มอื่น spoof postback ได้)             ║
+ * ║    🟠 H1: empty Flex stock_review → fallback text alert (เดิม silent return false)       ║
+ * ║    🟠 H2: bo_to_backorder + bo_reject_picker ใช้ b2b_line_reply_raw (ฟรี + 100ms)        ║
+ * ║        แทน push_raw_to_admin (กิน quota + 2-3s delay)                                    ║
+ * ║    🟠 H3: synthetic X-Idempotency-Key "bo-eta-{id}-{days}" for webhook bo-split          ║
+ * ║        → admin re-press → cached 200 replay แทน invalid_status warning                   ║
+ * ║    🟡 M1: order_id=0 guard + log diagnostic ใน 3 handlers ใหม่                            ║
+ * ║    🟡 M3: bo_set_eta_date past-date guard (reject + admin reply error) แทน clamp=1        ║
+ * ║    Invalid_status reply enriched ด้วย hint "อาจส่งเข้า BO แล้ว — ตรวจ Backorders tab".   ║
  * ║  Version: V.3.19 (2026-05-11) — "สินค้าหมดสต็อก" → BO flow (ไม่ใช่ reject!).            ║
  * ║    Boss reminded: "ระบบ BO ที่สร้างไว้ละ ไม่มีของก็ต้องไปเข้า Flow BO ลงไว้บอกวันที่      ║
  * ║    สินค้าจะเข้า". V.3.18 reason picker มี "📦 สินค้าหมดสต็อก" ที่ผิด — มันเรียก reject    ║
@@ -4285,14 +4297,22 @@ if ( ! function_exists( 'b2b_bo_notify_admin_stock_review' ) ) {
      */
     function b2b_bo_notify_admin_stock_review( $order_id ) {
         // V.3.17 (2026-05-11): TEXT FALLBACK REMOVED per UX feedback.
-        // Boss reported Flex + text duplicate ("ข้อความเยอะไป"). Flex ตอนนี้ส่งได้แล้ว
-        // (V.3.16 schema fix) + altText จัดการ notification preview/a11y อยู่แล้ว
-        // → text fallback ไม่จำเป็น. ถ้า Flex fail retry queue (V.3.13) จะส่ง alert
-        // "❌ Flex ส่งไม่สำเร็จ 5 ครั้ง" ให้ admin ทราบเอง.
+        // V.3.20 (2026-05-11) H1 — Flex empty observability: เดิม return false silent
+        // → boss ไม่รู้ว่า build fail. NOW push minimal text alert admin (+log) เพื่อ
+        // ให้ admin tab Backorders ใน Dashboard แทน. ป้องกัน orders stuck โดยที่ไม่มีใครรู้.
         $order_id = (int) $order_id;
         $flex = b2b_build_flex_stock_review_admin( $order_id );
         if ( ! $flex || ! is_array( $flex ) ) {
-            if ( function_exists('b2b_log') ) b2b_log( '[BO-Notify] empty Flex for #' . $order_id );
+            if ( function_exists('b2b_log') ) b2b_log( '[BO-Notify] empty Flex for #' . $order_id . ' — fallback text alert' );
+            // V.3.20 H1: ส่ง text alert แทนเงียบ — admin จะรู้ว่ามี order ใหม่ + ต้องไปดูใน Dashboard
+            if ( function_exists( 'b2b_push_to_admin' ) ) {
+                $ticket_no = function_exists('get_the_title') ? get_the_title( $order_id ) : ('#' . $order_id);
+                b2b_push_to_admin(
+                    "⚠️ Order #{$order_id} stock_review build Flex ล้มเหลว\n" .
+                    "Ticket: {$ticket_no}\n" .
+                    "👉 เปิด Admin Command Center → Backorders tab จัดการได้ตรง"
+                );
+            }
             return false;
         }
         if ( function_exists('b2b_log') ) b2b_log( '[BO-Notify] stock_review push for #' . $order_id );
@@ -4359,23 +4379,36 @@ add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params,
         return true;
     }
 
-    // V.3.19 (2026-05-11): NEW postback bo_to_backorder — สินค้าหมดสต็อก, route ไป BO flow
-    // (ไม่ใช่ reject!). แสดง Flex ETA picker → admin เลือก ETA → call bo-split with all qty_bo
+    // V.3.20 (2026-05-11) fullstack-developer review fixes:
+    // M1 — order_id=0 guard early return + log diagnostic
+    // H2 — ใช้ b2b_line_reply_raw() แทน b2b_push_raw_to_admin() (ฟรี + เร็ว 100ms)
     if ( $action === 'bo_to_backorder' ) {
         $order_id = (int) ( $params['order_id'] ?? 0 );
-        if ( $order_id && function_exists( 'b2b_build_flex_bo_eta_picker' ) ) {
+        if ( ! $order_id ) {
+            b2b_log( '[BO-Backorder] missing order_id in postback' );
+            return true;
+        }
+        if ( function_exists( 'b2b_build_flex_bo_eta_picker' ) ) {
             $picker = b2b_build_flex_bo_eta_picker( $order_id );
-            if ( $picker && function_exists( 'b2b_push_raw_to_admin' ) ) {
-                b2b_push_raw_to_admin( array( $picker ) );
+            if ( $picker ) {
+                // H2: reply ใช้ reply_token (ฟรี + ทันที) แทน push (กิน quota)
+                if ( $reply_token && function_exists( 'b2b_line_reply_raw' ) ) {
+                    b2b_line_reply_raw( $reply_token, array( $picker ) );
+                } elseif ( function_exists( 'b2b_push_raw_to_admin' ) ) {
+                    b2b_push_raw_to_admin( array( $picker ) );  // fallback
+                }
             }
         }
         return true;
     }
 
-    // V.3.19: bo_set_eta_all — admin เลือก ETA quick-pick (7/14/30/45 วัน) → all items → BO
+    // V.3.20: bo_set_eta_all/date — admin เลือก ETA → call bo-split all qty_bo
     if ( $action === 'bo_set_eta_all' || $action === 'bo_set_eta_date' ) {
         $order_id = (int) ( $params['order_id'] ?? 0 );
-        if ( ! $order_id ) return true;
+        if ( ! $order_id ) {
+            b2b_log( "[BO-ETA] missing order_id action={$action}" );
+            return true;
+        }
 
         // Compute ETA days from params
         $eta_days = 0;
@@ -4387,7 +4420,16 @@ add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params,
             if ( $picked_date && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $picked_date ) ) {
                 $ts_today = strtotime( date( 'Y-m-d', current_time( 'timestamp' ) ) );
                 $ts_eta   = strtotime( $picked_date );
-                $eta_days = max( 1, (int) round( ( $ts_eta - $ts_today ) / 86400 ) );
+                // M3 (2026-05-11) past-date guard: admin/attacker spoof postback past date
+                // → clamp ไป 1 วันก็ขัด business intent. Reject explicitly + log + reply error.
+                if ( $ts_eta === false || $ts_eta < $ts_today ) {
+                    b2b_log( "[BO-ETA] past-date rejected #{$order_id} picked={$picked_date}" );
+                    if ( function_exists( 'b2b_line_reply' ) ) {
+                        b2b_line_reply( $reply_token, "⚠️ ไม่สามารถเลือกวันที่ในอดีตได้ (เลือก >= วันนี้)" );
+                    }
+                    return true;
+                }
+                $eta_days = (int) round( ( $ts_eta - $ts_today ) / 86400 );
             }
         }
         if ( $eta_days < 1 || $eta_days > 365 ) {
@@ -4418,13 +4460,17 @@ add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params,
 
         // Call bo-split internal
         $req = new WP_REST_Request();
+        // H3 (2026-05-11) synthetic idempotency key — webhook postback ไม่มี X-Idempotency-Key
+        // header ทำให้ double-tap ถูก reject ที่ FSM (invalid_status) แทน cached replay.
+        // กับ key นี้ admin re-press ภายในเดือนเดียวกับ eta_days เดิม → cached 200 → smooth UX.
+        $req->set_header( 'X-Idempotency-Key', "bo-eta-{$order_id}-{$eta_days}" );
         $req->set_param( 'order_id', $order_id );
         $req->set_param( 'splits', $splits );
         $result = function_exists( 'b2b_rest_bo_split' ) ? b2b_rest_bo_split( $req ) : null;
 
         if ( function_exists( 'b2b_line_reply' ) ) {
             $eta_date_text = date_i18n( 'j M Y', strtotime( "+{$eta_days} days", current_time( 'timestamp' ) ) );
-            if ( ! is_wp_error( $result ) && $result !== null ) {
+            if ( ! is_wp_error( $result ) ) {
                 $ticket_no = get_the_title( $order_id );
                 b2b_line_reply( $reply_token,
                     "📦 ส่งเข้า BO #{$ticket_no}\n" .
@@ -4432,8 +4478,13 @@ add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params,
                     "— ลูกค้าได้รับแจ้งเตือนแล้ว"
                 );
             } else {
-                $err_msg = is_wp_error( $result ) ? $result->get_error_message() : 'unknown error';
-                b2b_line_reply( $reply_token, "⚠️ ส่งเข้า BO ไม่สำเร็จ #{$order_id}\n{$err_msg}" );
+                $err_msg  = $result->get_error_message();
+                $err_code = $result->get_error_code();
+                // H3 follow-up: invalid_status ปกติแล้ว = admin กดซ้ำหลัง bo-split สำเร็จ → friendly reply
+                $hint = ( $err_code === 'invalid_status' )
+                    ? '(อาจ ส่งเข้า BO แล้ว — ตรวจ Backorders tab)'
+                    : '(ลองเปิด Admin Dashboard เพื่อตรวจสอบ)';
+                b2b_line_reply( $reply_token, "⚠️ ส่งเข้า BO ไม่สำเร็จ #{$order_id}\n{$err_msg}\n{$hint}" );
             }
         }
         return true;
@@ -4445,12 +4496,21 @@ add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params,
     // รองรับ text เท่านั้น และ Flex picker จะแสดงข้างใต้ stock_review Flex เดิมในกลุ่มเดียวกัน
     if ( $action === 'bo_reject_picker' ) {
         $order_id = (int) ( $params['order_id'] ?? 0 );
-        if ( $order_id && function_exists( 'b2b_build_flex_bo_reject_reasons' ) ) {
+        if ( ! $order_id ) {
+            b2b_log( '[BO-RejectPicker] missing order_id' );
+            return true;
+        }
+        if ( function_exists( 'b2b_build_flex_bo_reject_reasons' ) ) {
             $picker = b2b_build_flex_bo_reject_reasons( $order_id );
-            if ( $picker && function_exists( 'b2b_push_raw_to_admin' ) ) {
-                b2b_push_raw_to_admin( array( $picker ) );
+            if ( $picker ) {
+                // V.3.20 H2: reply ใช้ reply_token (ฟรี + 100ms) แทน push
+                if ( $reply_token && function_exists( 'b2b_line_reply_raw' ) ) {
+                    b2b_line_reply_raw( $reply_token, array( $picker ) );
+                } elseif ( function_exists( 'b2b_push_raw_to_admin' ) ) {
+                    b2b_push_raw_to_admin( array( $picker ) );  // fallback
+                }
             } elseif ( function_exists( 'b2b_line_reply' ) ) {
-                b2b_line_reply( $reply_token, "กรุณาเลือกเหตุผล (text picker fallback):\n• สินค้าหมดสต็อก\n• สินค้ายกเลิกการขาย\n• ราคาผิดพลาด\n• อื่นๆ" );
+                b2b_line_reply( $reply_token, "กรุณาเลือกเหตุผล (text picker fallback):\n• สินค้ายกเลิกการขาย\n• ราคาผิดพลาด\n• อื่นๆ" );
             }
         }
         return true;
