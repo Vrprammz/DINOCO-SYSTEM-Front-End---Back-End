@@ -7432,6 +7432,39 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toMatch(/\$exception->getFile\(\)/);
             expect(code).toMatch(/\$exception->getLine\(\)/);
         });
+
+        test('R11 HIGH-2: pool_stats_v1 transient is invalidated on dinoco_sn_pool_status_changed', () => {
+            // Cache key 'dinoco_sn_pool_stats_v1' is set with 60s TTL at line ~5082.
+            // Must have a registered listener that deletes it when pool state changes.
+            const code = fs.readFileSync(
+                path.join(REPO_ROOT, '[System] DINOCO SN REST API'),
+                'utf8'
+            );
+            expect(code).toMatch(/set_transient\(\s*'dinoco_sn_pool_stats_v1'/);
+            // Listener registered on canonical status_changed action
+            expect(code).toMatch(
+                /add_action\(\s*'dinoco_sn_pool_status_changed'\s*,\s*'dinoco_sn_invalidate_pool_stats_cache'/
+            );
+            // Listener function body deletes the transient
+            expect(code).toMatch(
+                /function dinoco_sn_invalidate_pool_stats_cache[\s\S]{0,200}delete_transient\(\s*'dinoco_sn_pool_stats_v1'\s*\)/
+            );
+        });
+
+        test('R11 HIGH-3: LTV snapshot cron invalidates per-user transient on UPSERT', () => {
+            // dinoco_sn_run_ltv_snapshot() must delete_transient('dinoco_sn_ltv_<user_id>')
+            // after each INSERT ... ON DUPLICATE KEY UPDATE so member dashboard reads fresh.
+            const code = fs.readFileSync(
+                path.join(REPO_ROOT, '[Admin System] DINOCO Production SN Manager'),
+                'utf8'
+            );
+            const cronStart = code.indexOf('function dinoco_sn_run_ltv_snapshot');
+            expect(cronStart).toBeGreaterThan(0);
+            const cronBody = code.slice(cronStart, cronStart + 6000);
+            // Within cron body, find the UPSERT then a per-user transient delete
+            expect(cronBody).toMatch(/ON DUPLICATE KEY UPDATE/);
+            expect(cronBody).toMatch(/delete_transient\(\s*'dinoco_sn_ltv_'\s*\.\s*\$user_id\s*\)/);
+        });
     });
 });
 
