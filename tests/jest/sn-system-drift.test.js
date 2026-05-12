@@ -7337,5 +7337,101 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(heartbeatMatch[1].trim()).toBe('false');
         });
     });
+
+    describe('R11 BLOCKER-1 — dinoco_obs_capture() signature drift across SN namespace', () => {
+        // ─────────────────────────────────────────────────────────────────────
+        // R11 hunt found 54 sites passing Throwable / null as $level arg of
+        // dinoco_obs_capture( $level, $message, $context ). Defensive coercion
+        // logged exceptions as `{}` with NO class/message/stack — invisible to
+        // Sentry + error_log + structured logs across ALL sensitive SN ops.
+        // Fix: Throwables route through dinoco_obs_capture_exception() wrapper.
+        // ─────────────────────────────────────────────────────────────────────
+
+        const SN_FILES_WITH_OBS_CALLS = [
+            '[Admin System] DINOCO SN Approval Workflow',
+            '[System] DINOCO SN REST API',
+            '[Admin System] DINOCO Production SN Manager',
+            '[Admin System] DINOCO SN Reconciliation',
+            '[Admin System] DINOCO Public API Gateway',
+            '[Admin System] DINOCO Service Center & Claims',
+            '[System] DINOCO Warranty Activation LIFF',
+            '[Admin System] DINOCO Manual Transfer Tool',
+        ];
+
+        // Strip PHP/JS comments before regex scanning — version headers contain
+        // literal "dinoco_obs_capture( $e, ... )" describing the R11 fix.
+        function stripPhpComments(code) {
+            return code
+                .split('\n')
+                .filter((ln) => !/^\s*\*/.test(ln)) // skip ` * ...` block-comment continuations
+                .filter((ln) => !/^\s*\/\//.test(ln)) // skip `// ...` line comments
+                .join('\n');
+        }
+
+        test.each(SN_FILES_WITH_OBS_CALLS)(
+            'R11: %s has zero `dinoco_obs_capture( $<var>,` Throwable-first calls',
+            (filename) => {
+                const filepath = path.join(REPO_ROOT, filename);
+                if (!fs.existsSync(filepath)) return; // skip if snippet not present
+                const raw = fs.readFileSync(filepath, 'utf8');
+                const code = stripPhpComments(raw);
+                // Match `dinoco_obs_capture( $varname,` — Throwable arg passed as level.
+                // Strip `_exception` variant first to avoid false positives.
+                const stripped = code.replace(/dinoco_obs_capture_exception\(/g, 'DINOCO_OBS_CAPTURE_EXCEPTION(');
+                const matches = stripped.match(/dinoco_obs_capture\(\s*\$[a-zA-Z_][a-zA-Z0-9_]*\s*,/g) || [];
+                if (matches.length > 0) {
+                    console.error(`R11 drift in ${filename}:`, matches);
+                }
+                expect(matches.length).toBe(0);
+            }
+        );
+
+        test('R11: SN namespace has zero `dinoco_obs_capture( new Exception(...)` calls', () => {
+            // Throwable expressions (not just $var) must also use _exception wrapper
+            SN_FILES_WITH_OBS_CALLS.forEach((filename) => {
+                const filepath = path.join(REPO_ROOT, filename);
+                if (!fs.existsSync(filepath)) return;
+                const raw = fs.readFileSync(filepath, 'utf8');
+                const code = stripPhpComments(raw);
+                const stripped = code.replace(/dinoco_obs_capture_exception\(/g, 'DINOCO_OBS_CAPTURE_EXCEPTION(');
+                const matches = stripped.match(/dinoco_obs_capture\(\s*new\s+\\?Exception/g) || [];
+                if (matches.length > 0) {
+                    console.error(`R11 new Exception drift in ${filename}:`, matches);
+                }
+                expect(matches.length).toBe(0);
+            });
+        });
+
+        test('R11: SN Manager dinoco_sn_obs_capture wrapper uses (level, message, context) signature', () => {
+            // The wrapper helper itself was passing `null, $payload` → coerced 'info' + JSON msg.
+            // Must call dinoco_obs_capture('info', $tag, $payload) per Observability contract.
+            const code = fs.readFileSync(
+                path.join(REPO_ROOT, '[Admin System] DINOCO Production SN Manager'),
+                'utf8'
+            );
+            // Locate wrapper body (search a wider window for the inner call).
+            const wrapperStart = code.indexOf('function dinoco_sn_obs_capture');
+            expect(wrapperStart).toBeGreaterThan(0);
+            const wrapperBody = code.slice(wrapperStart, wrapperStart + 2500);
+            // Must call with 3 args: string level + string tag + array payload
+            expect(wrapperBody).toMatch(/dinoco_obs_capture\(\s*'info'\s*,\s*\$tag\s*,\s*\$payload\s*\)/);
+            // Must NOT pass null as level
+            expect(wrapperBody).not.toMatch(/dinoco_obs_capture\(\s*null\s*,/);
+        });
+
+        test('R11: dinoco_obs_capture_exception() function defined in Observability snippet', () => {
+            // Verify the canonical helper exists — Throwable callers depend on it.
+            const filepath = path.join(REPO_ROOT, '[Admin System] DINOCO Observability');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const code = fs.readFileSync(filepath, 'utf8');
+            expect(code).toMatch(/function dinoco_obs_capture_exception\(\s*\$exception\s*,\s*\$context/);
+            // Must extract class + message
+            expect(code).toMatch(/get_class\(\s*\$exception\s*\)/);
+            expect(code).toMatch(/\$exception->getMessage\(\)/);
+            // Must include file + line in context
+            expect(code).toMatch(/\$exception->getFile\(\)/);
+            expect(code).toMatch(/\$exception->getLine\(\)/);
+        });
+    });
 });
 
