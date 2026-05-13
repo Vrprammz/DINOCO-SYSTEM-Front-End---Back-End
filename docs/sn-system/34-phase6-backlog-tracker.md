@@ -41,7 +41,7 @@ LT-1..LT-4 tracked separately in `docs/sn-system/33-phase6-strategic-foundations
 
 | ID | Feature | Status | Effort | Blocker | Owner |
 | --- | --- | --- | --- | --- | --- |
-| **RD-2** | CLV Dashboard cohort analysis (signup month / tier movement) | ⏳ TODO | ~6h | None (data exists in `sn_customer_ltv_snapshot`) | Tech Lead |
+| **RD-2** | CLV Dashboard cohort analysis (signup month / tier movement) | ✅ MVP LANDED 2026-05-13 (V.0.46) — `/ltv/cohorts` endpoint with 5-tier × N-month matrix + retention pct + monthly/tier/grand totals. Admin UI viewer deferred. | 3/6h | None | Tech Lead |
 | **RD-4** | Smart Cross-Sell ML Recommendation | 🟡 DATA-BLOCKED | ~20h | Need ≥12 months of historical data + Gemini training budget | Boss decision |
 
 ### RM (Risk Mitigators) — Anti-fraud + Trust

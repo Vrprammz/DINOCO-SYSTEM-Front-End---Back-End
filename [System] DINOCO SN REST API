@@ -2,6 +2,14 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.46 (2026-05-13) — Phase 7 P3 RD-2 CLV Cohort       ║
+ * ║    Analysis NEW endpoint:                                        ║
+ * ║    - GET /ltv/cohorts?months_back=12 — aggregate customers into  ║
+ * ║      signup-month cohorts × current loyalty_tier matrix.          ║
+ * ║      Returns cohorts (M×T matrix) + monthly_totals + tier_totals ║
+ * ║      + grand_total + retention_pct per cell/row.                  ║
+ * ║      Rate limit 30/hr/user (heavy aggregation).                  ║
+ * ║      Defensive: table_exists guard → returns stub if cron not ran║
  * ║  Version: V.0.45 (2026-05-13) — Phase 7 P1 OP-3 Bulk Admin       ║
  * ║    Actions Wizard MVP (plan §K.4):                               ║
  * ║    - POST /bulk/void — max 100 plates, in_pool/reserved only,    ║
@@ -1934,6 +1942,21 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                 'tier'      => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_key' ),
                 'min_spent' => array( 'type' => 'number', 'sanitize_callback' => function( $v ) { return max( 0, (float) $v ); } ),
                 'limit'     => array( 'type' => 'integer', 'default' => 5000, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // Phase 7 P3 (2026-05-13) — RD-2 CLV Cohort Analysis
+        // GET /ltv/cohorts — aggregate customers into signup-month cohorts +
+        // current tier breakdown. Returns matrix [cohort_month][tier] => count
+        // for boss to see retention/movement patterns over time.
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/ltv/cohorts', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_ltv_cohorts',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                // months_back default 12 — covers full year of cohorts
+                'months_back' => array( 'type' => 'integer', 'default' => 12,
+                                        'sanitize_callback' => function( $v ) { return max( 1, min( 60, (int) $v ) ); } ),
             ),
         ) );
 
@@ -5820,6 +5843,147 @@ if ( ! function_exists( 'dinoco_sn_rest_ltv_export' ) ) {
         $resp->header( 'X-PII-Visible', $can_pii ? '1' : '0' );
 
         return $resp;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 8.5.5 PHASE 7 P3 RD-2 — CLV COHORT ANALYSIS (V.0.46, 2026-05-13)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Aggregates customers into signup-month cohorts × current tier matrix.
+ * Returns counts + reward/activity metrics per cohort. Source data:
+ *   - sn_customer_ltv_snapshot: per-user current loyalty_tier + spent
+ *   - first_purchase_date: cohort assignment (YYYY-MM)
+ *
+ * Boss can see at a glance:
+ *   - How many bronze customers joined in Jan, how many still bronze vs upgraded
+ *   - Retention rate per cohort (active_warranties_count > 0)
+ *   - Average lifetime spent per cohort (revenue concentration)
+ *
+ * Defensive: function_exists/table_exists guards. Empty cohort returns {} not error.
+ */
+
+if ( ! function_exists( 'dinoco_sn_rest_ltv_cohorts' ) ) {
+    function dinoco_sn_rest_ltv_cohorts( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'ltv_snapshot' ) ) {
+            return rest_ensure_response( array(
+                'cohorts' => array(),
+                'tiers'   => array( 'bronze', 'silver', 'gold', 'platinum', 'diamond' ),
+                'months_back' => 0,
+                'note'    => 'ltv_snapshot table not installed — cron has not run yet',
+            ) );
+        }
+
+        // Rate limit — max 30/hr (heavy aggregation query)
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'sn_ltv_cohorts_' . get_current_user_id(), 30, 3600 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        $months_back = (int) $req->get_param( 'months_back' );
+        if ( $months_back <= 0 ) $months_back = 12;
+        $months_back = max( 1, min( 60, $months_back ) );
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'ltv_snapshot' );
+
+        // Cohort = YYYY-MM of first_purchase_date. Aggregate by cohort × tier.
+        // Skip rows with NULL first_purchase_date (no plates yet).
+        $cutoff = gmdate( 'Y-m-01', strtotime( "-{$months_back} months" ) );
+        $sql = $wpdb->prepare(
+            "SELECT
+                DATE_FORMAT(first_purchase_date, '%%Y-%%m') AS cohort_month,
+                loyalty_tier,
+                COUNT(*) AS customer_count,
+                SUM(active_warranties_count > 0) AS active_count,
+                SUM(total_lifetime_spent) AS sum_spent,
+                AVG(total_lifetime_spent) AS avg_spent,
+                MAX(claim_count) AS max_claim_count
+             FROM {$tbl}
+             WHERE first_purchase_date IS NOT NULL
+               AND first_purchase_date >= %s
+             GROUP BY cohort_month, loyalty_tier
+             ORDER BY cohort_month DESC, loyalty_tier ASC",
+            $cutoff
+        );
+        $rows = $wpdb->get_results( $sql, ARRAY_A );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        // Reshape: { 'YYYY-MM' => { 'bronze' => { customer_count, ... }, 'silver' => ... }, ...}
+        // Plus monthly totals + grand totals.
+        $cohorts = array();
+        $monthly_totals = array();
+        $tier_totals = array();
+        $tiers_order = array( 'bronze', 'silver', 'gold', 'platinum', 'diamond' );
+        foreach ( $tiers_order as $t ) $tier_totals[ $t ] = array( 'customer_count' => 0, 'sum_spent' => 0.0 );
+
+        foreach ( $rows as $r ) {
+            $cm   = (string) $r['cohort_month'];
+            $tier = (string) $r['loyalty_tier'];
+            $count = (int) $r['customer_count'];
+            $active = (int) $r['active_count'];
+            $sum   = (float) $r['sum_spent'];
+            $avg   = (float) $r['avg_spent'];
+
+            if ( ! isset( $cohorts[ $cm ] ) ) {
+                $cohorts[ $cm ] = array();
+                $monthly_totals[ $cm ] = array(
+                    'cohort_month'   => $cm,
+                    'customer_count' => 0,
+                    'active_count'   => 0,
+                    'sum_spent'      => 0.0,
+                );
+            }
+            $cohorts[ $cm ][ $tier ] = array(
+                'customer_count' => $count,
+                'active_count'   => $active,
+                'sum_spent'      => round( $sum, 2 ),
+                'avg_spent'      => round( $avg, 2 ),
+                'retention_pct'  => $count > 0 ? round( ( $active / $count ) * 100, 1 ) : 0.0,
+            );
+            $monthly_totals[ $cm ]['customer_count'] += $count;
+            $monthly_totals[ $cm ]['active_count']   += $active;
+            $monthly_totals[ $cm ]['sum_spent']      += $sum;
+            if ( isset( $tier_totals[ $tier ] ) ) {
+                $tier_totals[ $tier ]['customer_count'] += $count;
+                $tier_totals[ $tier ]['sum_spent']      += $sum;
+            }
+        }
+
+        // Round + retention% on monthly totals
+        $monthly_list = array_values( array_map( function( $m ) {
+            $m['retention_pct'] = $m['customer_count'] > 0
+                ? round( ( $m['active_count'] / $m['customer_count'] ) * 100, 1 ) : 0.0;
+            $m['sum_spent']     = round( $m['sum_spent'], 2 );
+            return $m;
+        }, $monthly_totals ) );
+        foreach ( $tier_totals as $t => &$tt ) {
+            $tt['sum_spent'] = round( $tt['sum_spent'], 2 );
+        }
+        unset( $tt );
+
+        // Grand total
+        $grand = array(
+            'customer_count' => array_sum( wp_list_pluck( $monthly_list, 'customer_count' ) ),
+            'active_count'   => array_sum( wp_list_pluck( $monthly_list, 'active_count' ) ),
+            'sum_spent'      => round( array_sum( wp_list_pluck( $monthly_list, 'sum_spent' ) ), 2 ),
+        );
+        $grand['retention_pct'] = $grand['customer_count'] > 0
+            ? round( ( $grand['active_count'] / $grand['customer_count'] ) * 100, 1 ) : 0.0;
+
+        return rest_ensure_response( array(
+            'cohorts'        => $cohorts,         // signup_month → tier → metrics
+            'monthly_totals' => $monthly_list,    // signup_month → totals across tiers
+            'tier_totals'    => $tier_totals,     // tier → totals across cohorts
+            'grand_total'    => $grand,
+            'tiers'          => $tiers_order,
+            'months_back'    => $months_back,
+            'cutoff_date'    => $cutoff,
+            'snapshot_age'   => null,             // future: include latest computed_at
+        ) );
     }
 }
 
