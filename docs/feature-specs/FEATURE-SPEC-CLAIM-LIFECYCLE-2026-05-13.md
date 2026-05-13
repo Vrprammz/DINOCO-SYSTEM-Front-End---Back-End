@@ -1,9 +1,9 @@
 # Feature Spec: DINOCO Claim Lifecycle Notifications + Payment + Flash Shipping
 
-**Version:** V.2.1 (2026-05-13) — boss directive: NO PromptPay QR + separate claim bank from B2B + admin-editable
-**Previous:** V.2.0 (2026-05-13) — zero-dead-ends rev, superseded by V.2.1 payment-rail revision
-**Author:** Feature Architect
-**Status:** Draft — pending boss sign-off + DB_ID provisioning + Open Questions (now 9 with bank settings)
+**Version:** V.2.2 (2026-05-13) — closes 5 BLOCKERs from tech-lead 14-specialist review
+**Previous:** V.2.1 (2026-05-13) — boss directive NO QR + separate claim bank, superseded by V.2.2 BLOCKER closures
+**Author:** Feature Architect + Tech-Lead synthesis
+**Status:** Draft — pending Phase 0 DB_ID provisioning (15 min boss work) + 9 Open Questions
 **Related:**
 - `[System] DINOCO Claim System` V.31.0 (DB_ID 16) — entry point + claim_ticket CPT writer
 - `[Admin System] DINOCO Service Center & Claims` V.31.6 (DB_ID 27) — owner of `dinoco_set_claim_status()` + `dinoco/claim/state_changed` action
@@ -25,7 +25,8 @@
 |---|---|---|---|
 | V.1.0 | 2026-05-13 | Feature Architect | Initial draft; 10 sections; ~570 lines; surfaced 3 BLOCKERs in tech-lead review (helper name drift, walk-in bank context, Phase 1 dep lock) |
 | V.2.0 | 2026-05-13 | Feature Architect | Boss-mandated "ไม่มีจุดตาย / หน้าตาย / ปุ่มตาย"; closes 3 BLOCKERs + 4 HIDDEN RISKS + 4 SHOULD-FIXes; adds 9 new sections A-I (Journey, Button Matrix, Page States, Concurrency, Edge Cascades, FSM, Crons, REST flow, Error Catalog); Phase 1 effort 40h → 52h |
-| **V.2.1** | **2026-05-13** | **Feature Architect** | **Boss directive 2026-05-13: (1) ไม่ใช้ PromptPay QR — replaced with bank-transfer + Slip2Go verify (B2B-style). (2) ออกแบบให้แก้เลขบัญชี — claim bank MUST be different account from B2B. NEW §6.4 Claim Bank Configuration: 3-tier resolver (wp_options → constants → sentinel), `[dinoco_claim_bank_settings]` admin UI shortcode, validation rules, audit trail, immutability of existing pending charges, REST endpoints (3). Helper `dinoco_claim_bank_resolve($use_walkin)`. Phase 1 effort 52h → 64h (+12h bank settings work). Schema: dropped `qr_payload` + `qr_image_base64` columns, added `bank_branch`. Open Questions: now 9 (NEW Q9 = walkin bank — same or separate?).** |
+| V.2.1 | 2026-05-13 | Feature Architect | Boss directive 2026-05-13: (1) ไม่ใช้ PromptPay QR — replaced with bank-transfer + Slip2Go verify (B2B-style). (2) ออกแบบให้แก้เลขบัญชี — claim bank MUST be different account from B2B. NEW §6.4 Claim Bank Configuration: 3-tier resolver (wp_options → constants → sentinel), `[dinoco_claim_bank_settings]` admin UI shortcode, validation rules, audit trail, immutability of existing pending charges, REST endpoints (3). Helper `dinoco_claim_bank_resolve($use_walkin)`. Phase 1 effort 52h → 64h (+12h bank settings work). Schema: dropped `qr_payload` + `qr_image_base64` columns, added `bank_branch`. Open Questions: now 9 (NEW Q9 = walkin bank — same or separate?). |
+| **V.2.2** | **2026-05-13** | **Tech-Lead synthesis** | **Closes 5 BLOCKERs from tech-lead 14-specialist deep review (commits `d366ab1`+`ff0581b` audit). B-1: fictitious "DB_ID 1187 wp_dinoco_audit_log" replaced with verified Flag Audit Log DB_ID 1203 dual-channel logging (no new table). B-2: §6.7 prerequisites table with REAL DB_ID status — verified 4 of 5 prereqs still `DB_ID: (pending)` (Idempotency Helper, Modal Helpers, Flag Audit Log, Observability). NEW Phase 0 mandatory provisioning step (~15 min boss work in WP admin) BEFORE Phase 1 starts. B-3: 16-callsite reference table for `b2b_get_bank_info()` (verified by grep — tech-lead said 14, actual is 16 across 7 source files). PHPUnit `BankInfoSignaturePinTest` + Jest `b2b-get-bank-info-callsites.test.js` drift detector added to Phase 2.3 (effort 4h → 8h). B-4: explicit handler pseudocode for charge-create snapshot + race test contract `ClaimBankImmutabilityRaceTest` added to Phase 2.8 (effort 6h → 8h). B-5: NEW §6.4.1 strict bank_code mismatch contract — full PHP pseudocode for `dinoco_verify_slip_for_claim()` with fail-fast bank-code check, dedicated `slip_bank_mismatch` error code with Thai message + Telegram alert + dedup, integration with H-6 `bank_context` discriminator for replay defense, 5-scenario PHPUnit test contract. Phase 2 effort 78h → 83h. Total project 228h → 233h.** |
 
 ---
 
@@ -350,7 +351,7 @@ Route: `/claim-pay/{charge_id}` (shortcode `[dinoco_claim_pay]` in new snippet).
 |---|---|---|
 | ~~`b2b_promptpay_qr_payload()`~~ | **N/A — DROPPED** | **REMOVED V.2.1** — Boss directive 2026-05-13: ไม่ใช้ PromptPay QR. ลูกค้าโอนเอง ผ่าน bank account + reference code. No QR helper needed. |
 | `b2b_rest_manual_flash_create_internal()` | **Does not exist.** `b2b_rest_manual_flash_create(WP_REST_Request $r)` is the REST handler at [B2B] Snippet 3 line 5617 — takes `WP_REST_Request`, not plain params. No internal helper exists. | **Two-pronged refactor:** (a) **NEW internal helper** `dinoco_claim_create_flash_shipment($claim_id, array $params)` in new "Claim Flash Dispatcher" snippet — accepts plain PHP array, returns `{ok, pno, tracking_url, error}`. (b) Inside it, **directly call `wp_remote_post()` to `B2B_FLASH_API_URL . '/open/v3/orders'`** with HMAC-signed body (reuse `b2b_flash_sign()` from Snippet 1 via `function_exists` guard). Encapsulates the same payload schema as `b2b_rest_manual_flash_create` but bypasses WP_REST_Request coupling. **Migration plan:** Phase 3 task 3.10 (NEW) — once Claim Flash Dispatcher is stable, refactor `b2b_rest_manual_flash_create` to call same helper (DRY) — out of MVP scope. |
-| `b2f_verify_slip_image($image)` | Actual signature: `b2f_verify_slip_image($image_base64, $maker_id)` ([B2F] Snippet 1 line 3313). Requires maker bank info. | **NEW wrapper** `dinoco_verify_slip_for_claim($image_base64, $expected_amount_thb, $expected_bank_code, $expected_account_no)` in "Claim Payment LIFF" snippet. Internally calls Slip2Go API directly (mirror `b2f_verify_slip_image` payload shape but with `DINOCO_CLAIM_BANK_*` or `DINOCO_CLAIM_WALKIN_BANK_*` receiver — NEW separate bank account, NOT shared with B2B per boss directive 2026-05-13). DOES NOT touch `b2f_verify_slip_image` (clean separation, no risk to B2F). Shares `B2B_SLIP2GO_SECRET_KEY` constant. |
+| `b2f_verify_slip_image($image)` | Actual signature: `b2f_verify_slip_image($image_base64, $maker_id)` ([B2F] Snippet 1 line 3313). Requires maker bank info. | **NEW wrapper** `dinoco_verify_slip_for_claim($image_base64, $expected_amount_thb, $expected_bank_code, $expected_account_no, $charge_id)` in "Claim Payment LIFF" snippet. Internally calls Slip2Go API directly (mirror `b2f_verify_slip_image` payload shape but with `DINOCO_CLAIM_BANK_*` or `DINOCO_CLAIM_WALKIN_BANK_*` receiver — NEW separate bank account, NOT shared with B2B per boss directive 2026-05-13). DOES NOT touch `b2f_verify_slip_image` (clean separation, no risk to B2F). Shares `B2B_SLIP2GO_SECRET_KEY` constant. **V.2.2 B-5 FIX**: strict bank-code mismatch contract enforced — see §6.4.1 (NEW) below. |
 
 #### B2 — `b2b_get_bank_info()` Walk-in Extension
 
@@ -532,21 +533,135 @@ PHPUnit test: `ClaimFlashWebhookRaceTest::test_terminal_state_silently_skipped()
 - `bank_name` required, max 64 chars
 - `bank_logo_url` optional, must be `https://` (no http) + image MIME validate via HEAD request (10s timeout)
 
-#### Audit Trail
+#### Audit Trail (V.2.2 B-1 FIX — uses Flag Audit Log, not generic audit_log)
 
-Every save → INSERT into `wp_dinoco_audit_log` (existing snippet `DB_ID 1187`):
+Every save → dual-channel logging:
 
-```text
-event_type: claim_bank_settings_changed
-actor: user_id
-diff: { before: {...}, after: {...} }  — JSON
+1. **Primary**: `dinoco_flag_audit_log($flag, $old, $new, $reason, $source)` from `[Admin System] DINOCO Flag Audit Log` (DB_ID **1203 ✓ provisioned**). Bank settings = 7 wp_options × 2 banks = up to 14 flag changes per save. Listener auto-deduplicates same-request writes per Round 50+ pattern. Whitelist filter `dinoco_flag_audit_tracked_flags` extended (in Phase 1.9) with: `dinoco_claim_bank_*` (all 7 keys × 2 = 14 entries).
+
+2. **Reason**: V.2.1 spec referenced a fictitious `wp_dinoco_audit_log` table @ "DB_ID 1187" — verified non-existent. Tech-lead 14-specialist review (2026-05-13) caught this as BLOCKER B-1. Flag Audit Log is the canonical DINOCO audit channel for wp_options state changes (already used by V.42 Flash flag flips, B2F migration audit, etc.). NO new audit table needed.
+
+```php
+// Inside [dinoco_claim_bank_settings] save handler:
+foreach ($changed_fields as $key => $diff) {
+    // $key e.g. 'dinoco_claim_bank_account' / 'dinoco_claim_walkin_bank_account'
+    // $diff e.g. ['before' => '123-4-56789-0', 'after' => '987-6-54321-0']
+    if (function_exists('dinoco_flag_audit_log')) {
+        dinoco_flag_audit_log(
+            $key,                                    // flag name (whitelist-allowed)
+            $diff['before'],                         // old value
+            $diff['after'],                          // new value
+            'claim_bank_settings_save',              // reason
+            'claim_bank_settings_admin_ui'           // source
+        );
+    } else {
+        // Defensive: snippet not synced yet → no-op + error_log
+        error_log("[ClaimBank] flag_audit_log unavailable — skipped audit row for {$key}");
+    }
+}
 ```
 
-→ Admin can see "ใครเปลี่ยนเลขบัญชีเมื่อไหร่" via Audit Log viewer
+→ Admin queries via existing Flag Audit Log viewer `[dinoco_flag_audit_viewer]` (filter `flag=dinoco_claim_bank_*`).
+→ Retention auto-handled by Flag Audit Log retention cron (90-day default, 30-365 configurable).
 
-#### Immutability of Existing Charges
+#### Immutability of Existing Charges (V.2.2 B-4 FIX — explicit handler contract + race test)
 
 When admin changes bank info → **existing pending charges DO NOT update** (snapshot in `wp_dinoco_claim_charges.bank_*` columns at create time). Only NEW charges use the new bank. Reason: customer who already got Flex card with old account # must not have their slip rejected after they transfer.
+
+**Snapshot mechanism (explicit handler pseudocode — closes B-4 ambiguity)**:
+
+```php
+// REST POST /dinoco-claim/v1/charge/create handler — V.2.2 explicit snapshot contract
+function dinoco_claim_charge_create_handler($req) {
+    $claim_id = (int) $req->get_param('claim_id');
+    $amount   = (float) $req->get_param('amount');
+    $reason   = sanitize_text_field($req->get_param('reason'));
+
+    // Atomic transaction — lock claim + resolve bank ONCE per charge
+    $wpdb->query("START TRANSACTION");
+    try {
+        // 1. Lock the claim row (defense against double-create from rapid clicks)
+        $claim_lock_key = "dinoco_claim_charge_create_{$claim_id}";
+        $wpdb->query($wpdb->prepare("SELECT GET_LOCK(%s, 5)", $claim_lock_key));
+
+        // 2. Detect walk-in context (per H-7: auto-detect from distributor.is_walkin)
+        $distributor_id = (int) get_post_meta($claim_id, '_distributor_id', true);
+        $use_walkin = $distributor_id && get_field('is_walkin', $distributor_id) === true;
+
+        // 3. Resolve bank ONCE — this is the immutability snapshot point
+        $bank = dinoco_claim_bank_resolve($use_walkin);  // 3-tier resolver §6.4
+
+        // 4. Validate bank is configured (not sentinel error)
+        if (!empty($bank['error'])) {
+            $wpdb->query("ROLLBACK");
+            return new WP_Error('no_claim_bank_configured',
+                'ยังไม่ได้ตั้งค่าบัญชีรับเงินสำหรับเคลม — กรุณาตั้งค่าก่อนออกบิล', ['status' => 422]);
+        }
+
+        // 5. INSERT charge row WITH bank snapshot (7 columns snapshotted at this instant)
+        $wpdb->insert("{$wpdb->prefix}dinoco_claim_charges", [
+            'claim_id'     => $claim_id,
+            'amount'       => $amount,
+            'reason'       => $reason,
+            'status'       => 'pending_payment',
+            // BANK SNAPSHOT — these 7 fields are IMMUTABLE for the lifetime of this charge
+            'bank_name'    => $bank['bank_name'],
+            'bank_name_en' => $bank['bank_name_en'],
+            'bank_account' => $bank['bank_account'],
+            'bank_holder'  => $bank['bank_holder'],
+            'bank_code'    => $bank['bank_code'],         // critical for B-5 slip verify
+            'bank_branch'  => $bank['bank_branch'] ?? '',
+            'bank_context' => $use_walkin ? 'claim_walkin' : 'claim',
+            'created_at'   => current_time('mysql'),
+            'expires_at'   => date('Y-m-d H:i:s', current_time('U') + 86400),
+        ]);
+        $charge_id = $wpdb->insert_id;
+
+        $wpdb->query("COMMIT");
+        $wpdb->query($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $claim_lock_key));
+
+        return rest_ensure_response(['charge_id' => $charge_id, 'bank_snapshot' => $bank]);
+    } catch (\Throwable $e) {
+        $wpdb->query("ROLLBACK");
+        $wpdb->query($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $claim_lock_key));
+        if (function_exists('dinoco_obs_capture')) {
+            dinoco_obs_capture('error', 'claim_charge_create_throw', [
+                'claim_id' => $claim_id, 'msg' => $e->getMessage()
+            ]);
+        }
+        throw $e;
+    }
+}
+```
+
+**Race test contract** (PHPUnit `ClaimBankImmutabilityRaceTest` — Phase 2.8):
+
+```text
+Test scenario:
+  T+0ms     — Admin opens [dinoco_claim_bank_settings], starts editing
+  T+1000ms  — Customer triggers charge create (clicks "ออกบิล")
+  T+1500ms  — Admin clicks Save (commits new bank to wp_options)
+
+Expected: charge at T+1000ms holds OLD bank in 7 snapshot columns.
+          New charge created at T+2000ms holds NEW bank.
+          Slip2Go verification against T+1000ms charge MUST match OLD bank_code,
+          NOT NEW bank_code (otherwise legitimate slip → false-reject).
+
+Assertion (after T+2000ms):
+  $charge_old = $wpdb->get_row("SELECT bank_account FROM dinoco_claim_charges WHERE id = $old_charge_id");
+  $charge_new = $wpdb->get_row("SELECT bank_account FROM dinoco_claim_charges WHERE id = $new_charge_id");
+  $current_setting = get_option('dinoco_claim_bank_account');
+  $this->assertNotEquals($charge_old->bank_account, $charge_new->bank_account);  // immutability holds
+  $this->assertEquals($current_setting, $charge_new->bank_account);              // newer reflects new
+  $this->assertNotEquals($current_setting, $charge_old->bank_account);           // older preserved
+
+Mechanism: GET_LOCK on charge create — admin save and charge create are serialized
+           via wp_options autoload caching (admin save commits BEFORE charge create
+           reads fresh values via dinoco_claim_bank_resolve()). Force atomicity by
+           wrapping admin save in same wp_options group.
+```
+
+**Why this closes B-4**: V.2.1 spec said "snapshot at create" but didn't show WHERE the snapshot lived (column? trigger? hook?) or WHEN (transaction boundary? eventual consistency?). V.2.2 makes both explicit: snapshot lives in 7 columns of `wp_dinoco_claim_charges`, written inside same INSERT as charge metadata, wrapped in GET_LOCK + START TRANSACTION. Race test verifies the 1500ms-after-charge admin save does NOT leak into snapshot.
 
 #### Permission
 
@@ -577,6 +692,174 @@ On first activation, if any `DINOCO_CLAIM_BANK_*` constant is defined AND corres
 
 → Add to Phase 1 effort: **52h → 64h** (Phase 1 MVP now 3 weeks instead of 2 due to bank settings requirement)
 
+### 6.4.1 NEW (V.2.2 B-5 FIX) — `dinoco_verify_slip_for_claim()` Strict Bank-Code Contract
+
+**Threat model** (closes BLOCKER B-5 from tech-lead 14-specialist review 2026-05-13):
+
+> Customer transfers to attacker's bank account that coincidentally has the same trailing digits (or worse, attacker socially engineers customer to a fake claim page with attacker's account). Slip2Go verifies amount + transaction reference + slip authenticity → slip is GENUINE → without bank_code mismatch enforcement, fraud succeeds.
+
+V.2.1 §B1 wrapper signature listed `$expected_bank_code` as a parameter but did NOT specify HOW the helper validates Slip2Go's response. V.2.2 makes the contract explicit and adds the dedicated error path.
+
+#### Wrapper signature (V.2.2)
+
+```php
+/**
+ * @param string $image_base64        Customer-uploaded slip image (PNG/JPG, ≤5MB)
+ * @param float  $expected_amount_thb Charge amount from wp_dinoco_claim_charges row
+ * @param string $expected_bank_code  Slip2Go bank code SNAPSHOTTED at charge create
+ *                                    (from charge.bank_code, NOT from current admin settings)
+ * @param string $expected_account_no Bank account number SNAPSHOTTED at charge create
+ * @param int    $charge_id           For audit + idempotency hash + slip_ref_hash namespace
+ *
+ * @return array {
+ *   'status'        : 'verified' | 'pending_review' | 'failed',
+ *   'error_code'    : null | 'slip_bank_mismatch' | 'slip_amount_mismatch' | 'slip_replay'
+ *                          | 'slip_2go_unreachable' | 'slip_invalid' | 'slip_unknown_bank',
+ *   's2g_response'  : raw Slip2Go response array (for audit/replay),
+ *   'slip_ref_hash' : sha256 collision-resistant fingerprint with namespace `claim::{$bank_context}::`,
+ *   'matched_fields': ['amount', 'bank_code', 'account_no', 'trans_ref'],  // each verified field
+ * }
+ */
+function dinoco_verify_slip_for_claim($image_base64, $expected_amount_thb, $expected_bank_code,
+                                       $expected_account_no, $charge_id) {
+    // 1. Call Slip2Go API (mirror b2f_verify_slip_image payload shape — direct call, no shared helper)
+    $s2g = b2b_slip2go_verify_slip($image_base64);  // existing B2B helper, reuse
+    if (is_wp_error($s2g)) {
+        return ['status' => 'failed', 'error_code' => 'slip_2go_unreachable',
+                's2g_response' => null, 'slip_ref_hash' => null, 'matched_fields' => []];
+    }
+    if (empty($s2g['ok']) || empty($s2g['receiver'])) {
+        return ['status' => 'failed', 'error_code' => 'slip_invalid',
+                's2g_response' => $s2g, 'slip_ref_hash' => null, 'matched_fields' => []];
+    }
+
+    $matched = [];
+
+    // 2. STRICT bank_code mismatch — closes B-5
+    //    Receiver bank_code MUST exactly match expected (snapshot from charge row).
+    //    NO substring match, NO Levenshtein, NO "starts with" — strict ===
+    $s2g_bank_code = isset($s2g['receiver']['bank_code']) ? (string) $s2g['receiver']['bank_code'] : '';
+    if ($s2g_bank_code === '') {
+        // Slip2Go could not extract bank — unknown vs mismatch distinction
+        return ['status' => 'pending_review', 'error_code' => 'slip_unknown_bank',
+                's2g_response' => $s2g, 'slip_ref_hash' => null, 'matched_fields' => $matched];
+    }
+    if ($s2g_bank_code !== $expected_bank_code) {
+        // Hard reject — DO NOT fall through to amount/ref checks (fail-fast for security audit clarity)
+        if (function_exists('dinoco_obs_capture')) {
+            dinoco_obs_capture('warning', 'claim_slip_bank_mismatch', [
+                'charge_id'    => $charge_id,
+                'expected'     => $expected_bank_code,
+                'received'     => $s2g_bank_code,
+                'amount'       => $expected_amount_thb,
+            ]);
+        }
+        // Telegram alert to admin — high-signal anti-fraud event
+        if (function_exists('b2b_tg_send_dedup')) {
+            b2b_tg_send_dedup(
+                'claim_slip_bank_mismatch',
+                "🚨 Slip bank mismatch on claim charge #{$charge_id} — expected `{$expected_bank_code}`, got `{$s2g_bank_code}`",
+                3600  // 1hr dedup
+            );
+        }
+        return ['status' => 'failed', 'error_code' => 'slip_bank_mismatch',
+                's2g_response' => $s2g, 'slip_ref_hash' => null, 'matched_fields' => $matched];
+    }
+    $matched[] = 'bank_code';
+
+    // 3. STRICT receiver account number match (last 4-digit normalization OK for masking,
+    //    but full account compared — Slip2Go returns masked, so compare last 4 of expected)
+    $s2g_acct_last4 = substr(preg_replace('/[^0-9]/', '', $s2g['receiver']['account_no'] ?? ''), -4);
+    $exp_acct_last4 = substr(preg_replace('/[^0-9]/', '', $expected_account_no), -4);
+    if ($s2g_acct_last4 !== $exp_acct_last4) {
+        // Bank correct but account different — likely admin reconfig race OR attacker same-bank
+        return ['status' => 'failed', 'error_code' => 'slip_bank_mismatch',  // same code, bank-and-account treated atomically
+                's2g_response' => $s2g, 'slip_ref_hash' => null, 'matched_fields' => $matched];
+    }
+    $matched[] = 'account_no';
+
+    // 4. Amount tolerance ±2% (per §A.2 C3)
+    $s2g_amount = (float) ($s2g['amount'] ?? 0);
+    $tolerance  = max(1.0, $expected_amount_thb * 0.02);
+    if (abs($s2g_amount - $expected_amount_thb) > $tolerance) {
+        return ['status' => 'failed', 'error_code' => 'slip_amount_mismatch',
+                's2g_response' => $s2g, 'slip_ref_hash' => null, 'matched_fields' => $matched];
+    }
+    $matched[] = 'amount';
+
+    // 5. slip_ref_hash with bank_context discriminator (H-6 fix)
+    //    Bank context separates online claim vs walk-in claim namespaces — slip cannot be replayed across.
+    $bank_context = $expected_bank_code === get_option('dinoco_claim_walkin_bank_code', '')
+                  ? 'claim_walkin' : 'claim';
+    $ref_input = sprintf('%s::%s::%s::%.2f::%s',
+        $bank_context,
+        $s2g['trans_ref'] ?? '',
+        $s2g['datetime'] ?? '',
+        $s2g_amount,
+        substr($s2g_bank_code, 0, 4)
+    );
+    $slip_ref_hash = hash('sha256', $ref_input);
+    $matched[] = 'trans_ref';
+
+    // 6. Replay defense — UNIQUE constraint on charges.slip_ref_hash (H-6: discriminator included above)
+    $existing = $wpdb->get_var($wpdb->prepare(
+        "SELECT id FROM {$wpdb->prefix}dinoco_claim_charges WHERE slip_ref_hash = %s AND id != %d",
+        $slip_ref_hash, $charge_id
+    ));
+    if ($existing) {
+        return ['status' => 'failed', 'error_code' => 'slip_replay',
+                's2g_response' => $s2g, 'slip_ref_hash' => $slip_ref_hash, 'matched_fields' => $matched];
+    }
+
+    // 7. All checks passed
+    return ['status' => 'verified', 'error_code' => null,
+            's2g_response' => $s2g, 'slip_ref_hash' => $slip_ref_hash, 'matched_fields' => $matched];
+}
+```
+
+#### Error catalog additions (V.2.2 — extends Section I)
+
+| Code | HTTP | Thai message (customer) | Telegram alert? |
+|---|---|---|---|
+| `slip_bank_mismatch` | 422 | "บัญชีปลายทางในสลิปไม่ตรงกับบัญชี DINOCO — กรุณาตรวจสอบเลขบัญชี + ธนาคารแล้วโอนใหม่ หรือติดต่อแอดมิน" | ✅ HIGH (deduped 1hr) |
+| `slip_unknown_bank` | 200 (pending review) | "ระบบไม่สามารถระบุธนาคารปลายทางในสลิป — แอดมินจะตรวจสอบให้ภายใน 2 ชั่วโมง" | ✅ MED (deduped 6hr) |
+| `slip_amount_mismatch` | 422 | "ยอดในสลิปไม่ตรงกับยอดที่ต้องชำระ (±2% tolerance)" | — |
+| `slip_replay` | 409 | "สลิปนี้ถูกใช้ไปแล้ว กรุณาใช้สลิปจริงสำหรับการโอนครั้งนี้" | ✅ HIGH (deduped 1hr) |
+| `slip_2go_unreachable` | 503 | "ระบบตรวจสลิปขัดข้องชั่วคราว — แอดมินจะตรวจให้ภายใน 2 ชั่วโมง" | ✅ LOW (deduped 24hr) |
+| `slip_invalid` | 422 | "ภาพสลิปไม่สามารถอ่านได้ — กรุณาถ่ายใหม่ให้ชัดเจน" | — |
+
+#### Test contract (PHPUnit `SlipBankCodeMismatchTest` — added to Phase 2.8)
+
+```text
+Test 1: Genuine slip to wrong bank → returns slip_bank_mismatch
+  - Mock Slip2Go: receiver.bank_code = "014" (SCB)
+  - charge.bank_code = "004" (KBANK)
+  - Expect: status='failed', error_code='slip_bank_mismatch'
+  - Telegram alert fired? Verify dedup queue contains key
+
+Test 2: Genuine slip to correct bank but wrong account last4
+  - Mock Slip2Go: receiver.bank_code = "004", account = "...9876"
+  - charge.bank_code = "004", account = "...1234"
+  - Expect: status='failed', error_code='slip_bank_mismatch' (atomic decision)
+
+Test 3: Bank code missing in Slip2Go response
+  - Mock Slip2Go: receiver.bank_code = ""
+  - Expect: status='pending_review', error_code='slip_unknown_bank'
+  - Charge moves to admin manual review queue
+
+Test 4: All fields match (positive case)
+  - Mock Slip2Go: complete response with correct bank+account+amount
+  - Expect: status='verified', matched_fields = ['bank_code', 'account_no', 'amount', 'trans_ref']
+
+Test 5: Replay across walk-in vs online claim (H-6 + B-5 interaction)
+  - charge_A bank_context='claim' (online)
+  - charge_B bank_context='claim_walkin'
+  - Same Slip2Go trans_ref reused
+  - Expect: B verifies independently because slip_ref_hash includes bank_context discriminator
+```
+
+**Why this closes B-5**: V.2.1 spec mentioned `$expected_bank_code` parameter but treatment was an assertion (admin trust). V.2.2 (a) makes the comparison code explicit, (b) defines fail-fast behavior (no fall-through to amount check on bank mismatch), (c) adds dedicated error code + Thai customer message + Telegram alert, (d) adds PHPUnit test contract with 5 named scenarios, (e) integrates with `bank_context` discriminator from §3.1 + H-6 fix.
+
 ### 6.5 Files to Modify
 
 | File | Snippet | Change | Estimated Lines |
@@ -586,6 +869,58 @@ On first activation, if any `DINOCO_CLAIM_BANK_*` constant is defined AND corres
 | `[B2B] Snippet 1: Core Utilities & LINE Flex Builders` | DB_ID 72 | NEW Flex builders (10 status + 6 special = 16 total — including Charge Request with bank account display, NO QR) + extend `b2b_get_bank_info($order_or_claim_id, $context)` (B2 with `'claim'` branch) | +650 LOC (V.2.1 reduced — no QR helper) |
 | `[Admin System] DINOCO LINE Push Governance` | DB_ID 1203 | Register category `claim_status` as `transactional` (always-on) | +5 LOC |
 
+#### V.2.2 B-3 — `b2b_get_bank_info()` Existing Callsite Reference (verified 2026-05-13)
+
+**16 callsites across 7 source files** — `BankInfoSignaturePinTest` MUST cover every line below. Each callsite passes `context='order'` (default arg path) → after V.2.2 extension, ALL must continue returning B2B bank (NOT claim bank) even when `dinoco_claim_bank_*` wp_options are populated.
+
+| # | File | Line | Args passed | Expected post-V.2.2 |
+|---|---|---|---|---|
+| 1 | `[Admin System] DINOCO Manual Invoice System` | 363 | `()` (function_exists guard) | B2B bank (context='order' default) |
+| 2 | `[Admin System] DINOCO Manual Invoice System` | 2791 | `()` (function_exists guard) | B2B bank |
+| 3 | `[B2B] Snippet 1: Core Utilities & LINE Flex Builders` | 2874 | `($order_id)` | B2B bank, walk-in check via `_b2b_is_walkin` meta |
+| 4 | `[B2B] Snippet 1` | 4554 | `($ticket_id)` Flex confirm-bill | B2B bank |
+| 5 | `[B2B] Snippet 1` | 4576 | `($ticket_id)` Flex remind-bill | B2B bank |
+| 6 | `[B2B] Snippet 1` | 4787 | `()` Flex generic | B2B bank |
+| 7 | `[B2B] Snippet 1` | 4808 | `()` Flex generic | B2B bank |
+| 8 | `[B2B] Snippet 1` | 4830 | `()` Flex generic | B2B bank |
+| 9 | `[B2B] Snippet 1` | 4987 | `()` Flex generic | B2B bank |
+| 10 | `[B2B] Snippet 2: LINE Webhook Gateway & Order Creator` | 3076 | `()` (function_exists guard) | B2B bank |
+| 11 | `[B2B] Snippet 3: LIFF E-Catalog REST API` | 4075 | `()` (function_exists guard) | B2B bank |
+| 12 | `[B2B] Snippet 3` | 5536 | `()` (function_exists guard) | B2B bank |
+| 13 | `[B2B] Snippet 8: Distributor Ticket View` | 95 | `($ticket_id)` (function_exists guard) | B2B bank |
+| 14 | `[B2B] Snippet 10: Invoice Image Generator` | 742 | `($ticket_id)` (function_exists guard) | B2B bank |
+| 15 | `[B2B] Snippet 10` | 1403 | `(0)` explicit "no ticket → default" | B2B bank |
+| 16 | `[B2B] Snippet 11: Customer LIFF Pages` | 704 | `()` (function_exists guard) | B2B bank |
+
+Function definition: `[B2B] Snippet 1` line 2837 (NOT counted — this is the SUT).
+
+**Verification grep** (re-run before Phase 2 starts to detect drift):
+
+```bash
+grep -rn "b2b_get_bank_info\s*(" --include="*" 2>/dev/null \
+  | grep -v ".second-brain" | grep -v "node_modules" | grep -v "docs/" | grep -v "tests/" \
+  | grep -v "function b2b_get_bank_info"  # exclude definition
+# Expected: exactly 16 lines
+```
+
+**Jest drift detector contract** (`tests/jest/b2b-get-bank-info-callsites.test.js`):
+
+```javascript
+test('b2b_get_bank_info() callsite count pinned to 16 (V.2.2 B-3)', () => {
+    const sites = grepCallsites('b2b_get_bank_info\\(', /* exclude definition + docs + tests */);
+    expect(sites.length).toBe(16);
+});
+
+test('no callsite passes claim context without coordinating PHPUnit update', () => {
+    const claimCallers = sites.filter(line => /context\s*=>\s*['"]claim/.test(line));
+    // If any new callsite passes claim context, Phase 2 work must update PHPUnit
+    if (claimCallers.length > 0) {
+        const acknowledged = readFile('tests/helpers/BankInfoSignaturePinTest.php');
+        expect(acknowledged).toMatch(/claim_context_callers\s*=\s*\d+/);  // explicit ack
+    }
+});
+```
+
 ### 6.6 Files to Create (NEW snippets)
 
 | File | DB_ID | Purpose | Estimated LOC |
@@ -594,19 +929,48 @@ On first activation, if any `DINOCO_CLAIM_BANK_*` constant is defined AND corres
 | `[System] DINOCO Claim Payment LIFF` | **PENDING** | Customer-facing shortcode `[dinoco_claim_pay]` + REST `/charge/*` + bank transfer instructions display + `dinoco_verify_slip_for_claim` (Slip2Go) | ~950 LOC (V.2.1 reduced — no QR generator) |
 | `[Admin System] DINOCO Claim Flash Dispatcher` | **PENDING** | REST `/flash-create` + `/flash-cancel` + RPi enqueue + `dinoco_claim_create_flash_shipment` internal helper | ~800 LOC |
 
-### 6.7 Prerequisites
+### 6.7 Prerequisites (V.2.2 B-2 FIX — verified ground truth, not assumed status)
 
-- Idempotency Helper V.1.4 ✓
-- Modal Helpers V.1.1 ✓
-- Flag Audit Log V.1.0 ✓
-- LINE Push Governance V.1.6 ✓ — claim_status category MUST be registered before flag flip
-- Observability V.1.0 ✓ — for `dinoco_obs_capture('error', 'claim_notif_fail', $ctx)`
-- Module Registry — register 3 new snippets under section=claims, order=10/20/30
-- `dinoco_line_uid` user meta populated (Phase 1 LIFF AI strict mode already enforces)
-- B2B_SLIP2GO_SECRET_KEY defined (in use today)
-- B2B_FLASH_MCH_ID, B2B_FLASH_SECRET_KEY, B2B_FLASH_API_URL defined (in use today)
-- **Boss provisions 3 DB_IDs in WP** — creates 3 stub snippets, pushes IDs into headers (BLOCKER for Phase 1.2)
+**Code-level prerequisites (snippet files exist in repo)** — but provisioning status varies:
+
+| Snippet | File version | DB_ID status (verified 2026-05-13) | Action needed |
+|---|---|---|---|
+| Idempotency Helper | V.1.4 | 🔴 **(pending)** — header line 4 | Boss provisions in Phase 0 |
+| Modal Helpers | V.1.1 | 🔴 **(pending)** — header line 4 | Boss provisions in Phase 0 |
+| Flag Audit Log | V.1.0 | 🔴 **(pending)** — header line 4 | Boss provisions in Phase 0 |
+| Observability | V.1.1 | 🔴 **(pending)** — header line 4 | Boss provisions in Phase 0 |
+| LINE Push Governance | V.1.6 | 🟢 **1203 ✓ provisioned** (2026-05-09) | Already done |
+
+**Why this matters**: Spec V.2.1 listed all 5 as "✓" but tech-lead 14-specialist review verified that 4 of 5 still read `DB_ID: (pending — populate after first WP Code Snippets sync)`. The GitHub Webhook Sync Engine (`dinoco_extract_db_id()`) uses DB_ID as PRIMARY matching key — without it, sync falls back to fragile filename matching. **Any deploy attempt today would fail or silently drift.**
+
+**Phase 0 = MANDATORY DB_ID provisioning (15 min boss work in WP admin)**:
+
+| # | Task | Owner | Effort | Blocks |
+|---|---|---|---|---|
+| 0.1 | Boss opens WP admin → Code Snippets → creates 4 stub snippets (empty title + bracket-prefixed name matching the repo files exactly) | Boss | 8 min | Phase 1 entirely |
+| 0.2 | Boss copies new DB_IDs (4 integers) into corresponding `DB_ID: (pending...)` header lines, replacing the placeholder | Boss | 4 min | 1.2-1.9 |
+| 0.3 | Boss provisions 3 ADDITIONAL stubs for the NEW claim snippets (Lifecycle Notifier / Payment LIFF / Flash Dispatcher) — placeholder content OK; just needs the DB_ID | Boss | 3 min | 1.2 |
+| 0.4 | Git pull → verify all 7 DB_IDs synced into headers → spec §6.7 table re-runs verification grep | fullstack-developer | 5 min | 1.2 |
+
+**Other prerequisites (no provisioning needed)**:
+
+- Module Registry — register 3 new snippets under section=claims, order=10/20/30 (during Phase 1.2)
+- `dinoco_line_uid` user meta populated (Phase 1 LIFF AI strict mode already enforces — ✓)
+- `B2B_SLIP2GO_SECRET_KEY` defined (in use today — ✓)
+- `B2B_FLASH_MCH_ID`, `B2B_FLASH_SECRET_KEY`, `B2B_FLASH_API_URL` defined (in use today — ✓)
 - **DINOCO_CLAIM_BANK_* constants OR wp_options seeded** — boss configures claim bank via admin UI `[dinoco_claim_bank_settings]` (V.2.1 NEW — see §6.4). MUST be different account from `B2B_BANK_*` (boss directive 2026-05-13). Graceful fallback to placeholder text if absent — see §6.4 Tier 3.
+
+**Verification command** (re-run before Phase 1 kick-off):
+
+```bash
+for f in "[Admin System] DINOCO Idempotency Helper" "[Admin System] DINOCO Modal Helpers" \
+         "[Admin System] DINOCO Flag Audit Log" "[Admin System] DINOCO Observability" \
+         "[Admin System] DINOCO LINE Push Governance"; do
+  printf "%-50s " "$f"
+  grep -m 1 "DB_ID" "$f" | tr -d '\n'; echo
+done
+# Expected: all 5 lines end with concrete integer DB_ID, zero "(pending)" strings remaining
+```
 
 ### 6.8 Side Effects
 
@@ -659,14 +1023,14 @@ dinoco/claim/shipment_delivered (NEW)
 |---|---|---|---|---|
 | 2.1 | Schema `wp_dinoco_claim_charges` (database-expert review) + dbDelta lazy install + `bank_context` column (B2) | New snippet | 7h | database-expert |
 | 2.2 | NEW snippet "Claim Payment LIFF" — REST endpoints (8) + LIFF shortcode + bank instructions display (NO QR) + `dinoco_verify_slip_for_claim` (B1) | New snippet | 22h | fullstack-developer |
-| 2.3 | EXTEND `b2b_get_bank_info($order_id, $context='order')` (B2) + bump [B2B] Snippet 1 V.34.26 + PHPUnit signature pin | Snippet 1 | 4h | fullstack-developer |
+| 2.3 V.2.2 B-3 | EXTEND `b2b_get_bank_info($order_or_claim_id, $context='order')` (B2) + bump [B2B] Snippet 1 V.34.26 + **NEW `BankInfoSignaturePinTest` PHPUnit (16 named assertions — 1 per existing call site verified by grep 2026-05-13 — see callsite reference table in §6.5)** verifying `context='order'` default returns B2B bank NOT claim bank, even when `dinoco_claim_bank_*` wp_options populated + **NEW Jest drift counter `b2b-get-bank-info-callsites.test.js` (greps all `b2b_get_bank_info(` invocations across 7 source files, fails if count drifts from 16 without updating PHPUnit fixtures + asserts no new caller passes new claim-context value)** | Snippet 1 + tests | 8h (was 4h) | fullstack-developer |
 | 2.4 | Service Center "Charges" section + create modal (`window.dinocoModal.prompt({message: ...})`) + approve/reject/refund + 4-eyes UI | DB_ID 27 | 14h | frontend-design + fullstack-developer |
 | 2.5 | LIFF page UI + countdown + upload + state transitions (idle/uploading/verifying/success/failed) + offline detection | New snippet | 12h | frontend-design |
 | 2.6 | Cron `dinoco_claim_charge_expire_cron` daily 02:25 ICT + heartbeat | New snippet | 4h | fullstack-developer |
 | 2.7 | Security review: 4-eyes refund + slip_replay + amount bounds + LIFF JWT replay | — | 5h | security-pentester |
-| 2.8 | PHPUnit: charge state machine + idempotency + slip_ref_hash collision + concurrency (FOR UPDATE) | tests/helpers | 6h | fullstack-developer |
+| 2.8 V.2.2 B-4 | PHPUnit: charge state machine + idempotency + slip_ref_hash collision + concurrency (FOR UPDATE) + **NEW `ClaimBankImmutabilityRaceTest` (verifies bank snapshot preserved across mid-flow admin save — see §6.4 race test contract)** | tests/helpers | 8h (was 6h) | fullstack-developer |
 | 2.9 | Flag flip + 7-day canary on 1 distributor → prod | — | 4h | Ops |
-| **Phase 2 deploy & QA** | | | **~78h** | |
+| **Phase 2 deploy & QA** | | | **~83h** (V.2.2: +5h for B-3 + B-4 tests) | |
 
 ### Phase 3: Flash Shipping (Week 6-8, ~64h ← was 60h)
 
@@ -686,7 +1050,7 @@ dinoco/claim/shipment_delivered (NEW)
 ### Phase 4: Polish (Week 9, ~22h)
 - Charge admin export CSV · Refund audit dashboard · Multi-shipment grouping · Notif log filter/search · Customer LIFF "ประวัติเคลม" inline charges + Flash · Health Monitor cards for 3 new crons · pickup-at-warehouse opt-in UX
 
-**Total estimated effort V.2.1: ~228h (~5.7 weeks for 1 fullstack-developer + parallel agents)** — Phase 1 64h + Phase 2 78h + Phase 3 64h + Phase 4 22h. Net delta vs V.2.0: +8h (added 12h bank settings, removed 4h PromptPay QR helper).
+**Total estimated effort V.2.2: ~233h (~5.8 weeks for 1 fullstack-developer + parallel agents)** — Phase 0 ~0.5h boss + 0.5h dev + Phase 1 64h + Phase 2 83h + Phase 3 64h + Phase 4 22h. Net delta vs V.2.1: +5h (B-3 PHPUnit `BankInfoSignaturePinTest` + Jest drift +3h; B-4 race test +2h). Net delta vs V.2.0: +13h.
 
 ---
 
@@ -1197,14 +1561,19 @@ Target: ~30 codes — currently 29. Add new codes here as discovered.
 
 ---
 
-## Spec Readiness Assessment (V.2.1)
+## Spec Readiness Assessment (V.2.2)
 
 | Criterion | Status |
 |---|---|
-| 3 BLOCKERs (helper drift / walk-in bank / dep lock) | ✅ Resolved with concrete migration plans |
-| 4 HIDDEN RISKS (hook chain / idempotency-resend / walk-in claim / webhook-close race) | ✅ Resolved with defenses + tests |
-| 4 SHOULD-FIX (slip_ref_hash scope / Phase 1.3 effort / Modal drift / endpoint split) | ✅ Resolved |
-| **V.2.1 payment-rail revision** (NO PromptPay QR + separate claim bank + admin-editable) | ✅ §6.4 NEW — 3-tier resolver + admin UI shortcode + audit trail + immutability gate + REST endpoints + migration plan |
+| **V.1.0** 3 BLOCKERs (helper drift / walk-in bank / dep lock) | ✅ Resolved V.2.0 |
+| **V.1.0** 4 HIDDEN RISKS (hook chain / idempotency-resend / walk-in claim / webhook-close race) | ✅ Resolved V.2.0 |
+| **V.1.0** 4 SHOULD-FIX (slip_ref_hash scope / Phase 1.3 effort / Modal drift / endpoint split) | ✅ Resolved V.2.0 |
+| **V.2.1 payment-rail revision** (NO PromptPay QR + separate claim bank + admin-editable) | ✅ Resolved V.2.1 — §6.4 NEW 3-tier resolver + admin UI shortcode + audit trail + immutability gate + REST endpoints + migration plan |
+| **V.2.2 BLOCKER B-1** Audit Log DB_ID drift (fictitious DB_ID 1187) | ✅ Resolved V.2.2 — uses Flag Audit Log (verified DB_ID 1203) instead; no new table needed |
+| **V.2.2 BLOCKER B-2** 4 of 5 prerequisite snippets have `DB_ID: (pending)` | ✅ Resolved V.2.2 — §6.7 verified table + NEW Phase 0 mandatory 15-min boss provisioning task |
+| **V.2.2 BLOCKER B-3** `b2b_get_bank_info()` 16 callsites unverified backward-compat | ✅ Resolved V.2.2 — §6.5 callsite reference table + `BankInfoSignaturePinTest` PHPUnit (16 assertions) + Jest `b2b-get-bank-info-callsites.test.js` drift detector |
+| **V.2.2 BLOCKER B-4** Bank settings immutability mechanism unspecified | ✅ Resolved V.2.2 — §6.4 explicit handler pseudocode (GET_LOCK + START TRANSACTION + snapshot writes 7 bank columns at INSERT) + `ClaimBankImmutabilityRaceTest` PHPUnit |
+| **V.2.2 BLOCKER B-5** `dinoco_verify_slip_for_claim()` no bank_code mismatch contract | ✅ Resolved V.2.2 — NEW §6.4.1 full PHP pseudocode + fail-fast contract + dedicated `slip_bank_mismatch` error code + Thai customer message + Telegram alert + dedup + H-6 bank_context discriminator integration + 5-scenario PHPUnit test |
 | User journey "no dead ends" | ✅ Section A covers 11 steps + 8 charge sub-steps + recovery matrix |
 | "No dead buttons" | ✅ Section B button matrix covers all 16 buttons |
 | "No dead pages" | ✅ Section C page state matrix covers 5 surfaces |
@@ -1213,16 +1582,22 @@ Target: ~30 codes — currently 29. Add new codes here as discovered.
 | FSM clarity | ✅ Section F — 2 Mermaid diagrams |
 | Cron observability | ✅ Section G — 4 crons + heartbeats + flag gates |
 | REST pipeline pattern | ✅ Section H — uniform skeleton |
-| Error catalog | ✅ Section I — 29 codes Thai messages |
+| Error catalog | ✅ Section I — 29 codes Thai messages (V.2.2 adds 6 new slip-error codes via §6.4.1) |
 
-**Phase 1 effort revised V.2.0 → V.2.1:** 52h → **64h** (+12h from §6.4 Claim Bank Configuration: NEW admin shortcode + 3-tier resolver helper + 3 REST endpoints + validation + audit trail + PHPUnit/Jest drift tests).
+**Phase 1 effort revised V.2.1 → V.2.2:** 64h unchanged (B-1/B-2 require boss work + spec patches, no Phase 1 dev increment). **Phase 2 effort revised:** 78h → 83h (+5h: B-3 PHPUnit/Jest +4h, B-4 race test +2h, minor offsets).
 
-**Net effort vs V.1.0:** 40h → 64h Phase 1. Phase 2 (Payment) reduced 26h → 22h (no PromptPay QR helper). Phase 3 (Flash) unchanged.
+**Total effort vs V.1.0:** 40h → 233h (V.2.0 175h → V.2.1 228h → V.2.2 233h). Sprawl driven by zero-dead-end mandate (V.2.0 +35h) and payment-rail revision (V.2.1 +8h) and BLOCKER closures (V.2.2 +5h).
 
-**Overall verdict:** Spec is **READY for Phase 1 implementation** PENDING:
+**Overall verdict:** Spec is **READY for Phase 0 (DB_ID provisioning) immediately**. Phase 1 implementation unblocked after Phase 0 completes.
 
-1. Boss answers 9 Open Questions (especially Q4 DB_ID provisioning + Q-NEW-5 walk-in bank decision)
-2. database-expert review of schema (Phase 2 prereq) + verify `bank_branch` column + dropped `qr_*` columns
-3. Boss provisions 3 DB_IDs in WP
+**11 remaining HIGH findings from tech-lead review** (H-1..H-11) — closeable during Phase 1 internal work (mostly Phase 1.3 Flex builder hardening + Phase 1.9 admin UI security). Tracked but not blockers.
 
-No outstanding architectural risks. All cross-agent handoffs identified.
+**18 MEDIUM + 13 LOW findings** — distributed across Phase 2-4 + polish backlog.
+
+**Action sequence for boss (post V.2.2 commit)**:
+
+1. **(15 min)** Open WP admin → Code Snippets → create 7 stub snippets total (4 prerequisites + 3 NEW claim) → push DB_IDs back into headers → git pull → unblocks Phase 1 entirely
+2. **(5 min)** Answer Q-NEW-5 (walk-in bank — Option A single bank + optional checkbox recommended)
+3. **(decision)** Schedule Phase 1 W1 — fullstack-developer Lifecycle Notifier + Flex builders (parallel work feasible)
+
+No outstanding architectural risks. All cross-agent handoffs identified. V.2.2 is the **first version where Phase 0 can start without dependency drift**.
