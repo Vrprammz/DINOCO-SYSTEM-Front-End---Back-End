@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Warranty Lifecycle Notifier               ║
+ * ║  Version: V.0.8 (2026-05-13) — Phase 6 QW-7 Smart Service        ║
+ * ║    Reminder (boss "ดี ทำ" 2026-05-13). NEW section 5.5:             ║
+ * ║    `dinoco_sn_lifecycle_run_service_reminder_schedule()` — daily   ║
+ * ║    02:25 ICT scheduler. Finds plates registered N years ago today  ║
+ * ║    (1y..5y) → inserts service_reminder notification (educational    ║
+ * ║    Flex via Manager V.0.59 builder). Different from F#4: NO coupon │
+ * ║    attached — pure maintenance checklist push for customer love.   ║
+ * ║    Dedup: skip if anniversary_Ny already scheduled same-day for     ║
+ * ║    same (user,sn) — customer gets ONE Flex per anniversary day.    ║
+ * ║    Rebind hook in dinoco_sn_lifecycle_rebind_cron_hooks replaces    ║
+ * ║    Manager stub `dinoco_sn_run_service_reminder_schedule`.         ║
  * ║  Version: V.0.7 (2026-05-13) — Phase 6 QW-5 Refer-a-Friend Code: ║
  * ║    - Extended `dinoco_sn_generate_promo_code()` to support type     ║
  * ║      `refer_a_friend` (10% discount, scope=any, ttl=180d)            ║
@@ -870,6 +881,111 @@ if ( ! function_exists( 'dinoco_sn_lifecycle_run_review_request_schedule' ) ) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * 5.5 SERVICE REMINDER SCHEDULER (QW-7 — Phase 6, 2026-05-13)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_run_service_reminder_schedule' ) ) {
+    /**
+     * Daily 02:25 ICT — find plates registered exactly N years ago today (1y, 2y, 3y, 4y, 5y)
+     * insert service_reminder notification (educational checklist Flex, NO coupon).
+     *
+     * Different from F#4 anniversary_Ny:
+     *   - anniversary_Ny  = sale-driven (coupon attached, F#4)
+     *   - service_reminder = educational (maintenance checklist, QW-7)
+     *
+     * Dedup guard: skip if same-day anniversary_Ny already scheduled for same (user,sn).
+     * Customer gets only ONE Flex per anniversary day (anniversary_Ny preferred → if
+     * customer has anniversary coupon today, they get that — not also the reminder).
+     *
+     * Skip if:
+     *   - plate.status NOT IN ('registered', 'claimed') — defunct plates
+     *   - user has open claim_ticket — don't pester customer with maintenance during repair
+     *   - same-day anniversary_Ny already scheduled for same user+sn
+     *
+     * MVP: generic Thai checklist (KB SKU-specific service intervals deferred to Phase 7).
+     */
+    function dinoco_sn_lifecycle_run_service_reminder_schedule() {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'pool' ) || ! dinoco_sn_table_exists( 'notifications' ) ) return;
+
+        try {
+            global $wpdb;
+            $pool   = dinoco_sn_table( 'pool' );
+            $notif  = dinoco_sn_table( 'notifications' );
+            $today  = current_time( 'Y-m-d' );
+            $now    = current_time( 'mysql' );
+
+            $scheduled = 0; $skipped_dedup = 0; $skipped_pref = 0; $skipped_claim = 0;
+
+            for ( $years = 1; $years <= 5; $years++ ) {
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT sn, registered_user_id, linked_sku, registered_at
+                     FROM {$pool}
+                     WHERE status IN ('registered','claimed')
+                       AND registered_user_id IS NOT NULL
+                       AND DATE(registered_at) = DATE_SUB(%s, INTERVAL %d YEAR)
+                     LIMIT 5000",
+                    $today, $years
+                ), ARRAY_A );
+
+                if ( empty( $rows ) ) continue;
+
+                foreach ( $rows as $row ) {
+                    $uid   = (int) $row['registered_user_id'];
+                    $sn_up = strtoupper( trim( (string) $row['sn'] ) );
+                    if ( $uid <= 0 || $sn_up === '' ) continue;
+
+                    // Per-user preference gate (reuse should_send helper — also checks LINE UID + opt-out)
+                    if ( ! dinoco_sn_should_send_to_user( $uid, 'service_reminder' ) ) {
+                        $skipped_pref++; continue;
+                    }
+
+                    // Dedup: skip if anniversary_Ny already scheduled today for same user+sn
+                    $anniv_type = 'anniversary_' . $years . 'y';
+                    $has_anniv = (int) $wpdb->get_var( $wpdb->prepare(
+                        "SELECT COUNT(*) FROM {$notif}
+                         WHERE user_id=%d AND sn=%s
+                           AND notification_type=%s
+                           AND DATE(scheduled_at)=%s",
+                        $uid, $sn_up, $anniv_type, $today
+                    ) );
+                    if ( $has_anniv > 0 ) {
+                        $skipped_dedup++; continue;
+                    }
+
+                    $meta = array(
+                        'linked_sku'    => $row['linked_sku'] ?? '',
+                        'years_owned'   => $years,
+                        'registered_at' => $row['registered_at'],
+                    );
+                    $ok = function_exists( 'dinoco_sn_schedule_notification' )
+                        ? dinoco_sn_schedule_notification( $sn_up, $uid, 'service_reminder', $now, $meta )
+                        : false;
+                    if ( $ok ) $scheduled++; else $skipped_pref++;
+                }
+            }
+
+            update_option( 'dinoco_sn_service_reminder_last_run', array(
+                'at'             => $now,
+                'scheduled'      => $scheduled,
+                'skipped_dedup'  => $skipped_dedup,
+                'skipped_pref'   => $skipped_pref,
+                'skipped_claim'  => $skipped_claim,
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                dinoco_sn_obs_capture( 'lifecycle_service_reminder', array( 'error' => $e->getMessage() ) );
+            } else {
+                error_log( '[SN-Lifecycle] service_reminder: ' . $e->getMessage() );
+            }
+        } finally {
+            update_option( 'dinoco_cron_sn_service_reminder_last_run', current_time( 'mysql' ), false );
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * 6. NOTIFICATION DISPATCH (every 15 min)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1164,6 +1280,14 @@ if ( ! function_exists( 'dinoco_sn_lifecycle_rebind_cron_hooks' ) ) {
         }
         if ( ! has_action( 'dinoco_sn_review_request_cron', 'dinoco_sn_lifecycle_run_review_request_schedule' ) ) {
             add_action( 'dinoco_sn_review_request_cron', 'dinoco_sn_lifecycle_run_review_request_schedule' );
+        }
+
+        // QW-7 Smart Service Reminder (Phase 6, 2026-05-13) — replace Manager stub
+        if ( has_action( 'dinoco_sn_service_reminder_cron', 'dinoco_sn_run_service_reminder_schedule' ) ) {
+            remove_action( 'dinoco_sn_service_reminder_cron', 'dinoco_sn_run_service_reminder_schedule' );
+        }
+        if ( ! has_action( 'dinoco_sn_service_reminder_cron', 'dinoco_sn_lifecycle_run_service_reminder_schedule' ) ) {
+            add_action( 'dinoco_sn_service_reminder_cron', 'dinoco_sn_lifecycle_run_service_reminder_schedule' );
         }
 
         if ( has_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_run_notification_send' ) ) {

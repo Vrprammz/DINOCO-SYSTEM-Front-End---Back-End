@@ -1,0 +1,677 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2B] Snippet 17: Warranty Check LIFF                       ║
+ * ║  Version: V.0.1 (2026-05-13) — NEW — LT-1 REPLAN per boss decision 2026-05-13.       ║
+ * ║    Original LT-1 Public Dealer Portal API cut (ทุกร้านไม่มี POS). Replaced with this  ║
+ * ║    minimal LIFF page that lets dealers scan QR plate (or type S/N) in LINE chat group ║
+ * ║    and instantly see warranty status. Triggered from Flex menu @ บอท (Snippet 1       ║
+ * ║    V.34.32 added "🛡 ระบบประกัน → 🔍 เช็คประกัน" item).                              ║
+ * ║                                                                                       ║
+ * ║  Architecture:                                                                        ║
+ * ║    • Shortcode: [b2b_warranty_check]                                                  ║
+ * ║    • WP page slug: b2b-warranty-check (admin must create + assign shortcode)          ║
+ * ║    • LIFF route: liff.line.me/{B2B_LIFF_ID}/b2b-warranty-check/?gid=...               ║
+ * ║    • Uses html5-qrcode CDN (lazy-load on "Scan" button tap, not on page load)         ║
+ * ║    • Calls existing GET /dinoco-sn/v1/lookup/{sn} (60s cached, public)                ║
+ * ║    • Reuses LINE OAuth + WP session (D11 pattern — no new JWT)                        ║
+ * ║                                                                                       ║
+ * ║  Permission: Public lookup endpoint already 60s rate-limited (30/min/IP, R3 audit).   ║
+ * ║    Dealer identity comes from LIFF auth (LINE Login). No PII gate needed — owner_masked║
+ * ║    field already strips full name + phone server-side (R3 audit fix).                  ║
+ * ║                                                                                       ║
+ * ║  Dependencies:                                                                        ║
+ * ║    - B2B Snippet 1 V.34.32+ (Flex menu item points here)                             ║
+ * ║    - System SN REST API V.0.46+ (GET /dinoco-sn/v1/lookup/{sn})                      ║
+ * ║    - SN Management System v2.13+ (sn_pool data)                                       ║
+ * ║    - constant B2B_LIFF_ID                                                             ║
+ * ║                                                                                       ║
+ * ║  CSS prefix: .b2b-warr-* (scoped — no namespace bleed into other LIFF pages)         ║
+ * ║                                                                                       ║
+ * ║  Effort: ~6h (replaces original LT-1 40h estimate).                                   ║
+ * ║                                                                                       ║
+ * ║  DB_ID: TBD (set after first sync)                                                    ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 1: LIFF Router — handle liff.state redirect
+// ═══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_warr_liff_router' ) ) {
+    function b2b_warr_liff_router() {
+        if ( ! is_page( 'b2b-warranty-check' ) ) return;
+
+        // ── LIFF Router: same pattern as Snippet 4 — forward query params on liff.state redirect ──
+        $liff_state = isset( $_GET['liff.state'] ) ? $_GET['liff.state'] : '';
+        if ( $liff_state && strpos( $liff_state, '/b2b-warranty-check' ) === false ) {
+            $liff_path   = $liff_state;
+            $liff_params = array();
+            if ( strpos( $liff_state, '?' ) !== false ) {
+                list( $liff_path, $liff_qs ) = explode( '?', $liff_state, 2 );
+                parse_str( $liff_qs, $liff_params );
+            }
+            $forward_params = $_GET;
+            unset( $forward_params['liff.state'] );
+            $all_params = array_merge( $liff_params, $forward_params );
+            $redirect_url = home_url( $liff_path );
+            if ( ! empty( $all_params ) ) {
+                $redirect_url = add_query_arg( $all_params, $redirect_url );
+            }
+            wp_redirect( $redirect_url, 302 );
+            exit;
+        }
+    }
+    add_action( 'template_redirect', 'b2b_warr_liff_router', 5 );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 2: Shortcode [b2b_warranty_check]
+// ═══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_warr_render_page' ) ) {
+    function b2b_warr_render_page() {
+        $liff_id  = defined( 'B2B_LIFF_ID' ) ? B2B_LIFF_ID : '';
+        $rest_url = esc_url( rest_url( 'dinoco-sn/v1/' ) );
+        $gid      = isset( $_GET['gid'] ) ? sanitize_text_field( $_GET['gid'] ) : '';
+        $prefill_sn = isset( $_GET['sn'] ) ? strtoupper( sanitize_text_field( $_GET['sn'] ) ) : '';
+
+        $config = array(
+            'liff_id'    => $liff_id,
+            'rest_url'   => $rest_url,
+            'gid'        => $gid,
+            'prefill_sn' => $prefill_sn,
+        );
+
+        ob_start();
+        ?>
+<div class="b2b-warr-root" data-config="<?php echo esc_attr( wp_json_encode( $config ) ); ?>">
+    <header class="b2b-warr-header">
+        <button type="button" class="b2b-warr-back" data-action="back" aria-label="กลับ">←</button>
+        <h1 class="b2b-warr-title">🔍 เช็คประกัน</h1>
+    </header>
+
+    <main class="b2b-warr-main">
+        <!-- State A: Input -->
+        <section class="b2b-warr-input-card" data-state="input">
+            <p class="b2b-warr-hint">สแกน QR เพลทบนสินค้า หรือพิมพ์ S/N เพื่อเช็คประกัน</p>
+
+            <button type="button" class="b2b-warr-btn-scan" id="b2b-warr-btn-scan">
+                <span class="b2b-warr-btn-scan-icon">📷</span>
+                <span class="b2b-warr-btn-scan-label">เปิดกล้องสแกน QR</span>
+            </button>
+
+            <div class="b2b-warr-divider"><span>หรือ</span></div>
+
+            <label class="b2b-warr-label" for="b2b-warr-sn-input">พิมพ์ S/N เอง</label>
+            <div class="b2b-warr-input-row">
+                <input type="text" id="b2b-warr-sn-input" class="b2b-warr-input"
+                    placeholder="DNCSS0001234" autocomplete="off" inputmode="text"
+                    value="<?php echo esc_attr( $prefill_sn ); ?>" />
+                <button type="button" class="b2b-warr-btn-check" id="b2b-warr-btn-check">เช็ค</button>
+            </div>
+            <p class="b2b-warr-input-note">รูปแบบ: DNCSS + ตัวเลข/ตัวอักษร 7 ตัว (case-insensitive)</p>
+        </section>
+
+        <!-- State B: Scanning (camera viewport) -->
+        <section class="b2b-warr-scanner-card" data-state="scanning" hidden>
+            <div id="b2b-warr-scanner-region"></div>
+            <p class="b2b-warr-scanner-hint">วาง QR ในกรอบ — ระบบจะ scan อัตโนมัติ</p>
+            <button type="button" class="b2b-warr-btn-cancel" id="b2b-warr-btn-cancel-scan">ยกเลิก</button>
+        </section>
+
+        <!-- State C: Loading -->
+        <section class="b2b-warr-loading-card" data-state="loading" hidden>
+            <div class="b2b-warr-spinner" aria-hidden="true"></div>
+            <p class="b2b-warr-loading-text">กำลังตรวจสอบ...</p>
+        </section>
+
+        <!-- State D: Result -->
+        <section class="b2b-warr-result-card" data-state="result" hidden>
+            <div class="b2b-warr-result-badge" id="b2b-warr-result-badge">⏳</div>
+            <h2 class="b2b-warr-result-title" id="b2b-warr-result-title">กำลังตรวจสอบ</h2>
+            <p class="b2b-warr-result-sn" id="b2b-warr-result-sn"></p>
+
+            <div class="b2b-warr-result-body" id="b2b-warr-result-body">
+                <!-- Populated by JS -->
+            </div>
+
+            <button type="button" class="b2b-warr-btn-again" id="b2b-warr-btn-again">เช็คอีกครั้ง</button>
+        </section>
+    </main>
+</div>
+
+<style>
+/* ═══════════════════════════════════════════════════════════════
+   B2B Warranty Check LIFF — scoped .b2b-warr-* (no namespace bleed)
+   Mobile-first: targets LINE in-app browser (320-414px portrait)
+   ═══════════════════════════════════════════════════════════════ */
+.b2b-warr-root {
+    --warr-primary: #1e3a5f;
+    --warr-accent: #10b981;
+    --warr-warning: #f59e0b;
+    --warr-danger: #dc2626;
+    --warr-text: #1f2937;
+    --warr-muted: #6b7280;
+    --warr-bg: #f9fafb;
+    --warr-card: #ffffff;
+    --warr-border: #e5e7eb;
+    --warr-radius: 12px;
+    --warr-touch: 44px;
+    font-family: 'Noto Sans Thai', -apple-system, system-ui, sans-serif;
+    background: var(--warr-bg);
+    color: var(--warr-text);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+}
+.b2b-warr-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    background: var(--warr-primary);
+    color: #fff;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+.b2b-warr-back {
+    background: rgba(255,255,255,0.15);
+    border: none;
+    color: #fff;
+    font-size: 20px;
+    width: var(--warr-touch);
+    height: var(--warr-touch);
+    border-radius: 50%;
+    cursor: pointer;
+    line-height: 1;
+}
+.b2b-warr-title { font-size: 16px; font-weight: 600; margin: 0; }
+.b2b-warr-main { padding: 16px; max-width: 480px; margin: 0 auto; }
+
+.b2b-warr-input-card,
+.b2b-warr-scanner-card,
+.b2b-warr-loading-card,
+.b2b-warr-result-card {
+    background: var(--warr-card);
+    border-radius: var(--warr-radius);
+    padding: 20px 16px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    margin-bottom: 16px;
+}
+
+.b2b-warr-hint {
+    color: var(--warr-muted);
+    font-size: 13px;
+    margin: 0 0 16px;
+    text-align: center;
+}
+
+.b2b-warr-btn-scan {
+    width: 100%;
+    background: var(--warr-primary);
+    color: #fff;
+    border: none;
+    border-radius: var(--warr-radius);
+    padding: 16px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 60px;
+}
+.b2b-warr-btn-scan-icon { font-size: 22px; }
+
+.b2b-warr-divider {
+    text-align: center;
+    margin: 20px 0;
+    position: relative;
+    color: var(--warr-muted);
+    font-size: 13px;
+}
+.b2b-warr-divider::before,
+.b2b-warr-divider::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    width: calc(50% - 28px);
+    height: 1px;
+    background: var(--warr-border);
+}
+.b2b-warr-divider::before { left: 0; }
+.b2b-warr-divider::after { right: 0; }
+
+.b2b-warr-label {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    color: var(--warr-text);
+}
+.b2b-warr-input-row { display: flex; gap: 8px; }
+.b2b-warr-input {
+    flex: 1;
+    padding: 12px;
+    border: 1px solid var(--warr-border);
+    border-radius: 8px;
+    font-size: 16px;
+    font-family: 'JetBrains Mono', monospace;
+    text-transform: uppercase;
+    min-height: var(--warr-touch);
+}
+.b2b-warr-input:focus {
+    outline: 2px solid var(--warr-primary);
+    outline-offset: 1px;
+}
+.b2b-warr-btn-check {
+    background: var(--warr-accent);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 0 20px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    min-height: var(--warr-touch);
+    min-width: 80px;
+}
+.b2b-warr-input-note {
+    font-size: 11px;
+    color: var(--warr-muted);
+    margin: 6px 0 0;
+}
+
+#b2b-warr-scanner-region {
+    width: 100%;
+    min-height: 280px;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+}
+.b2b-warr-scanner-hint {
+    text-align: center;
+    color: var(--warr-muted);
+    font-size: 13px;
+    margin: 12px 0;
+}
+.b2b-warr-btn-cancel {
+    width: 100%;
+    background: var(--warr-border);
+    color: var(--warr-text);
+    border: none;
+    border-radius: 8px;
+    padding: 12px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    min-height: var(--warr-touch);
+}
+
+.b2b-warr-loading-card { text-align: center; padding: 40px 16px; }
+.b2b-warr-spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid var(--warr-border);
+    border-top-color: var(--warr-primary);
+    border-radius: 50%;
+    margin: 0 auto 16px;
+    animation: b2b-warr-spin 0.8s linear infinite;
+}
+@keyframes b2b-warr-spin { to { transform: rotate(360deg); } }
+.b2b-warr-loading-text { color: var(--warr-muted); font-size: 14px; margin: 0; }
+
+.b2b-warr-result-card { text-align: center; }
+.b2b-warr-result-badge { font-size: 48px; margin-bottom: 12px; }
+.b2b-warr-result-title { font-size: 20px; font-weight: 700; margin: 0 0 4px; }
+.b2b-warr-result-sn {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--warr-muted);
+    font-size: 13px;
+    margin: 0 0 16px;
+}
+.b2b-warr-result-body { text-align: left; margin: 16px 0; }
+.b2b-warr-result-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--warr-border);
+    font-size: 14px;
+}
+.b2b-warr-result-row:last-child { border-bottom: 0; }
+.b2b-warr-result-row .label { color: var(--warr-muted); }
+.b2b-warr-result-row .value { font-weight: 600; }
+.b2b-warr-result-row .value.positive { color: var(--warr-accent); }
+.b2b-warr-result-row .value.warning { color: var(--warr-warning); }
+.b2b-warr-result-row .value.danger { color: var(--warr-danger); }
+
+.b2b-warr-btn-again {
+    width: 100%;
+    background: var(--warr-primary);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 12px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    min-height: var(--warr-touch);
+    margin-top: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .b2b-warr-spinner { animation: none; }
+}
+</style>
+
+<script>
+(function() {
+    'use strict';
+
+    var root = document.querySelector('.b2b-warr-root');
+    if (!root) return;
+    var config = {};
+    try { config = JSON.parse(root.dataset.config || '{}'); } catch (e) {}
+
+    var sections = {
+        input:    root.querySelector('[data-state="input"]'),
+        scanning: root.querySelector('[data-state="scanning"]'),
+        loading:  root.querySelector('[data-state="loading"]'),
+        result:   root.querySelector('[data-state="result"]')
+    };
+
+    function showState(name) {
+        Object.keys(sections).forEach(function(k) {
+            sections[k].hidden = (k !== name);
+        });
+    }
+
+    function normalizeSn(raw) {
+        if (!raw) return '';
+        var v = String(raw).trim().toUpperCase();
+        // Allow URL form (?sn=DNCSS...) — extract sn param
+        if (v.indexOf('SN=') !== -1) {
+            try {
+                var url = new URL(v.indexOf('://') === -1 ? 'https://x/?' + v : v);
+                v = (url.searchParams.get('sn') || '').toUpperCase();
+            } catch (e) {}
+        }
+        // Allow plain DNCSS prefix or full URL
+        var match = v.match(/DNC[A-Z0-9]{4,16}/);
+        return match ? match[0] : v;
+    }
+
+    function fmtBuddhistDate(iso) {
+        if (!iso) return '—';
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return '—';
+        var months = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+        return d.getDate() + ' ' + months[d.getMonth()] + ' ' + (d.getFullYear() + 543);
+    }
+
+    function daysUntil(iso) {
+        if (!iso) return null;
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return null;
+        var now = new Date();
+        return Math.ceil((d - now) / (1000 * 60 * 60 * 24));
+    }
+
+    function renderResult(data) {
+        var badge = root.querySelector('#b2b-warr-result-badge');
+        var title = root.querySelector('#b2b-warr-result-title');
+        var snEl  = root.querySelector('#b2b-warr-result-sn');
+        var body  = root.querySelector('#b2b-warr-result-body');
+
+        var status = data.status || 'unknown';
+        var sn = data.sn || '';
+        snEl.textContent = 'S/N: ' + sn;
+
+        var rows = [];
+        var statusLabel, statusClass, badgeIcon;
+
+        switch (status) {
+            case 'registered':
+                badgeIcon = '✅';
+                statusLabel = 'ลงทะเบียนแล้ว';
+                statusClass = 'positive';
+                break;
+            case 'claimed':
+                badgeIcon = '🔧';
+                statusLabel = 'กำลังเคลม';
+                statusClass = 'warning';
+                break;
+            case 'replaced':
+                badgeIcon = '🔄';
+                statusLabel = 'เปลี่ยนสินค้าใหม่แล้ว';
+                statusClass = 'warning';
+                break;
+            case 'stolen':
+                badgeIcon = '🚨';
+                statusLabel = 'แจ้งหาย — เพลทถูกล็อค';
+                statusClass = 'danger';
+                break;
+            case 'voided':
+            case 'recalled':
+                badgeIcon = '⛔';
+                statusLabel = 'ติดต่อร้านค้า';
+                statusClass = 'danger';
+                break;
+            case 'in_pool':
+            case 'shipped':
+                badgeIcon = '📦';
+                statusLabel = 'ยังไม่ลงทะเบียน';
+                statusClass = 'warning';
+                break;
+            default:
+                badgeIcon = '❓';
+                statusLabel = 'ไม่พบข้อมูล';
+                statusClass = 'danger';
+        }
+
+        badge.textContent = badgeIcon;
+        title.textContent = statusLabel;
+        title.className = 'b2b-warr-result-title';
+
+        // Product info
+        if (data.product) {
+            var setName = data.product.top_set_name || data.product.linked_sku || '—';
+            rows.push({ label: 'สินค้า', value: setName });
+        }
+
+        // Warranty info
+        if (data.warranty && data.warranty.registered) {
+            rows.push({ label: 'ลงทะเบียน', value: fmtBuddhistDate(data.warranty.registered_at) });
+
+            if (data.warranty.warranty_until) {
+                var until = fmtBuddhistDate(data.warranty.warranty_until);
+                var days = daysUntil(data.warranty.warranty_until);
+                var valueClass = '';
+                if (days !== null) {
+                    if (days < 0) valueClass = 'danger';
+                    else if (days < 30) valueClass = 'warning';
+                    else valueClass = 'positive';
+                }
+                rows.push({ label: 'ประกันถึง', value: until + (days !== null ? ' (' + (days < 0 ? 'หมดอายุ' : 'เหลือ ' + days + ' วัน') + ')' : ''), cls: valueClass });
+            }
+
+            if (data.warranty.owner_masked) {
+                rows.push({ label: 'เจ้าของ', value: data.warranty.owner_masked });
+            }
+        } else if (status === 'in_pool' || status === 'shipped') {
+            rows.push({ label: 'หมายเหตุ', value: 'ลูกค้ายังไม่ activate' });
+        }
+
+        body.innerHTML = rows.map(function(r) {
+            var cls = r.cls ? ' ' + r.cls : '';
+            return '<div class="b2b-warr-result-row"><span class="label">' + r.label + '</span><span class="value' + cls + '">' + r.value + '</span></div>';
+        }).join('');
+    }
+
+    function fetchLookup(sn) {
+        showState('loading');
+        var url = config.rest_url + 'lookup/' + encodeURIComponent(sn);
+        fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } })
+            .then(function(r) {
+                if (!r.ok && r.status !== 404) throw new Error('HTTP ' + r.status);
+                return r.json().then(function(data) { return { ok: r.ok, status: r.status, data: data }; });
+            })
+            .then(function(res) {
+                if (res.status === 404) {
+                    renderResult({ status: 'not_found', sn: sn });
+                } else if (res.ok) {
+                    renderResult(res.data);
+                } else {
+                    renderResult({ status: 'error', sn: sn });
+                }
+                showState('result');
+            })
+            .catch(function(err) {
+                renderResult({ status: 'error', sn: sn });
+                showState('result');
+            });
+    }
+
+    // ── Wire up: manual S/N check ──
+    var btnCheck = root.querySelector('#b2b-warr-btn-check');
+    var snInput = root.querySelector('#b2b-warr-sn-input');
+    btnCheck.addEventListener('click', function() {
+        var sn = normalizeSn(snInput.value);
+        if (!sn || sn.length < 6) {
+            snInput.focus();
+            snInput.style.borderColor = '#dc2626';
+            setTimeout(function() { snInput.style.borderColor = ''; }, 2000);
+            return;
+        }
+        fetchLookup(sn);
+    });
+    snInput.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); btnCheck.click(); }
+    });
+
+    // ── Wire up: scan QR (lazy-load html5-qrcode CDN) ──
+    var btnScan = root.querySelector('#b2b-warr-btn-scan');
+    var btnCancelScan = root.querySelector('#b2b-warr-btn-cancel-scan');
+    var scanner = null;
+
+    function startScanner() {
+        if (!window.Html5Qrcode) {
+            var s = document.createElement('script');
+            s.src = 'https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js';
+            s.addEventListener('load', function() { startScanner(); });
+            s.addEventListener('error', function() { alert('โหลด scanner ไม่สำเร็จ — กรุณาพิมพ์ S/N เอง'); showState('input'); });
+            document.head.appendChild(s);
+            return;
+        }
+        showState('scanning');
+        scanner = new Html5Qrcode('b2b-warr-scanner-region');
+        scanner.start(
+            { facingMode: 'environment' },
+            { fps: 10, qrbox: { width: 240, height: 240 } },
+            function(decodedText) {
+                stopScanner();
+                var sn = normalizeSn(decodedText);
+                if (sn) fetchLookup(sn);
+                else { alert('QR ไม่ถูกต้อง'); showState('input'); }
+            },
+            function() {} // ignore scan errors
+        ).catch(function() {
+            alert('ไม่สามารถเปิดกล้องได้ — กรุณาอนุญาตสิทธิ์กล้องใน Settings');
+            showState('input');
+        });
+    }
+    function stopScanner() {
+        if (scanner && scanner.isScanning) {
+            scanner.stop().catch(function() {});
+        }
+    }
+
+    btnScan.addEventListener('click', startScanner);
+    btnCancelScan.addEventListener('click', function() {
+        stopScanner();
+        showState('input');
+    });
+
+    // ── Wire up: try again ──
+    root.querySelector('#b2b-warr-btn-again').addEventListener('click', function() {
+        snInput.value = '';
+        showState('input');
+        snInput.focus();
+    });
+
+    // ── Event delegation for [data-action] (UX-H3 compliant) ──
+    root.addEventListener('click', function(e) {
+        var t = e.target.closest('[data-action]');
+        if (!t) return;
+        if (t.dataset.action === 'back') {
+            if (window.liff && liff.isInClient && liff.isInClient()) {
+                liff.closeWindow();
+            } else {
+                history.back();
+            }
+        }
+    });
+
+    // ── LIFF init (D11 pattern — LINE OAuth + WP session) ──
+    if (window.liff && config.liff_id) {
+        liff.init({ liffId: config.liff_id })
+            .then(function() {
+                // No JWT — relies on existing WP session from LIFF login
+                if (!liff.isLoggedIn() && liff.isInClient()) {
+                    liff.login();
+                }
+            })
+            .catch(function(e) {
+                // Soft fail — page still works for manual S/N input
+                console.warn('LIFF init failed', e);
+            });
+    }
+
+    // ── Auto-check if ?sn=... in URL ──
+    if (config.prefill_sn) {
+        fetchLookup(config.prefill_sn);
+    } else {
+        showState('input');
+    }
+})();
+</script>
+        <?php
+        return ob_get_clean();
+    }
+    add_shortcode( 'b2b_warranty_check', 'b2b_warr_render_page' );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 3: Auto-create WP page on activation (idempotent)
+// ═══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_warr_ensure_page' ) ) {
+    function b2b_warr_ensure_page() {
+        $existing = get_page_by_path( 'b2b-warranty-check' );
+        if ( $existing ) return;
+
+        wp_insert_post( array(
+            'post_title'   => 'B2B Warranty Check',
+            'post_name'    => 'b2b-warranty-check',
+            'post_status'  => 'publish',
+            'post_type'    => 'page',
+            'post_content' => '[b2b_warranty_check]',
+        ) );
+    }
+    add_action( 'admin_init', 'b2b_warr_ensure_page', 20 );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 4: LIFF SDK enqueue on warranty check page
+// ═══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_warr_enqueue_liff_sdk' ) ) {
+    function b2b_warr_enqueue_liff_sdk() {
+        if ( ! is_page( 'b2b-warranty-check' ) ) return;
+        wp_enqueue_script( 'liff-sdk', 'https://static.line-scdn.net/liff/edge/2/sdk.js', array(), null, false );
+    }
+    add_action( 'wp_enqueue_scripts', 'b2b_warr_enqueue_liff_sdk' );
+}
