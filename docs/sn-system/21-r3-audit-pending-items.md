@@ -55,18 +55,32 @@ Round 3 audit เจอ findings 18 อัน (5 BLOCKER + 4 HIGH + 6 MED + 3 LO
 **Track**: `docs/sn-system/19-phase4-w12-pubapi-deferred.md`
 
 ### D6 — F#12 Anti-Fraud Engine cleanup verification
+
 **Severity**: LOW
 **Round**: R3
+**Status update 2026-05-13 (R13 audit verification)**: ✅ CODE SIDE COMPLETE
 **Issue**: Q21 boss decision = remove F#12 entirely. Commit `8d97fdf` removed schema/routes/cron/JS/test surface — but defensive `wp_unschedule_event` runs ONLY at admin_init time. ระบบที่ deploy ก่อน commit + cron ที่ pre-register อยู่อาจ orphan run อยู่ background.
-**Mitigation**: Production hotfix landed — verify post-deploy with `wp cron event list | grep -i fraud` (must return empty).
-**Owner**: Tech Lead — verify pre-Phase 1 W4 launch
-**Track**: Plan v2.13 §Q21 + commit `8d97fdf`
+**Code-side verification (R13 grep)**:
+
+- ✅ `dinoco_sn_install_schema()` does NOT create `wp_dinoco_sn_fraud_scores` table (`docs/sn-system/...` schema marker confirmed)
+- ✅ REST routes for `/fraud/queue` + `/fraud/{id}/decision` + `/fraud/stats` NOT registered in `rest_api_init`
+- ✅ `dinoco_sn_unschedule_orphan_crons()` clears `dinoco_sn_fraud_aggregate_cron` defensively at admin_init (SN Manager line 12265)
+- ✅ Handler bodies `dinoco_sn_rest_fraud_queue/stats` (SN REST API line 8267-8330) are unreachable dead code archived for git history. Defensive: each checks `dinoco_sn_table_exists('fraud_scores')` first → returns empty response since table not installed. Q21 doc note: "Phase 4+ may delete entirely once schema migration drop confirmed".
+**Remaining server-side verification** (boss/admin SSH):
+- `wp cron event list | grep -i fraud` → expect empty
+- `wp option get dinoco_sn_schema_version` → verify schema version absent fraud_scores key
+**Mitigation**: Code-side defensive guards prevent any access. Production hotfix landed.
+**Owner**: Tech Lead — verify pre-Phase 1 W4 launch (SSH-side cron verify pending boss)
+**Track**: Plan v2.13 §Q21 + commit `8d97fdf` + R13 grep verification (2026-05-13)
 
 ### D7 — Admin LIFF approval UX accessibility (high-contrast mode)
+
 **Severity**: LOW
 **Round**: R3
+**Status update 2026-05-13**: Standing — current contrast 5.9:1 passes WCAG AA. Phase 5 W18 axe-core/NVDA broader audit still pending.
 **Issue**: 4-eyes approval LIFF prompt ใช้ amber color (#fef3c7 / #b45309). High-contrast Windows + Linux mode บาง edge case อาจให้ contrast ratio < 4.5:1 (WCAG AA fail).
 **Mitigation**: Spot-checked in Phase 1 audit (UX-C3) — passed at 5.9:1. Round 3 didn't detect new regression. Re-audit Phase 5 with broader accessibility tools (axe-core, NVDA).
+**R13 note (2026-05-13)**: BO V.4.0 all_backorder Flex builder uses same amber palette (#b45309 / #fef3c7) — inherits same WCAG AA pass. New customer-facing surface (LIFF Order page + customer split view) consistent with existing convention.
 **Owner**: UX Lead
 **Track**: Phase 5 W18 launch readiness
 
