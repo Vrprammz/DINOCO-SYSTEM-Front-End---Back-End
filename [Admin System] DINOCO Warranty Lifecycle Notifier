@@ -1,6 +1,18 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Warranty Lifecycle Notifier               ║
+ * ║  Version: V.0.7 (2026-05-13) — Phase 6 QW-5 Refer-a-Friend Code: ║
+ * ║    - Extended `dinoco_sn_generate_promo_code()` to support type     ║
+ * ║      `refer_a_friend` (10% discount, scope=any, ttl=180d)            ║
+ * ║    - NEW `dinoco_sn_get_or_create_referral_code($user_id)` —         ║
+ * ║      idempotent per-user code (stored in user meta for instant       ║
+ * ║      member dashboard read; reuse across all plate activations)      ║
+ * ║    - NEW `dinoco_sn_get_referral_stats($user_id)` — returns          ║
+ * ║      {code, redeemed_count, reward_pending ฿100×N}                   ║
+ * ║    - Auto-trigger listener on `dinoco_sn_pool_status_changed_for_user║
+ * ║      → generates code on first registration (idempotent guard)       ║
+ * ║    Reward ฿100/redemption configurable via wp_option                 ║
+ * ║      `dinoco_sn_referral_reward_thb` (default 100.0).                ║
  * ║  Version: V.0.6 (2026-05-08) — R6 GAP-1: NUCLEAR opt-out also  ║
  * ║    honored in fallback path (when Governance helper missing).   ║
  * ║    Was: only canonical-helper branch enforced opt_out_all meta. ║
@@ -376,6 +388,13 @@ if ( ! function_exists( 'dinoco_sn_generate_promo_code' ) ) {
         } elseif ( strpos( (string) $type, 'expiry_' ) === 0 ) {
             $defaults['discount_pct'] = 10;
             $defaults['scope']        = 'same_sku';
+        } elseif ( $type === 'refer_a_friend' ) {
+            // QW-5 (Phase 6): Refer-a-Friend reward — friend gets 10% off any product.
+            // Referrer's reward (฿100 credit) handled separately on redemption hook.
+            // TTL long (180d) since referral codes are shared via word-of-mouth.
+            $defaults['discount_pct']   = 10;
+            $defaults['scope']          = 'any';
+            $defaults['ttl_days']       = 180;
         }
         $opts = array_merge( $defaults, is_array( $opts ) ? $opts : array() );
 
@@ -408,6 +427,105 @@ if ( ! function_exists( 'dinoco_sn_generate_promo_code' ) ) {
             if ( $ok === false ) break;
         }
         return false;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2.5 REFER-A-FRIEND CODE (Phase 6 QW-5)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_get_or_create_referral_code' ) ) {
+    /**
+     * Idempotent per-user referral code — generates ONE code per customer
+     * (reused across all their plate activations + shares). Stored in user
+     * meta `dinoco_sn_referral_code` for instant member dashboard read.
+     *
+     * Flow: customer activates plate → if no referral_code yet, generate one
+     * via dinoco_sn_generate_promo_code(refer_a_friend) → save to user meta.
+     * Code is the same shareable link forever (until manually rotated by admin).
+     *
+     * @param int $user_id WP user
+     * @return string|false Code string, or false on error
+     */
+    function dinoco_sn_get_or_create_referral_code( $user_id ) {
+        $user_id = (int) $user_id;
+        if ( $user_id <= 0 ) return false;
+
+        $existing = get_user_meta( $user_id, 'dinoco_sn_referral_code', true );
+        if ( $existing && is_string( $existing ) && strlen( $existing ) >= 8 ) {
+            return $existing;
+        }
+
+        // Generate new code via promo_codes table (source_sn=null since per-user not per-plate)
+        $code = dinoco_sn_generate_promo_code( $user_id, null, 'refer_a_friend' );
+        if ( $code === false ) return false;
+
+        update_user_meta( $user_id, 'dinoco_sn_referral_code', $code );
+        return $code;
+    }
+}
+
+// QW-5 (Phase 6 backlog): Auto-generate referral code on first plate activation.
+// Listens to R3 cache invalidation chain (`dinoco_sn_pool_status_changed_for_user`)
+// — fires when sn_pool.status changes for a specific user. Only acts on first
+// registration (to='registered' + user has no code yet). Idempotent via
+// dinoco_sn_get_or_create_referral_code() which short-circuits if code exists.
+if ( ! has_action( 'dinoco_sn_pool_status_changed_for_user', 'dinoco_sn_auto_generate_referral_on_register' ) ) {
+    add_action( 'dinoco_sn_pool_status_changed_for_user', 'dinoco_sn_auto_generate_referral_on_register', 20, 4 );
+}
+if ( ! function_exists( 'dinoco_sn_auto_generate_referral_on_register' ) ) {
+    function dinoco_sn_auto_generate_referral_on_register( $user_id, $sn, $from, $to ) {
+        if ( (int) $user_id <= 0 ) return;
+        if ( $to !== 'registered' ) return;
+        // Idempotent — short-circuits if user already has a code (returns existing string).
+        try {
+            dinoco_sn_get_or_create_referral_code( (int) $user_id );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture_exception' ) ) {
+                dinoco_obs_capture_exception( $e, array( 'context' => 'sn_referral_auto_generate', 'user_id' => $user_id, 'sn' => $sn ) );
+            }
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_referral_stats' ) ) {
+    /**
+     * Returns per-user referral usage stats for member dashboard.
+     *
+     * @param int $user_id Referrer's WP user
+     * @return array {
+     *     code:           string|null  Active referral code
+     *     redeemed_count: int          Number of friends who used the code
+     *     reward_pending: float        Sum of pending referrer rewards (฿100 × redeemed_count)
+     * }
+     */
+    function dinoco_sn_get_referral_stats( $user_id ) {
+        $user_id = (int) $user_id;
+        $code = get_user_meta( $user_id, 'dinoco_sn_referral_code', true );
+        $stats = array(
+            'code'           => is_string( $code ) ? $code : null,
+            'redeemed_count' => 0,
+            'reward_pending' => 0.0,
+        );
+        if ( ! $stats['code'] ) return $stats;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'promo_codes' ) ) {
+            return $stats;
+        }
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'promo_codes' );
+        // Count redemptions: rows where used_at IS NOT NULL AND code = referrer's code.
+        // Note: this counts how many TIMES the code was used (in MVP we allow multiple
+        // friends to use same code). For per-friend tracking, future schema extension
+        // would add a `referrer_user_id` column.
+        $count = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$tbl} WHERE code = %s AND used_at IS NOT NULL",
+            $stats['code']
+        ) );
+        $stats['redeemed_count'] = $count;
+        // ฿100 per redemption (configurable via wp_option)
+        $reward_per = (float) get_option( 'dinoco_sn_referral_reward_thb', 100.0 );
+        $stats['reward_pending'] = $count * $reward_per;
+        return $stats;
     }
 }
 
