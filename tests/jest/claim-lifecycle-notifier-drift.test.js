@@ -68,11 +68,64 @@ describe('Claim Lifecycle Notifier — Sprint 5 drift detector', () => {
 
     // ─── Claim Lifecycle Notifier V.0.2 (Sprint 5B) ─────────────
 
-    describe('Claim Lifecycle Notifier V.0.2 — listener + dispatcher', () => {
+    describe('Claim Lifecycle Notifier V.0.3 — listener + dispatcher', () => {
         const code = read('[Admin System] DINOCO Claim Lifecycle Notifier');
 
-        test('version V.0.2 in header', () => {
-            expect(code).toMatch(/Version: V\.0\.2 \(2026-05-13\)/);
+        test('version V.0.3 in header (latest)', () => {
+            expect(code).toMatch(/Version: V\.0\.3 \(2026-05-13\)/);
+        });
+
+        test('Sprint 7 CRIT-1 fix landed — reads $resp code not is_wp_error', () => {
+            // Dispatcher must check $resp['code'] not is_wp_error($resp).
+            // CRIT-1 from code-reviewer Sprint 7: b2b_line_push_raw never returns WP_Error.
+            // Look at the LINE push dispatch region specifically.
+            const dispatchStart = code.indexOf('function dinoco_claim_notif_dispatch');
+            const dispatchEnd   = code.indexOf("\n    }\n}\n", dispatchStart);
+            const dispatchBody  = dispatchStart > -1 && dispatchEnd > -1
+                ? code.slice(dispatchStart, dispatchEnd)
+                : '';
+            expect(dispatchBody).toMatch(/\$resp\s*===\s*false/);
+            expect(dispatchBody).toMatch(/isset\(\s*\$resp\['code'\]\s*\)/);
+            // 'http_' . $code prefix when non-200
+            expect(dispatchBody).toMatch(/'http_'\s*\.\s*\$code/);
+            // push_helper_unavailable when $resp === false
+            expect(dispatchBody).toMatch(/'push_helper_unavailable'/);
+            // unknown_push_response_shape fallback
+            expect(dispatchBody).toMatch(/'unknown_push_response_shape'/);
+        });
+
+        test('Sprint 7 HIGH-1 fix landed — body_for_hash uses slug at BOTH key + body', () => {
+            // V.0.2 keyed on slug but hashed raw $to_status — false 409 risk.
+            // V.0.3 unifies on $body_for_hash variable shared at both sites.
+            expect(code).toMatch(/\$body_for_hash\s*=\s*array\([\s\S]*?'to_status'\s*=>\s*dinoco_claim_notif_status_to_slug/);
+            // Both check + store must consume the unified $body_for_hash.
+            expect(code).toMatch(/dinoco_idempotency_check\(\s*\$idem_key\s*,\s*'claim-notif'\s*,\s*\$body_for_hash\s*\)/);
+            expect(code).toMatch(/dinoco_idempotency_store\(\s*\$idem_key\s*,\s*'claim-notif'\s*,\s*\$body_for_hash/);
+        });
+
+        test('Sprint 7 HIGH-1 fix landed — 409 path captures observability warning', () => {
+            // V.0.2 silent return on 409 violated spec §6.2 "no observability black holes".
+            expect(code).toMatch(/dinoco_obs_capture\(\s*'warning'\s*,\s*'claim_notif_idempotency_conflict'/);
+        });
+
+        test('Sprint 7 HIGH-3 fix landed — Push Gov reason truncated to 60 chars', () => {
+            // CRIT-1 fix makes push_err carry ~200-char HTTP body preview;
+            // Push Gov schema is reason VARCHAR(64).
+            expect(code).toMatch(/mb_substr\(\s*\$push_err\s*,\s*0\s*,\s*60\s*\)/);
+        });
+
+        test('Sprint 7 MED-2 fix landed — REST /notif/log requires manage_options only', () => {
+            // V.0.2 allowed (manage_options || edit_posts). edit_posts is Author role default
+            // and the notif log contains delivery metadata that could leak.
+            const restRegion = code.match(/register_rest_route\(\s*'dinoco-claim\/v1'\s*,\s*'\/notif\/log'[\s\S]*?\)\s*;/);
+            expect(restRegion).not.toBeNull();
+            expect(restRegion[0]).toMatch(/current_user_can\(\s*'manage_options'\s*\)/);
+            // edit_posts MUST NOT appear in the /notif/log route definition.
+            expect(restRegion[0]).not.toMatch(/current_user_can\(\s*'edit_posts'\s*\)/);
+        });
+
+        test('sentinel constant bumped to 0.3', () => {
+            expect(code).toMatch(/DINOCO_CLAIM_LIFECYCLE_NOTIFIER_LOADED'\s*,\s*'0\.3'/);
         });
 
         test('DB_ID 1211 in header', () => {

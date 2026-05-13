@@ -1,6 +1,42 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Lifecycle Notifier                  ║
+ * ║  Version: V.0.3 (2026-05-13) — Sprint 7 code-reviewer remediation:║
+ * ║    Closes 1 CRITICAL + 3 HIGH + 1 MEDIUM finding from review of   ║
+ * ║    V.0.2 (Sprint 5B). Pre-flag-flip safety landed BEFORE any      ║
+ * ║    production traffic reaches the listener.                       ║
+ * ║                                                                   ║
+ * ║    CRIT-1 — b2b_line_push_raw response shape misparsed.          ║
+ * ║      V.0.2 checked is_wp_error($resp) but helper NEVER returns    ║
+ * ║      WP_Error (verified Snippet 1 V.34.35 lines 646-657). Every  ║
+ * ║      actual LINE API failure (HTTP 401/429/500, network error)   ║
+ * ║      was silently logged as success=true. Audit log misreported   ║
+ * ║      delivery; Sentry never saw claim_notif_push_fail. V.0.3      ║
+ * ║      reads $resp['code'] correctly + records http_<code>:<body>   ║
+ * ║      preview on non-200 + handles $resp===false (token missing). ║
+ * ║                                                                   ║
+ * ║    HIGH-1 — Idempotency hash asymmetry between key + body.        ║
+ * ║      V.0.2 keyed on slug but body-hashed on raw $to_status. Case  ║
+ * ║      variants of same logical status (e.g. "Under Maintenance"    ║
+ * ║      vs "under maintenance" from divergent code paths) would     ║
+ * ║      slug-collide on key but body-hash-differ → false 409        ║
+ * ║      mismatch → silent return → legit event dropped, customer    ║
+ * ║      never gets Flex. V.0.3 unifies on slug at BOTH sites +       ║
+ * ║      dinoco_obs_capture('warning', 'claim_notif_idempotency_      ║
+ * ║      conflict', ...) on 409 path so production drift visible.    ║
+ * ║                                                                   ║
+ * ║    HIGH-3 — Push Gov reason column truncation.                    ║
+ * ║      CRIT-1 fix makes $push_err carry ~200-char HTTP body         ║
+ * ║      preview. Push Gov schema has reason VARCHAR(64). Under       ║
+ * ║      STRICT_TRANS_TABLES MySQL would truncate-error. V.0.3        ║
+ * ║      mb_substr($push_err, 0, 60) at the call site.               ║
+ * ║                                                                   ║
+ * ║    MED-2 — REST /notif/log permission too permissive.             ║
+ * ║      V.0.2 allowed (manage_options || edit_posts). edit_posts is  ║
+ * ║      granted to Author role (WP default); notif log contains      ║
+ * ║      delivery metadata + user_ids. V.0.3 tightens to              ║
+ * ║      manage_options only, matches DINOCO admin-only convention.   ║
+ * ║                                                                   ║
  * ║  Version: V.0.2 (2026-05-13) — Sprint 5B Phase 1.2 scaffold:     ║
  * ║    Listener + dispatcher + REST endpoints + observability +      ║
  * ║    graceful Flex fallback. NO 10 Flex builders yet (Phase 1.3    ║
@@ -67,7 +103,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // Sentinel marker so Phase 1.3 work knows this snippet is live.
 if ( ! defined( 'DINOCO_CLAIM_LIFECYCLE_NOTIFIER_LOADED' ) ) {
-    define( 'DINOCO_CLAIM_LIFECYCLE_NOTIFIER_LOADED', '0.2' );
+    define( 'DINOCO_CLAIM_LIFECYCLE_NOTIFIER_LOADED', '0.3' );
 }
 
 // Feature flag (default OFF). Stub-like behavior when OFF — pure helpers
@@ -341,14 +377,27 @@ if ( ! function_exists( 'dinoco_claim_notif_dispatch' ) ) {
         $push_err = '';
         try {
             if ( function_exists( 'b2b_line_push_raw' ) ) {
+                // V.0.3 CRIT-1 fix — b2b_line_push_raw NEVER returns WP_Error.
+                // Actual return shapes (verified Snippet 1 lines 646-657):
+                //   - false                              (token undefined or empty $to)
+                //   - array('code'=>0,'body'=>'')        (wp_remote_post threw WP_Error internally)
+                //   - array('code'=>$code,'body'=>$resp) (all HTTP responses incl. 401/429/500)
                 $resp = b2b_line_push_raw( $line_uid, array( $flex ) );
-                if ( is_wp_error( $resp ) ) {
-                    $push_err = $resp->get_error_message();
+                if ( $resp === false ) {
+                    $push_err = 'push_helper_unavailable';  // token undefined or no $to
+                } elseif ( is_array( $resp ) && isset( $resp['code'] ) ) {
+                    $code = (int) $resp['code'];
+                    if ( $code === 200 ) {
+                        // Success — x-line-request-id not currently exposed by helper.
+                        // Leave $msg_id null until helper extends; audit row still useful.
+                        $msg_id = null;
+                    } else {
+                        // HTTP error (401/429/500) OR code=0 (network failure internally caught)
+                        $body_preview = isset( $resp['body'] ) ? substr( (string) $resp['body'], 0, 200 ) : '';
+                        $push_err = 'http_' . $code . ( $body_preview !== '' ? ':' . $body_preview : '' );
+                    }
                 } else {
-                    // Treat any non-error response as success; msg_id best-effort
-                    $msg_id = is_array( $resp ) && isset( $resp['x_line_request_id'] )
-                        ? (string) $resp['x_line_request_id']
-                        : null;
+                    $push_err = 'unknown_push_response_shape';
                 }
             } elseif ( function_exists( 'b2b_line_push' ) ) {
                 // Degraded path — text-only fallback if Flex helper missing
@@ -364,11 +413,15 @@ if ( ! function_exists( 'dinoco_claim_notif_dispatch' ) ) {
         $success = ( $push_err === '' );
 
         // 8. Governance log (for cap accounting + admin visibility)
+        // V.0.3 HIGH-3 fix — Push Gov schema `reason VARCHAR(64)`. CRIT-1 fix made
+        // $push_err carry full http body preview (up to ~200 chars) so we must
+        // truncate at the call site to avoid STRICT_TRANS_TABLES truncation errors.
         if ( function_exists( 'dinoco_line_log_push' ) ) {
             try {
+                $gov_reason = $success ? '' : mb_substr( $push_err, 0, 60 );
                 dinoco_line_log_push( (int) $author_id, 'claim_status',
                     dinoco_claim_notif_status_to_slug( $to_status ), $success,
-                    $success ? '' : $push_err );
+                    $gov_reason );
             } catch ( \Throwable $e ) {
                 // best-effort — never block notify on logging failure
             }
@@ -445,19 +498,34 @@ if ( ! function_exists( 'dinoco_claim_notify_status_changed' ) ) {
     function dinoco_claim_notify_status_changed( $claim_id, $from_status, $to_status, $context = array() ) {
         // Idempotency dedup via Helper [#1194] — covers hook re-fire
         // across separate request lifetimes (transient covers same-request
-        // re-fire). Idempotency body hash uses (claim_id, to_status) as
-        // semantic identity.
+        // re-fire). Semantic identity = (claim_id, to_status_slug).
+        //
+        // V.0.3 HIGH-1 fix — unify hash composition across key + body. V.0.2
+        // used slug for key but raw $to_status for body hash; case/whitespace
+        // variants of the same logical status (e.g. "Under Maintenance" vs
+        // "under maintenance" from different code paths) would slug-collide on
+        // the key but body-hash-differ, triggering a false 409 hash mismatch
+        // and silent return. Now both sides use slug → deterministic identity.
         $idem_key = '';
+        $body_for_hash = array(
+            'claim_id'  => (int) $claim_id,
+            'to_status' => dinoco_claim_notif_status_to_slug( $to_status ),
+        );
         if ( function_exists( 'dinoco_idempotency_hash' ) ) {
-            $idem_key = 'claim-notif:' . dinoco_idempotency_hash( array(
-                'claim_id'  => (int) $claim_id,
-                'to_status' => dinoco_claim_notif_status_to_slug( $to_status ),
-            ) );
+            $idem_key = 'claim-notif:' . dinoco_idempotency_hash( $body_for_hash );
             if ( function_exists( 'dinoco_idempotency_check' ) ) {
-                $cached = dinoco_idempotency_check( $idem_key, 'claim-notif',
-                    dinoco_idempotency_hash( array( 'cid' => (int) $claim_id, 'to' => $to_status ) ) );
+                $cached = dinoco_idempotency_check( $idem_key, 'claim-notif', $body_for_hash );
                 if ( is_wp_error( $cached ) ) {
-                    // 409 hash mismatch — log + skip (HR4: silent on race)
+                    // 409 hash mismatch — should be unreachable after V.0.3 unify
+                    // fix, but log defensively so production drift is visible
+                    // (V.2.3 §6.2 "no observability black holes" discipline).
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( 'warning', 'claim_notif_idempotency_conflict', array(
+                            'claim_id'  => (int) $claim_id,
+                            'to_status' => (string) $to_status,
+                            'idem_key'  => $idem_key,
+                        ) );
+                    }
                     return;
                 }
                 if ( $cached ) {
@@ -483,7 +551,7 @@ if ( ! function_exists( 'dinoco_claim_notify_status_changed' ) ) {
         if ( $idem_key !== '' && ! empty( $result['sent'] )
             && function_exists( 'dinoco_idempotency_store' ) ) {
             dinoco_idempotency_store( $idem_key, 'claim-notif',
-                dinoco_idempotency_hash( array( 'cid' => (int) $claim_id, 'to' => $to_status ) ),
+                $body_for_hash,
                 $result, 200 );
         }
     }
@@ -499,8 +567,14 @@ if ( ! function_exists( 'dinoco_claim_notif_register_rest' ) ) {
         register_rest_route( 'dinoco-claim/v1', '/notif/log', array(
             'methods'             => 'GET',
             'callback'            => 'dinoco_claim_notif_rest_log',
+            // V.0.3 MED-2 fix — tightened from manage_options || edit_posts → manage_options.
+            // edit_posts is granted to Author role (WP default) and the notif log
+            // contains delivery metadata + user_ids that should not leak. Matches
+            // DINOCO admin-only convention (Service Center, B2F Migration Audit).
+            // If Phase 1 Task 1.5 Service Center UI needs role variation, introduce
+            // a custom cap (view_claim_audit) later instead of widening here.
             'permission_callback' => function () {
-                return current_user_can( 'manage_options' ) || current_user_can( 'edit_posts' );
+                return current_user_can( 'manage_options' );
             },
             'args' => array(
                 'claim_id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),

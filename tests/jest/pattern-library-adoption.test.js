@@ -122,14 +122,44 @@ describe('Pattern Library Adoption (Sprint 2 H1-H5)', () => {
             const fn = src.match(/function dinoco_status_severity_to_color[\s\S]+?\n\s{0,4}\}\s*\n\s{0,4}\}/);
             expect(fn).not.toBeNull();
             const body = fn[0];
-            // Success → brand-green token (#16a34a per B2B canonical)
+            // Success → brand-green token (#16A34A per B2B canonical, V.1.3 uppercase)
             expect(body).toMatch(/case 'success':\s*return dinoco_brand_color\(\s*'brand-green'/);
-            // Warning → warning-amber token (#b45309 UX-H3 fix)
+            // Warning → warning-amber token (#B45309 UX-H3 fix)
             expect(body).toMatch(/case 'warning':\s*return dinoco_brand_color\(\s*'warning-amber'/);
             // Critical → danger-red
             expect(body).toMatch(/case 'critical':\s*return dinoco_brand_color\(\s*'danger-red'/);
             // Default/info/brand → brand-navy-flex (#1A3A5C)
             expect(body).toMatch(/return dinoco_brand_color\(\s*'brand-navy-flex'/);
+        });
+
+        test('Sprint 7C HIGH-2 fix — V.1.3 registry stores UPPERCASE canonical hex', () => {
+            // Code-reviewer HIGH-2: V.1.2 stored lowercase while Sprint 6 V.34.35
+            // builders use UPPERCASE — mixed-case payloads. V.1.3 uppercases all
+            // 14 canonical entries. Verify the most-critical ones flipped.
+            expect(src).toMatch(/'brand-green'\s+=>\s+'#16A34A'/);
+            expect(src).toMatch(/'success-emerald'\s+=>\s+'#10B981'/);
+            expect(src).toMatch(/'warning-amber'\s+=>\s+'#B45309'/);
+            expect(src).toMatch(/'danger-red'\s+=>\s+'#DC2626'/);
+            expect(src).toMatch(/'info-blue'\s+=>\s+'#3B82F6'/);
+            expect(src).toMatch(/'brand-charcoal-ui'\s+=>\s+'#1F2937'/);
+            // brand-navy-flex was already uppercase in V.1.2 — verify it stayed.
+            expect(src).toMatch(/'brand-navy-flex'\s+=>\s+'#1A3A5C'/);
+            // line-green is LINE-native and was always uppercase
+            expect(src).toMatch(/'line-green'\s+=>\s+'#06C755'/);
+        });
+
+        test('Sprint 7C — severity_to_color fallback literals match registry uppercase', () => {
+            // Defensive fallback path (when registry not loaded) must use same case
+            // as registry values to avoid mixed-case Flex bubbles.
+            const fn = src.match(/function dinoco_status_severity_to_color[\s\S]+?\n\s{0,4}\}\s*\n\s{0,4}\}/);
+            expect(fn).not.toBeNull();
+            expect(fn[0]).toMatch(/case 'success':\s*return dinoco_brand_color\(\s*'brand-green'\s*,\s*'#16A34A'/);
+            expect(fn[0]).toMatch(/case 'warning':\s*return dinoco_brand_color\(\s*'warning-amber'\s*,\s*'#B45309'/);
+            expect(fn[0]).toMatch(/case 'critical':\s*return dinoco_brand_color\(\s*'danger-red'\s*,\s*'#DC2626'/);
+        });
+
+        test('Design Tokens version bumped to V.1.3 (HIGH-2 fix)', () => {
+            expect(src).toMatch(/Version: V\.1\.3 \(2026-05-13\)/);
         });
     });
 
