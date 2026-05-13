@@ -157,9 +157,11 @@ describe('B2B BO all_backorder drift detector (V.4.0 — Order #6313 redesign)',
             expect(code).toMatch(/\$target_state\s*=\s*\$is_all_backorder\s*\?\s*'all_backorder'\s*:\s*'partial_fulfilled'/);
         });
 
-        test('_b2b_all_backorder postmeta marker stamped', () => {
+        test('R13: _b2b_all_backorder write-only marker REMOVED (order_status is source of truth)', () => {
             const code = stripComments(read('s16'));
-            expect(code).toMatch(/update_post_meta\(\s*\$order_id,\s*'_b2b_all_backorder'/);
+            // R13 (2026-05-13): marker was write-only (never read) — removed to eliminate
+            // drift risk. order_status === 'all_backorder' is the only source of truth.
+            expect(code).not.toMatch(/update_post_meta\(\s*\$order_id,\s*'_b2b_all_backorder'/);
         });
     });
 
@@ -203,11 +205,13 @@ describe('B2B BO all_backorder drift detector (V.4.0 — Order #6313 redesign)',
             expect(code).toMatch(/\$was_all_bo\s*=\s*\(\s*\$prev_status\s*===\s*'all_backorder'\s*\)/);
         });
 
-        test('clears _b2b_all_backorder marker on graduation', () => {
+        test('R13: bo-fulfill uses $was_all_bo for diagnostic transition reason (marker removed)', () => {
             const code = stripComments(read('s16'));
-            // Find the bo-fulfill section that clears the marker
-            const fulfillSection = code.match(/'all BO resolved.*all_backorder[\s\S]*?delete_post_meta|\$was_all_bo[\s\S]*?update_post_meta\(\s*\$order_id,\s*'_b2b_all_backorder',\s*0/);
-            expect(fulfillSection).not.toBeNull();
+            // R13: marker is gone but $was_all_bo logic still drives the transition reason
+            // log ("all BO resolved (from all_backorder)" vs "all BO resolved"). This is
+            // pure-derive logic — reads order_status field, no postmeta marker needed.
+            expect(code).toMatch(/\$was_all_bo\s*=\s*\(\s*\$prev_status\s*===\s*'all_backorder'/);
+            expect(code).toMatch(/\$was_all_bo\s*\?\s*'all BO resolved \(from all_backorder\)'/);
         });
     });
 

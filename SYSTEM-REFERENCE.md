@@ -352,7 +352,7 @@ Namespace สำหรับ B2B Backorder System ([B2B] Snippet 16 V.1.6). Mast
 
 | Method | Endpoint | Purpose | Gates |
 |--------|----------|---------|-------|
-| POST | `/bo-split` | Split pending order → fulfilled + BO items | **V.4.0**: detects qty_fulfill=0 ทุก SKU → routes to `all_backorder` state (instead of `partial_fulfilled`) + sets `_b2b_all_backorder=1` postmeta. invariant check, per-SKU compound debt, 10min undo window. |
+| POST | `/bo-split` | Split pending order → fulfilled + BO items | **V.4.0**: detects qty_fulfill=0 ทุก SKU → routes to `all_backorder` state (instead of `partial_fulfilled`). invariant check, per-SKU compound debt, 10min undo window. **V.4.1 R13 (2026-05-13)**: removed redundant `_b2b_all_backorder` postmeta marker (was write-only — `order_status` field is source of truth). |
 | POST | `/bo-confirm-full` | Admin confirms full stock (no split) | FSM pending_stock_review → awaiting_confirm |
 | POST | `/bo-reject` | Admin rejects entire order | revert counters + notify customer cancelled |
 | POST | `/bo-undo-split` | Undo split within 10min window | 1 max/order, must have no fulfilled BO |
