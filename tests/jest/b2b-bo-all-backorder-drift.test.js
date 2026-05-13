@@ -122,7 +122,9 @@ describe('B2B BO all_backorder drift detector (V.4.0 — Order #6313 redesign)',
 
         test('b2b_get_status_colors() contains all_backorder', () => {
             const code = read('s1');
-            const match = code.match(/function b2b_get_status_colors\(\)\s*\{[\s\S]*?return\s*array\(([\s\S]*?)\);\s*\}/);
+            // V.34.34: refactored to use $local = array(...) + H2 registry overlay + return $local.
+            // Match the $local = array(...) declaration (source of truth for legacy keys).
+            const match = code.match(/function b2b_get_status_colors\(\)\s*\{[\s\S]*?\$local\s*=\s*array\(([\s\S]*?)\);[\s\S]*?return\s+\$local\s*;/);
             expect(match).not.toBeNull();
             expect(match[1]).toMatch(/'all_backorder'\s*=>/);
         });

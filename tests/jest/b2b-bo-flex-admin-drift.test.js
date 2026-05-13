@@ -39,7 +39,9 @@ describe('B2B BO admin Flex drift detector (2026-05-11 Order #6308 regression)',
 
     test('Snippet 1 b2b_get_status_colors() contains BO V.1.6 statuses', () => {
         const code = read('s1');
-        const match = code.match(/function b2b_get_status_colors\(\)\s*\{[\s\S]*?return\s*array\(([\s\S]*?)\);\s*\}/);
+        // V.34.34: refactored to use $local = array(...) + H2 registry overlay + return $local.
+        // Match the $local = array(...) declaration (source of truth for legacy keys).
+        const match = code.match(/function b2b_get_status_colors\(\)\s*\{[\s\S]*?\$local\s*=\s*array\(([\s\S]*?)\);[\s\S]*?return\s+\$local\s*;/);
         expect(match).not.toBeNull();
         const colors = match[1];
         expect(colors).toMatch(/'pending_stock_review'\s*=>/);

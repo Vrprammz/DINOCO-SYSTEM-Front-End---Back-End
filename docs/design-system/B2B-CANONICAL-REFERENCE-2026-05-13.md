@@ -80,20 +80,53 @@ $display = dinoco_format_date( $registered_at, 'customer' );  // → "13/05/2026
 $display = dinoco_sn_format_thai_date( $registered_at, false );  // → "13 พ.ค. 2026"
 ```
 
-### D4 — Canonical Currency Decimal Rule
+### D4 — Canonical Currency Decimal Rule (V.1.1 Sprint 4A REFINEMENT)
 
-**Implicit B2B rule, now explicit:**
+**B2B rule clarified after Sprint 4A audit found existing patterns are intentional per context** (invoice grand total = 2 decimals is financial-doc convention; alt text / admin previews = 0 decimals for compact display). Rule is **context-sensitive**, not a blanket rule:
 
-| Field type | Decimals | Example | B2B reference |
+#### Compact display (0 decimals)
+
+Used in: alt text, push subject lines, admin Flex headers, daily summary cards, dashboard stat boxes, customer LINE notifications "ยอด ฿X".
+
+```php
+'฿' . number_format( $amount, 0 )   // → ฿8,800
+```
+
+| Context | Example sites |
+|---|---|
+| Flex alt text | `[B2B] Snippet 1:4208` `'altText'=>'... ฿'.number_format($total,0)` |
+| Daily summary push | `[B2B] Snippet 7` daily-summary Flex |
+| Admin order preview rows | `[B2B] Snippet 1:4197/4203/4372/4425` |
+| Push subject lines | `[B2B] Snippet 1:4955/5450` `mb_substr('🔔 '.$subtitle.' ฿'.number_format($amount,0)` |
+
+#### Financial-document precision (2 decimals)
+
+Used in: invoice grand total ("มูลค่ารวมสุทธิ"), payment confirm body, slip verify confirm, statement line items, B2F receive cost display, debt detail.
+
+```php
+'฿' . number_format( $amount, 2 )   // → ฿8,800.00
+```
+
+| Context | Example sites |
+|---|---|
+| Invoice grand total | `[B2B] Snippet 1:4794` `'มูลค่ารวมสุทธิ' ฿number_format($total,2)` + `[Admin] Manual Invoice:481` same pattern |
+| Payment confirm body | `[B2B] Snippet 1:4934/4960` `฿number_format($amount,2)` size xxl |
+| Slip verify confirm | `[B2B] Snippet 1:5351/5390/5412` `฿number_format($amount,2)` |
+| Debt detail | `[B2B] Snippet 1:4976` `'ยอดค้าง: ฿'.number_format($amount,2)` |
+| B2B Snippet 10 invoice generator | Print invoice line items + grand total |
+
+#### Other rules
+
+| Field type | Decimals | Example | Note |
 |---|---|---|---|
-| Order total / grand total | 0 | `฿8,800` | `[B2B] Snippet 1:4048` `number_format($total_retail, 0)` |
-| Line item amount (subtotal × qty) | 2 | `฿8,800.00` | `[B2B] Snippet 1:4560` `number_format($total_amount, 2)` |
-| Line item with discount | 2 | `฿7,040.00` | Discount math precision required |
-| Unit price (catalog/dealer) | 0 if integer, 2 if fraction | `฿8,800` or `฿100.50` | Common sense |
-| Foreign currency (B2F land/sea shipping) | 2 always | `USD 35.00` / `CNY 5.50` | B2F multi-currency pattern |
-| Discount percent | Integer % | `-20%` | Never decimal % |
+| Foreign currency (B2F land/sea) | 2 always | `USD 35.00` / `CNY 5.50` | Multi-currency convention |
+| Discount percent | Integer % | `-20%` | Never decimal % (`-20.00%` wrong) |
+| Unit price (catalog) | 0 if integer, 2 if fraction | `฿8,800` or `฿100.50` | Auto-format by value |
+| Order subtotal row | 2 | `฿8,800.00 × 4 ชิ้น` | Line precision required for math audit |
 
-**Locale:** `Intl.NumberFormat('th-TH')` for thousand separators in customer-facing. Admin OK with `en-US`.
+**Locale**: `Intl.NumberFormat('th-TH')` for thousand separators in customer-facing JS. PHP `number_format()` uses default `,` separator (locale-agnostic).
+
+**Sprint 4A status**: No code changes needed — existing patterns conform to refined rule. Pattern is documented for future Phase 1.3 Flex builders + Sprint 5+ Phase 1 implementation.
 
 ---
 
