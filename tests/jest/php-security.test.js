@@ -77,8 +77,9 @@ const PHP_SECURITY_ALLOWLIST = new Set([
     // :984 → :989 → :999 → :1009 → :1046 across edits from commits 8784976..Round 51 —
     // re-pinned 2026-04-30 (Round 51 V.3.22 header insertion +37 lines for
     // batch 29 push toward 80% wrap of 5 b2f-audit cluster endpoints).
+    // re-pinned 2026-05-13 (Sprint 3E V.3.24 navy sweep +3 header lines).
     // Re-verify if line moves again.
-    "[Admin System] B2F Migration Audit:1065:RCE_SHELL",
+    "[Admin System] B2F Migration Audit:1068:RCE_SHELL",
 ]);
 
 /**

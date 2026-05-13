@@ -70,7 +70,8 @@ describe('Customer-facing UX Phase 8 Bundle A — 5 SHOULD-FIX closed', () => {
         // Version header marker
         expect(code).toMatch(/V\.31\.4[\s\S]{0,500}?S9/);
         // Green gradient hero with strong copy
-        expect(code).toMatch(/linear-gradient\(135deg,\s*#06C755[\s\S]{0,400}?ลงทะเบียนสินค้าชิ้นแรก/);
+        // V.31.6 Sprint 3C: migrated from #06C755 (LINE-native) → #16a34a (B2B canonical brand-green)
+        expect(code).toMatch(/linear-gradient\(135deg,\s*#16a34a[\s\S]{0,400}?ลงทะเบียนสินค้าชิ้นแรก/);
         // Benefit copy
         expect(code).toMatch(/รับประกันฟรี 1 ปี/);
         // 30-second micro-copy

@@ -53,6 +53,33 @@ Following the UX/Flex consistency audit 2026-05-13 (32 findings, score 5.5/10), 
 - Buddhist year (`+ 543`) in SN warranty Flex (`[Admin] SN Manager:11515`)
 - Mixed format in `dinoco_sn_format_thai_date($buddhist=true)` default
 
+#### Sprint 3F Status (2026-05-13) — DEPRECATION DOCUMENTED, ACTUAL FLIP DEFERRED TO SPRINT 4
+
+**6 live Buddhist year sites identified** (sites preserved as-is to avoid mid-sprint UX breaking change):
+
+| File:Line | Type | Currently shows | Boss visual review needed |
+|---|---|---|---|
+| `[System] Member Dashboard Main:178` | PHP helper default `$buddhist=true` | `13 พ.ค. 2569` (Thai month + Buddhist year) | Y — affects all asset cards |
+| `[System] DINOCO SN REST API:969` | PHP helper default `$buddhist=true` | API responses | Y |
+| `[Admin] DINOCO Warranty Lifecycle Notifier:217` | Inline `+ 543` in Flex date helper | Customer LINE Flex push | Y — customer-visible |
+| `[System] DINOCO Warranty Activation LIFF:1000` | JS date picker helper `var buddhist = year + 543` with `พ.ศ.` prefix | "✓ พ.ศ. 2569 — 13 พ.ค. 2569" preview | N (input UX, prefix is explicit) |
+| `[Admin] DINOCO Production SN Manager:11515` | Inline `+ 543` in S/N audit display | Admin S/N detail page | N (admin context) |
+| `[B2B] Snippet 17 Warranty Check LIFF:418` | JS Thai date format `getFullYear() + 543` | Customer warranty check result | Y — customer-visible |
+
+**Sprint 3F decision**: NEW code (Phase 1.3 Flex builders + future) MUST use `dinoco_format_date($ts, 'customer')` H5 helper (Gregorian). Existing 6 sites remain unchanged in Sprint 3 to avoid surprise visual breaking change. Sprint 4 reviews these with side-by-side mockups: keep พ.ศ. (Thai cultural norm) vs migrate to Gregorian (strict B2B canonical). Boss decides per-site.
+
+**H5 helper guidance for new code**:
+
+```php
+// Customer-facing Flex / web — Gregorian per B2B canonical
+$display = dinoco_format_date( $registered_at, 'customer' );  // → "13/05/2026"
+
+// If Thai month abbreviation needed (warranty Flex etc.), use legacy
+// dinoco_sn_format_thai_date($ts, false) explicitly passing false
+// — DO NOT use $buddhist=true (defaults to true is deprecated)
+$display = dinoco_sn_format_thai_date( $registered_at, false );  // → "13 พ.ค. 2026"
+```
+
 ### D4 — Canonical Currency Decimal Rule
 
 **Implicit B2B rule, now explicit:**
