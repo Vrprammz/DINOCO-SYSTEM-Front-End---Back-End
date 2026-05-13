@@ -2,6 +2,14 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.35.2 (2026-05-13) — Round 53 Idempotency-Key wrapper on 4 retry-prone LINE notification POSTs:
+ *   - /invoice/send-reminder (admin "ส่งเตือน" double-click → 2× Flex + audit row)
+ *   - /invoice/send-overdue-notice (admin "ส่งแจ้งค้างชำระ" — escalated dunning)
+ *   - /invoice/resend-line (admin "ส่งใหม่" on stuck LINE delivery — 2× GD render + 2× quota)
+ *   - /invoice/send-summary (admin "ส่งสรุปบิลค้าง" — layered over 60s transient rate limit)
+ *   All single shape {id|dist_id, actor_user_id}. Different invoice/distributor mid-retry → 409.
+ *   resend-line caches only on success (failed pushes should be retryable).
+ *   Idempotency campaign progress: 149 → 153 / 196 = 78.1% (+4 toward 80% milestone).
  * Version: V.35.1 (2026-05-07) — Phase 2 W7 audit touch-up:
  *   • dinoco_inv_check_sn_required_items() — defensive column check now validates ALL
  *     3 columns (sn_attach_level + sn_required + sn_qty_per_unit). If any missing →
@@ -1220,6 +1228,31 @@ function dinoco_inv_cron_overdue() {
 function dinoco_inv_rest_send_reminder(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
+
+    // R53 Idempotency-Key wrapper (single shape) — admin "ส่งเตือน" double-click on slow
+    // b2b_build_flex_dunning_summary + LINE push burns quota + dunning audit row spam.
+    // Body hash = {id, actor_user_id} — same admin retry within TTL = cached 200 instant.
+    // Different invoice mid-retry → 409 catches admin clicked wrong row.
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/send-reminder';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array('id' => $id, 'actor_user_id' => get_current_user_id());
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     $due     = get_field('due_date', $id);
     $total   = floatval(get_field('total_amount', $id));
     $paid    = floatval(get_post_meta($id, '_inv_paid_amount', true));
@@ -1248,13 +1281,42 @@ function dinoco_inv_rest_send_reminder(WP_REST_Request $req) {
     // Reset flags so cron can re-send later if still unpaid
     delete_post_meta($id, '_dunning_reminder_3day_sent');
     b2b_add_audit_log($id, 'dunning_manual', 'Admin ส่งเตือนชำระเงินด้วยตนเอง');
-    return rest_ensure_response(['success' => true, 'message' => 'ส่งเตือนผ่าน LINE แล้ว']);
+
+    $resp = ['success' => true, 'message' => 'ส่งเตือนผ่าน LINE แล้ว'];
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, $resp, 200);
+    }
+    return rest_ensure_response($resp);
 }
 
 // REST: Manual send overdue notice — V.33.5: ใช้ b2b_build_flex_dunning_summary
 function dinoco_inv_rest_send_overdue_notice(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
+
+    // R53 Idempotency-Key wrapper (single shape) — same risk profile as send-reminder
+    // but more sensitive (escalated dunning). Admin double-click → 2× Flex push + 2×
+    // audit row + 2× delete_post_meta. Body hash = {id, actor_user_id}.
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/send-overdue-notice';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array('id' => $id, 'actor_user_id' => get_current_user_id());
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     $due      = get_field('due_date', $id);
     $total    = floatval(get_field('total_amount', $id));
     $paid     = floatval(get_post_meta($id, '_inv_paid_amount', true));
@@ -1288,7 +1350,12 @@ function dinoco_inv_rest_send_overdue_notice(WP_REST_Request $req) {
     delete_post_meta($id, '_overdue_notice_sent_day1');
     delete_post_meta($id, '_overdue_notice_sent_escalated');
     b2b_add_audit_log($id, 'dunning_overdue_manual', "Admin ส่งแจ้งเตือนค้างชำระ {$days_ov} วัน ด้วยตนเอง");
-    return rest_ensure_response(['success' => true, 'message' => "ส่งแจ้งเตือนค้างชำระผ่าน LINE แล้ว"]);
+
+    $resp = ['success' => true, 'message' => "ส่งแจ้งเตือนค้างชำระผ่าน LINE แล้ว"];
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, $resp, 200);
+    }
+    return rest_ensure_response($resp);
 }
 
 // --- Helpers for REST ---
@@ -3027,6 +3094,31 @@ function dinoco_inv_rest_cancel(WP_REST_Request $req) {
 function dinoco_inv_rest_resend_line(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'ไม่พบใบแจ้งหนี้', ['status' => 404]);
+
+    // R53 Idempotency-Key wrapper (single shape) — admin "ส่งใหม่" on stuck/failed LINE
+    // delivery is high retry. Without wrapper: 2× Flex + 2× invoice image GD render +
+    // 2× LINE quota burn + 2× audit row. Body hash = {id, actor_user_id}.
+    // Different invoice mid-retry → 409 catches admin clicked wrong "ส่งใหม่" button.
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/resend-line';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array('id' => $id, 'actor_user_id' => get_current_user_id());
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     $dist_id  = intval(get_post_meta($id, '_dist_post_id', true));
     $line_gid = $dist_id ? get_field('line_group_id', $dist_id) : '';
     if (!$line_gid) return new WP_Error('no_line', 'ตัวแทนไม่มี LINE Group ID', ['status' => 400]);
@@ -3057,7 +3149,13 @@ function dinoco_inv_rest_resend_line(WP_REST_Request $req) {
         }
     }
     b2b_add_audit_log($id, 'resend_line', 'ส่ง LINE Flex Card ซ้ำ โดย ' . wp_get_current_user()->user_login);
-    return rest_ensure_response(['success' => $sent_ok, 'message' => $sent_ok ? 'ส่ง LINE สำเร็จ' : 'ส่ง LINE ล้มเหลว (HTTP ' . $sent_code . ')']);
+
+    $resp = ['success' => $sent_ok, 'message' => $sent_ok ? 'ส่ง LINE สำเร็จ' : 'ส่ง LINE ล้มเหลว (HTTP ' . $sent_code . ')'];
+    // R53: store only on success — failed pushes shouldn't be cached (admin should be able to retry)
+    if ($sent_ok && $idem_key !== '' && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, $resp, 200);
+    }
+    return rest_ensure_response($resp);
 }
 
 // --- PENDING SUMMARY: Preview (GET) ---
@@ -3097,6 +3195,31 @@ function dinoco_inv_rest_send_summary(WP_REST_Request $req) {
     $dist_id = intval($req->get_param('dist_id'));
     if ($dist_id <= 0) return new WP_Error('missing', 'กรุณาระบุรหัสตัวแทนจำหน่าย', ['status' => 400]);
 
+    // R53 Idempotency-Key wrapper (single shape) — admin "ส่งสรุปบิลค้าง" double-click.
+    // Layered defense over existing 60s transient rate limit: rate-limit blocks but
+    // returns 429 (failure UX). Cached replay returns 200 with cached "success" message
+    // (smooth UX). Body hash = {dist_id, actor_user_id}. Different distributor mid-retry
+    // → 409 catches admin clicked wrong row.
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/send-summary';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array('dist_id' => $dist_id, 'actor_user_id' => get_current_user_id());
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     // Rate limit: 60s per distributor
     $lock = 'inv_summary_lock_' . $dist_id;
     if (get_transient($lock)) return new WP_Error('rate_limited', 'กรุณารอ 60 วินาทีก่อนส่งอีกครั้ง', ['status' => 429]);
@@ -3124,13 +3247,17 @@ function dinoco_inv_rest_send_summary(WP_REST_Request $req) {
     $msg = $data['count'] > 0
         ? 'ส่งสรุป ' . $data['count'] . ' บิล ฿' . number_format($data['total'], 0) . ' แล้ว'
         : 'ส่งอัพเดทยอดบัญชี (ไม่มีค้าง) แล้ว';
-    return rest_ensure_response([
+    $resp = [
         'success'   => true,
         'dist_name' => $data['dist_name'],
         'count'     => $data['count'],
         'total'     => $data['total'],
         'message'   => $msg,
-    ]);
+    ];
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, $resp, 200);
+    }
+    return rest_ensure_response($resp);
 }
 
 // --- DISTRIBUTOR DETAIL (V.32.0) ---
