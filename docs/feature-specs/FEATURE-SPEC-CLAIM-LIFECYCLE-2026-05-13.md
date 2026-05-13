@@ -1,9 +1,9 @@
 # Feature Spec: DINOCO Claim Lifecycle Notifications + Payment + Flash Shipping
 
-**Version:** V.2.2 (2026-05-13) — closes 5 BLOCKERs from tech-lead 14-specialist review
-**Previous:** V.2.1 (2026-05-13) — boss directive NO QR + separate claim bank, superseded by V.2.2 BLOCKER closures
-**Author:** Feature Architect + Tech-Lead synthesis
-**Status:** Draft — pending Phase 0 DB_ID provisioning (15 min boss work) + 9 Open Questions
+**Version:** V.2.3 (2026-05-13) — V.2.2 false-positive correction + 3 NEW claim DB_IDs assigned
+**Previous:** V.2.2 (2026-05-13) — claimed 5 BLOCKERs, but B-1 + B-2 were FALSE POSITIVES (tech-lead agent + author both read repo file headers without verifying against WP sync dashboard)
+**Author:** Feature Architect
+**Status:** Draft — Phase 1 UNBLOCKED. All 7 DB_IDs assigned (5 prereqs + 3 NEW claim snippets). 3 legitimate BLOCKERs remain closed (B-3/B-4/B-5).
 **Related:**
 - `[System] DINOCO Claim System` V.31.0 (DB_ID 16) — entry point + claim_ticket CPT writer
 - `[Admin System] DINOCO Service Center & Claims` V.31.6 (DB_ID 27) — owner of `dinoco_set_claim_status()` + `dinoco/claim/state_changed` action
@@ -26,7 +26,8 @@
 | V.1.0 | 2026-05-13 | Feature Architect | Initial draft; 10 sections; ~570 lines; surfaced 3 BLOCKERs in tech-lead review (helper name drift, walk-in bank context, Phase 1 dep lock) |
 | V.2.0 | 2026-05-13 | Feature Architect | Boss-mandated "ไม่มีจุดตาย / หน้าตาย / ปุ่มตาย"; closes 3 BLOCKERs + 4 HIDDEN RISKS + 4 SHOULD-FIXes; adds 9 new sections A-I (Journey, Button Matrix, Page States, Concurrency, Edge Cascades, FSM, Crons, REST flow, Error Catalog); Phase 1 effort 40h → 52h |
 | V.2.1 | 2026-05-13 | Feature Architect | Boss directive 2026-05-13: (1) ไม่ใช้ PromptPay QR — replaced with bank-transfer + Slip2Go verify (B2B-style). (2) ออกแบบให้แก้เลขบัญชี — claim bank MUST be different account from B2B. NEW §6.4 Claim Bank Configuration: 3-tier resolver (wp_options → constants → sentinel), `[dinoco_claim_bank_settings]` admin UI shortcode, validation rules, audit trail, immutability of existing pending charges, REST endpoints (3). Helper `dinoco_claim_bank_resolve($use_walkin)`. Phase 1 effort 52h → 64h (+12h bank settings work). Schema: dropped `qr_payload` + `qr_image_base64` columns, added `bank_branch`. Open Questions: now 9 (NEW Q9 = walkin bank — same or separate?). |
-| **V.2.2** | **2026-05-13** | **Tech-Lead synthesis** | **Closes 5 BLOCKERs from tech-lead 14-specialist deep review (commits `d366ab1`+`ff0581b` audit). B-1: fictitious "DB_ID 1187 wp_dinoco_audit_log" replaced with verified Flag Audit Log DB_ID 1203 dual-channel logging (no new table). B-2: §6.7 prerequisites table with REAL DB_ID status — verified 4 of 5 prereqs still `DB_ID: (pending)` (Idempotency Helper, Modal Helpers, Flag Audit Log, Observability). NEW Phase 0 mandatory provisioning step (~15 min boss work in WP admin) BEFORE Phase 1 starts. B-3: 16-callsite reference table for `b2b_get_bank_info()` (verified by grep — tech-lead said 14, actual is 16 across 7 source files). PHPUnit `BankInfoSignaturePinTest` + Jest `b2b-get-bank-info-callsites.test.js` drift detector added to Phase 2.3 (effort 4h → 8h). B-4: explicit handler pseudocode for charge-create snapshot + race test contract `ClaimBankImmutabilityRaceTest` added to Phase 2.8 (effort 6h → 8h). B-5: NEW §6.4.1 strict bank_code mismatch contract — full PHP pseudocode for `dinoco_verify_slip_for_claim()` with fail-fast bank-code check, dedicated `slip_bank_mismatch` error code with Thai message + Telegram alert + dedup, integration with H-6 `bank_context` discriminator for replay defense, 5-scenario PHPUnit test contract. Phase 2 effort 78h → 83h. Total project 228h → 233h.** |
+| V.2.2 | 2026-05-13 | Tech-Lead synthesis (SUPERSEDED by V.2.3) | Claimed 5 BLOCKERs closed from tech-lead 14-specialist review. **B-1 + B-2 turned out to be FALSE POSITIVES** — tech-lead agent + author both read repo file headers (`DB_ID: (pending — populate after first WP Code Snippets sync)` placeholder text) WITHOUT verifying against WP sync dashboard. Boss provided 89-snippet sync dashboard snapshot on 2026-05-13 showing ALL 5 prerequisites already provisioned (1180/1181/1187/1193/1194) + status "Same" (sync'd cleanly for weeks). V.2.3 reverts B-1 (Audit Log DB_ID 1187 IS real, no Flag Audit Log redirect needed) + B-2 (no Phase 0 task needed, all DB_IDs exist). B-3/B-4/B-5 fixes retained (legitimate). |
+| **V.2.3** | **2026-05-13** | **Feature Architect** | **(1) FALSE-POSITIVE CORRECTION: revert B-1 + B-2 from V.2.2 — verified via WP sync dashboard that 5 prerequisite snippets ALL have DB_IDs assigned (Observability=1180, Modal Helpers=1181, Audit Log=1187, Flag Audit Log=1193, Idempotency Helper=1194). Boss expressed frustration — quote: "assign DB_ID ทำไม ก็เคยบอกไปหมดแล้ว". (2) NEW DB_ID PROVISIONING: Boss created 3 NEW claim snippets in WP admin 2026-05-13 with DB_IDs 1211/1212/1213 (status "Pending" = stub awaits source). (3) UPDATED §6.6 with assigned DB_IDs replacing "**PENDING**". (4) UPDATED 5 prerequisite snippet file headers (1180/1181/1187/1193/1194) replacing `(pending — populate after first WP Code Snippets sync)` placeholder with verified IDs + sync dashboard verification date. (5) REVERTED §6.4 audit trail to use `[Admin System] DINOCO Audit Log` (DB_ID 1187) as PRIMARY channel — original V.2.1 design was correct. Flag Audit Log V.2.2 dual-channel mirror retained as defense-in-depth for wp_options-level changes. (6) REMOVED Phase 0 task from §6.7 — no provisioning step needed; Phase 1 starts immediately. (7) RETAINED B-3 PHPUnit `BankInfoSignaturePinTest` (16 callsites) + B-4 immutability race test + B-5 §6.4.1 strict bank_code mismatch contract — all legitimate. Phase 2 effort stays at 83h. Total project remains 233h (effort unchanged from V.2.2). MEMORY UPDATE: `feedback_check_sync_dashboard_source_of_truth.md` added to prevent future false-positive tech-lead reviews based solely on repo file inspection.** |
 
 ---
 
@@ -533,36 +534,50 @@ PHPUnit test: `ClaimFlashWebhookRaceTest::test_terminal_state_silently_skipped()
 - `bank_name` required, max 64 chars
 - `bank_logo_url` optional, must be `https://` (no http) + image MIME validate via HEAD request (10s timeout)
 
-#### Audit Trail (V.2.2 B-1 FIX — uses Flag Audit Log, not generic audit_log)
+#### Audit Trail (V.2.3 — REVERTED V.2.2 B-1 false positive; dual-channel logging)
 
-Every save → dual-channel logging:
+V.2.2 incorrectly redirected audit writes from `[Admin System] DINOCO Audit Log` (which it called "fictitious DB_ID 1187") to Flag Audit Log only. Boss sync dashboard 2026-05-13 verified: **Audit Log V.1.0 IS real at DB_ID 1187** (provisioned 2026-04-24, status "Same" for weeks). V.2.3 reverts to dual-channel design that uses both:
 
-1. **Primary**: `dinoco_flag_audit_log($flag, $old, $new, $reason, $source)` from `[Admin System] DINOCO Flag Audit Log` (DB_ID **1203 ✓ provisioned**). Bank settings = 7 wp_options × 2 banks = up to 14 flag changes per save. Listener auto-deduplicates same-request writes per Round 50+ pattern. Whitelist filter `dinoco_flag_audit_tracked_flags` extended (in Phase 1.9) with: `dinoco_claim_bank_*` (all 7 keys × 2 = 14 entries).
+**Channel 1 — Primary forensic trail**: `dinoco_audit_log_write($scope, $event, $context_array)` from `[Admin System] DINOCO Audit Log` (DB_ID **1187 ✓ provisioned**). Writes one full audit row per `claim_bank_settings_changed` event with complete diff snapshot, actor, IP, UA, request_id.
 
-2. **Reason**: V.2.1 spec referenced a fictitious `wp_dinoco_audit_log` table @ "DB_ID 1187" — verified non-existent. Tech-lead 14-specialist review (2026-05-13) caught this as BLOCKER B-1. Flag Audit Log is the canonical DINOCO audit channel for wp_options state changes (already used by V.42 Flash flag flips, B2F migration audit, etc.). NO new audit table needed.
+**Channel 2 — Flag-level mirror (defense-in-depth)**: `dinoco_flag_audit_log($flag, $old, $new, $reason, $source)` from `[Admin System] DINOCO Flag Audit Log` (DB_ID **1193 ✓ provisioned**). Mirrors wp_options state transitions for the existing Flag Audit Viewer admin UI. Bank settings save = 7-14 flag-key writes per save (Round 50+ dedup applies).
 
 ```php
 // Inside [dinoco_claim_bank_settings] save handler:
+
+// Channel 1 — primary forensic row (single row, full diff)
+if (function_exists('dinoco_audit_log_write')) {
+    dinoco_audit_log_write(
+        'claim_bank',                      // scope
+        'claim_bank_settings_changed',     // event
+        [
+            'diff'    => $changed_fields,  // before/after for each key
+            'actor'   => get_current_user_id(),
+            'source'  => 'claim_bank_settings_admin_ui',
+        ]
+    );
+} else {
+    error_log('[ClaimBank] dinoco_audit_log_write unavailable — skipped primary audit row');
+}
+
+// Channel 2 — Flag Audit Log mirror (per-key, drives Flag Audit Viewer UI)
 foreach ($changed_fields as $key => $diff) {
-    // $key e.g. 'dinoco_claim_bank_account' / 'dinoco_claim_walkin_bank_account'
-    // $diff e.g. ['before' => '123-4-56789-0', 'after' => '987-6-54321-0']
     if (function_exists('dinoco_flag_audit_log')) {
         dinoco_flag_audit_log(
-            $key,                                    // flag name (whitelist-allowed)
-            $diff['before'],                         // old value
-            $diff['after'],                          // new value
-            'claim_bank_settings_save',              // reason
-            'claim_bank_settings_admin_ui'           // source
+            $key,                                // 'dinoco_claim_bank_account' etc.
+            $diff['before'],
+            $diff['after'],
+            'claim_bank_settings_save',
+            'claim_bank_settings_admin_ui'
         );
-    } else {
-        // Defensive: snippet not synced yet → no-op + error_log
-        error_log("[ClaimBank] flag_audit_log unavailable — skipped audit row for {$key}");
     }
 }
 ```
 
-→ Admin queries via existing Flag Audit Log viewer `[dinoco_flag_audit_viewer]` (filter `flag=dinoco_claim_bank_*`).
-→ Retention auto-handled by Flag Audit Log retention cron (90-day default, 30-365 configurable).
+→ Admin queries via existing Audit Log viewer (Channel 1, primary forensic) OR Flag Audit Viewer `[dinoco_flag_audit_viewer]` filter `flag=dinoco_claim_bank_*` (Channel 2, wp_options-centric).
+→ Retention: Channel 1 uses Audit Log retention cron; Channel 2 uses Flag Audit Log retention cron (90-day default).
+
+**Why dual-channel**: Channel 1 captures the SAVE EVENT as one row (good for "show me every claim bank settings change in order" forensic queries). Channel 2 captures per-key transitions (good for "show me history of dinoco_claim_bank_account field specifically" queries). Both whitelisted in Phase 1.9 via existing filters — zero new infrastructure.
 
 #### Immutability of Existing Charges (V.2.2 B-4 FIX — explicit handler contract + race test)
 
@@ -921,36 +936,36 @@ test('no callsite passes claim context without coordinating PHPUnit update', () 
 });
 ```
 
-### 6.6 Files to Create (NEW snippets)
+### 6.6 Files to Create (NEW snippets — V.2.3 DB_IDs assigned 2026-05-13)
 
 | File | DB_ID | Purpose | Estimated LOC |
 |---|---|---|---|
-| `[Admin System] DINOCO Claim Lifecycle Notifier` | **PENDING** | Listen `dinoco/claim/state_changed` + dispatch Flex + own Sub-Feature A logic | ~900 LOC |
-| `[System] DINOCO Claim Payment LIFF` | **PENDING** | Customer-facing shortcode `[dinoco_claim_pay]` + REST `/charge/*` + bank transfer instructions display + `dinoco_verify_slip_for_claim` (Slip2Go) | ~950 LOC (V.2.1 reduced — no QR generator) |
-| `[Admin System] DINOCO Claim Flash Dispatcher` | **PENDING** | REST `/flash-create` + `/flash-cancel` + RPi enqueue + `dinoco_claim_create_flash_shipment` internal helper | ~800 LOC |
+| `[Admin System] DINOCO Claim Lifecycle Notifier` | **1211** ✓ (Pending source) | Listen `dinoco/claim/state_changed` + dispatch Flex + own Sub-Feature A logic | ~900 LOC |
+| `[System] DINOCO Claim Payment LIFF` | **1212** ✓ (Pending source) | Customer-facing shortcode `[dinoco_claim_pay]` + REST `/charge/*` + bank transfer instructions display + `dinoco_verify_slip_for_claim` (Slip2Go) | ~950 LOC (V.2.1 reduced — no QR generator) |
+| `[Admin System] DINOCO Claim Flash Dispatcher` | **1213** ✓ (Pending source) | REST `/flash-create` + `/flash-cancel` + RPi enqueue + `dinoco_claim_create_flash_shipment` internal helper | ~800 LOC |
 
-### 6.7 Prerequisites (V.2.2 B-2 FIX — verified ground truth, not assumed status)
+**Status legend**: "Pending source" = WP DB row exists with DB_ID, but source file in repo missing → Sync Engine status shows "Pending" until V.2.3 stub commit is pushed (this commit creates 3 PHP files matching DB_IDs).
 
-**Code-level prerequisites (snippet files exist in repo)** — but provisioning status varies:
+### 6.7 Prerequisites (V.2.3 — verified via WP sync dashboard 2026-05-13, NO Phase 0 needed)
 
-| Snippet | File version | DB_ID status (verified 2026-05-13) | Action needed |
+**All prerequisites already provisioned** — boss confirmed via 89-snippet sync dashboard snapshot. File header `(pending — populate after first WP Code Snippets sync)` placeholder text was outdated; actual WP DB has DB_IDs assigned and sync status "Same" for weeks. V.2.3 updates the 5 prerequisite file headers in repo to reflect verified DB_IDs.
+
+| Snippet | File version | DB_ID (verified WP sync dashboard 2026-05-13) | Sync status |
 |---|---|---|---|
-| Idempotency Helper | V.1.4 | 🔴 **(pending)** — header line 4 | Boss provisions in Phase 0 |
-| Modal Helpers | V.1.1 | 🔴 **(pending)** — header line 4 | Boss provisions in Phase 0 |
-| Flag Audit Log | V.1.0 | 🔴 **(pending)** — header line 4 | Boss provisions in Phase 0 |
-| Observability | V.1.1 | 🔴 **(pending)** — header line 4 | Boss provisions in Phase 0 |
-| LINE Push Governance | V.1.6 | 🟢 **1203 ✓ provisioned** (2026-05-09) | Already done |
+| Idempotency Helper | V.1.4 | **1194 ✓** (assigned 2026-05-08) | Same |
+| Modal Helpers | V.1.2 | **1181 ✓** | Same |
+| Flag Audit Log | V.1.2 | **1193 ✓** (assigned 2026-04-30) | Same |
+| Observability | V.1.1 | **1180 ✓** | Same |
+| Audit Log | V.1.0 | **1187 ✓** (assigned 2026-04-24) | Same |
+| LINE Push Governance | V.1.6 | **1203 ✓** (assigned 2026-05-09) | Same |
 
-**Why this matters**: Spec V.2.1 listed all 5 as "✓" but tech-lead 14-specialist review verified that 4 of 5 still read `DB_ID: (pending — populate after first WP Code Snippets sync)`. The GitHub Webhook Sync Engine (`dinoco_extract_db_id()`) uses DB_ID as PRIMARY matching key — without it, sync falls back to fragile filename matching. **Any deploy attempt today would fail or silently drift.**
+**3 NEW claim snippets** (assigned by boss 2026-05-13):
 
-**Phase 0 = MANDATORY DB_ID provisioning (15 min boss work in WP admin)**:
-
-| # | Task | Owner | Effort | Blocks |
-|---|---|---|---|---|
-| 0.1 | Boss opens WP admin → Code Snippets → creates 4 stub snippets (empty title + bracket-prefixed name matching the repo files exactly) | Boss | 8 min | Phase 1 entirely |
-| 0.2 | Boss copies new DB_IDs (4 integers) into corresponding `DB_ID: (pending...)` header lines, replacing the placeholder | Boss | 4 min | 1.2-1.9 |
-| 0.3 | Boss provisions 3 ADDITIONAL stubs for the NEW claim snippets (Lifecycle Notifier / Payment LIFF / Flash Dispatcher) — placeholder content OK; just needs the DB_ID | Boss | 3 min | 1.2 |
-| 0.4 | Git pull → verify all 7 DB_IDs synced into headers → spec §6.7 table re-runs verification grep | fullstack-developer | 5 min | 1.2 |
+| Snippet | DB_ID | Sync status |
+|---|---|---|
+| `[Admin System] DINOCO Claim Lifecycle Notifier` | **1211** | Pending (awaits source file in repo — Phase 1.2 task) |
+| `[System] DINOCO Claim Payment LIFF` | **1212** | Pending (awaits source — Phase 2.2 task) |
+| `[Admin System] DINOCO Claim Flash Dispatcher` | **1213** | Pending (awaits source — Phase 3.1 task) |
 
 **Other prerequisites (no provisioning needed)**:
 
@@ -960,17 +975,20 @@ test('no callsite passes claim context without coordinating PHPUnit update', () 
 - `B2B_FLASH_MCH_ID`, `B2B_FLASH_SECRET_KEY`, `B2B_FLASH_API_URL` defined (in use today — ✓)
 - **DINOCO_CLAIM_BANK_* constants OR wp_options seeded** — boss configures claim bank via admin UI `[dinoco_claim_bank_settings]` (V.2.1 NEW — see §6.4). MUST be different account from `B2B_BANK_*` (boss directive 2026-05-13). Graceful fallback to placeholder text if absent — see §6.4 Tier 3.
 
-**Verification command** (re-run before Phase 1 kick-off):
+**V.2.3 verification command** (verifies repo headers match assigned DB_IDs):
 
 ```bash
 for f in "[Admin System] DINOCO Idempotency Helper" "[Admin System] DINOCO Modal Helpers" \
          "[Admin System] DINOCO Flag Audit Log" "[Admin System] DINOCO Observability" \
-         "[Admin System] DINOCO LINE Push Governance"; do
+         "[Admin System] DINOCO Audit Log" "[Admin System] DINOCO LINE Push Governance"; do
   printf "%-50s " "$f"
   grep -m 1 "DB_ID" "$f" | tr -d '\n'; echo
 done
-# Expected: all 5 lines end with concrete integer DB_ID, zero "(pending)" strings remaining
+# Expected after V.2.3 commit: lines show 1194 / 1181 / 1193 / 1180 / 1187 / 1203
+# (V.2.3 updates all 5 prerequisites that previously read "(pending)" — LINE Push Governance was already correct)
 ```
+
+**Phase 0 task removed in V.2.3** — V.2.2 falsely required boss to provision 4 DB_IDs in WP admin; sync dashboard verification proved they were already provisioned. **Phase 1 starts immediately with no blocking dependencies.**
 
 ### 6.8 Side Effects
 
@@ -1561,7 +1579,7 @@ Target: ~30 codes — currently 29. Add new codes here as discovered.
 
 ---
 
-## Spec Readiness Assessment (V.2.2)
+## Spec Readiness Assessment (V.2.3)
 
 | Criterion | Status |
 |---|---|
@@ -1569,11 +1587,12 @@ Target: ~30 codes — currently 29. Add new codes here as discovered.
 | **V.1.0** 4 HIDDEN RISKS (hook chain / idempotency-resend / walk-in claim / webhook-close race) | ✅ Resolved V.2.0 |
 | **V.1.0** 4 SHOULD-FIX (slip_ref_hash scope / Phase 1.3 effort / Modal drift / endpoint split) | ✅ Resolved V.2.0 |
 | **V.2.1 payment-rail revision** (NO PromptPay QR + separate claim bank + admin-editable) | ✅ Resolved V.2.1 — §6.4 NEW 3-tier resolver + admin UI shortcode + audit trail + immutability gate + REST endpoints + migration plan |
-| **V.2.2 BLOCKER B-1** Audit Log DB_ID drift (fictitious DB_ID 1187) | ✅ Resolved V.2.2 — uses Flag Audit Log (verified DB_ID 1203) instead; no new table needed |
-| **V.2.2 BLOCKER B-2** 4 of 5 prerequisite snippets have `DB_ID: (pending)` | ✅ Resolved V.2.2 — §6.7 verified table + NEW Phase 0 mandatory 15-min boss provisioning task |
-| **V.2.2 BLOCKER B-3** `b2b_get_bank_info()` 16 callsites unverified backward-compat | ✅ Resolved V.2.2 — §6.5 callsite reference table + `BankInfoSignaturePinTest` PHPUnit (16 assertions) + Jest `b2b-get-bank-info-callsites.test.js` drift detector |
-| **V.2.2 BLOCKER B-4** Bank settings immutability mechanism unspecified | ✅ Resolved V.2.2 — §6.4 explicit handler pseudocode (GET_LOCK + START TRANSACTION + snapshot writes 7 bank columns at INSERT) + `ClaimBankImmutabilityRaceTest` PHPUnit |
-| **V.2.2 BLOCKER B-5** `dinoco_verify_slip_for_claim()` no bank_code mismatch contract | ✅ Resolved V.2.2 — NEW §6.4.1 full PHP pseudocode + fail-fast contract + dedicated `slip_bank_mismatch` error code + Thai customer message + Telegram alert + dedup + H-6 bank_context discriminator integration + 5-scenario PHPUnit test |
+| ~~V.2.2 BLOCKER B-1~~ Audit Log DB_ID drift | ❌ **FALSE POSITIVE** — DB_ID 1187 IS real (verified WP sync dashboard 2026-05-13). V.2.3 reverts to original V.2.1 audit design + Flag Audit Log defense-in-depth mirror retained |
+| ~~V.2.2 BLOCKER B-2~~ 4 prereqs allegedly "(pending)" | ❌ **FALSE POSITIVE** — all 5 prereqs (1180/1181/1187/1193/1194) provisioned for weeks. V.2.3 updates repo file headers to reflect real DB_IDs |
+| **V.2.2 BLOCKER B-3** `b2b_get_bank_info()` 16 callsites unverified backward-compat | ✅ LEGITIMATE — retained — §6.5 callsite reference table + `BankInfoSignaturePinTest` PHPUnit (16 assertions) + Jest `b2b-get-bank-info-callsites.test.js` drift detector |
+| **V.2.2 BLOCKER B-4** Bank settings immutability mechanism unspecified | ✅ LEGITIMATE — retained — §6.4 explicit handler pseudocode (GET_LOCK + START TRANSACTION + snapshot writes 7 bank columns at INSERT) + `ClaimBankImmutabilityRaceTest` PHPUnit |
+| **V.2.2 BLOCKER B-5** `dinoco_verify_slip_for_claim()` no bank_code mismatch contract | ✅ LEGITIMATE — retained — §6.4.1 full PHP pseudocode + fail-fast contract + dedicated `slip_bank_mismatch` error code + Thai customer message + Telegram alert + dedup + H-6 bank_context discriminator integration + 5-scenario PHPUnit test |
+| **V.2.3 NEW** 3 claim snippet DB_IDs assigned | ✅ 1211 (Notifier) / 1212 (Payment LIFF) / 1213 (Flash Dispatcher) — boss provisioned 2026-05-13 |
 | User journey "no dead ends" | ✅ Section A covers 11 steps + 8 charge sub-steps + recovery matrix |
 | "No dead buttons" | ✅ Section B button matrix covers all 16 buttons |
 | "No dead pages" | ✅ Section C page state matrix covers 5 surfaces |
@@ -1584,20 +1603,20 @@ Target: ~30 codes — currently 29. Add new codes here as discovered.
 | REST pipeline pattern | ✅ Section H — uniform skeleton |
 | Error catalog | ✅ Section I — 29 codes Thai messages (V.2.2 adds 6 new slip-error codes via §6.4.1) |
 
-**Phase 1 effort revised V.2.1 → V.2.2:** 64h unchanged (B-1/B-2 require boss work + spec patches, no Phase 1 dev increment). **Phase 2 effort revised:** 78h → 83h (+5h: B-3 PHPUnit/Jest +4h, B-4 race test +2h, minor offsets).
+**Effort (V.2.3 unchanged from V.2.2):** Phase 1 = 64h, Phase 2 = 83h, Phase 3 = 64h, Phase 4 = 22h. **Total = 233h** (~5.8 weeks). Phase 0 task REMOVED — V.2.3 no longer requires DB_ID provisioning step.
 
-**Total effort vs V.1.0:** 40h → 233h (V.2.0 175h → V.2.1 228h → V.2.2 233h). Sprawl driven by zero-dead-end mandate (V.2.0 +35h) and payment-rail revision (V.2.1 +8h) and BLOCKER closures (V.2.2 +5h).
-
-**Overall verdict:** Spec is **READY for Phase 0 (DB_ID provisioning) immediately**. Phase 1 implementation unblocked after Phase 0 completes.
+**Overall verdict:** Spec is **READY for Phase 1 W1 implementation IMMEDIATELY** — no Phase 0 dependency. 3 NEW claim snippet stubs in repo will satisfy Sync Engine source-match requirement (status will flip from "Pending" → "Same" on next git push).
 
 **11 remaining HIGH findings from tech-lead review** (H-1..H-11) — closeable during Phase 1 internal work (mostly Phase 1.3 Flex builder hardening + Phase 1.9 admin UI security). Tracked but not blockers.
 
 **18 MEDIUM + 13 LOW findings** — distributed across Phase 2-4 + polish backlog.
 
-**Action sequence for boss (post V.2.2 commit)**:
+**Action sequence for boss (post V.2.3 commit)**:
 
-1. **(15 min)** Open WP admin → Code Snippets → create 7 stub snippets total (4 prerequisites + 3 NEW claim) → push DB_IDs back into headers → git pull → unblocks Phase 1 entirely
-2. **(5 min)** Answer Q-NEW-5 (walk-in bank — Option A single bank + optional checkbox recommended)
-3. **(decision)** Schedule Phase 1 W1 — fullstack-developer Lifecycle Notifier + Flex builders (parallel work feasible)
+1. **(decision)** Answer Q-NEW-5 (walk-in bank — Option A single bank + optional checkbox recommended)
+2. **(decision)** Schedule Phase 1 W1 — fullstack-developer Lifecycle Notifier (DB_ID 1211) + Flex builders (Snippet 1 V.34.32 → V.34.33) parallel work
+3. **(no provisioning needed)** All 8 DB_IDs already assigned (5 prereqs + 3 NEW claim)
 
-No outstanding architectural risks. All cross-agent handoffs identified. V.2.2 is the **first version where Phase 0 can start without dependency drift**.
+**Lesson recorded for future reviews** (`feedback_check_sync_dashboard_source_of_truth.md`): When tech-lead or any specialist agent claims a snippet has `DB_ID: (pending)`, **ALWAYS cross-reference with WP sync dashboard** before treating as BLOCKER. Repo file headers are documentation drift; WP DB is source of truth.
+
+No outstanding architectural risks. All cross-agent handoffs identified. **V.2.3 is the first version where Phase 1 can start without ANY blocking dependencies.**
