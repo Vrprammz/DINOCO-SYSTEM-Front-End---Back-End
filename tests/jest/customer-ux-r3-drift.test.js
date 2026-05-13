@@ -78,16 +78,18 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         expect(code).toMatch(/<\?php if \(\s*\$has_legacy_warranty\s*\)\s*:\s*\?>[\s\S]{0,500}?royal-upgrade-btn[\s\S]{0,500}?<\?php endif;\s*\?>/);
     });
 
-    test('C4 — Duplicate "เคลม" button removed (keep /claim internal only)', () => {
+    test('C4 — Duplicate "เคลม" button removed; canonical URL is /claim-system/ (V.31.7 bug fix)', () => {
         const code = read('header');
-        // Old external claim-system/ URL removed from code (allowed in comments only)
+        // V.31.7 (2026-05-13): URL corrected /claim → /claim-system/ (the /claim slug
+        // did not exist in WP page registry → 404. Canonical page wraps
+        // [dinoco_claim_page] shortcode from DB_ID 16 at slug `claim-system`).
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '');
-        // External URL should NOT appear in active button code
-        expect(stripped).not.toMatch(/window\.location\.href='https:\/\/www\.dinoco\.in\.th\/claim-system\/'/);
-        // Single internal /claim button (btn-claim-page class still exists)
-        expect(code).toMatch(/btn-claim-page[\s\S]{0,150}?window\.location\.href='\/claim'/);
+        // Single internal /claim-system/ button (btn-claim-page class still exists)
+        expect(code).toMatch(/btn-claim-page[\s\S]{0,200}?window\.location\.href='\/claim-system\/'/);
+        // Buggy bare /claim slug MUST NOT appear in active button code (only in version comments)
+        expect(stripped).not.toMatch(/window\.location\.href='\/claim'/);
         // Layout still uses dnc-sn-action-grid-4 class but with 3 cells
         const grid = code.match(/<div class="action-grid dnc-sn-action-grid-4">[\s\S]{0,2000}?<\/div>/);
         expect(grid).not.toBeNull();
