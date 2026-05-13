@@ -55,7 +55,7 @@ LT-1..LT-4 tracked separately in `docs/sn-system/33-phase6-strategic-foundations
 
 | ID | Feature | Status | Effort | Blocker | Owner |
 | --- | --- | --- | --- | --- | --- |
-| **OP-3** | Bulk Admin Actions Wizard (bulk relink / void / export / notify) | ⏳ TODO | ~12h | None — spec in plan §K.4 | Tech Lead |
+| **OP-3** | Bulk Admin Actions Wizard (bulk relink / void / export / notify) | ✅ MVP LANDED 2026-05-13 (V.0.45) — 2/5 endpoints (`/bulk/void` + `/bulk/export`) | 5/12h | None — spec in plan §K.4 | Tech Lead |
 | **OP-4** | Plate Inventory Multi-Warehouse Transfer | 🟡 BUSINESS-BLOCKED | ~10h | Only relevant if DINOCO operates 2+ warehouses | บอส |
 
 ---

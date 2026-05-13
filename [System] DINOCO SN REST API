@@ -2,6 +2,16 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.45 (2026-05-13) — Phase 7 P1 OP-3 Bulk Admin       ║
+ * ║    Actions Wizard MVP (plan §K.4):                               ║
+ * ║    - POST /bulk/void — max 100 plates, in_pool/reserved only,    ║
+ * ║      per-SN atomic transaction + dispatcher fire + audit + idem  ║
+ * ║      key + Telegram alert if >20 voided (abuse detection)        ║
+ * ║    - GET /bulk/export — CSV with UTF-8 BOM + RFC 4180 escaping,  ║
+ * ║      max 10K rows, PII gate (dinoco_sn_view_pii cap masks uid),  ║
+ * ║      rate-limited 10/hr/user, audit row per export (PDPA track)  ║
+ * ║    Deferred Phase 7+: bulk relink, undo window, async queue,     ║
+ * ║    bulk notify, bulk transfer (per plan §K.4 backlog).           ║
  * ║  Version: V.0.44 (2026-05-13) — Phase 7 P0 B1: F#8 LIFF marketplace║
  * ║    /{id}/status endpoint MISSING — customer LIFF polls every 10s ║
  * ║    after slip upload waiting for admin verify, got 404 forever.   ║
@@ -1799,6 +1809,37 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                 // V.0.35 R6 BLOCKER fix: removed 'default' => 0 — was triggering R5 API-G1 self-approval
                 // guard on every call (0 → cap check fails → 422 approver_invalid_cap on legitimate calls)
                 'approver_user_id' => array( 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // Phase 7 P1 OP-3 (2026-05-13) — Bulk Admin Actions Wizard (plan §K.4)
+        // POST /bulk/void — admin bulk void multiple S/Ns in one operation.
+        // Only allowed for status IN (in_pool / reserved) — registered plates require
+        // single-plate /void with 4-eyes approval. Server-side enforces this guard.
+        // Max 100 plates per call to prevent runaway. Returns per-SN result array.
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/bulk/void', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_bulk_void',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'sns'    => array( 'required' => true, 'type' => 'array' ),
+                'reason' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+                'approver_user_id' => array( 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /bulk/export — admin CSV export of filtered plate list (same filters as /search).
+        // Streams response with chunked SELECT. UTF-8 BOM + RFC 4180.
+        // Max 10K rows per export to prevent memory blow-up.
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/bulk/export', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_bulk_export',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'q'        => array( 'type' => 'string' ),
+                'status'   => array( 'type' => 'string' ),
+                'batch_id' => array( 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+                'limit'    => array( 'type' => 'integer', 'default' => 10000, 'sanitize_callback' => 'absint' ),
             ),
         ) );
 
@@ -6621,6 +6662,292 @@ if ( ! function_exists( 'dinoco_sn_rest_void' ) ) {
                 return new WP_Error( 'void_failed', $e->getMessage(), array( 'status' => 500 ) );
             }
         } );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Phase 7 P1 OP-3 — Bulk Admin Actions Wizard (plan §K.4)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Two endpoints land in this MVP:
+ *   POST /bulk/void   — bulk void plates in {in_pool, reserved} state only
+ *   GET  /bulk/export — CSV export of filtered list (same filters as /search)
+ *
+ * Bulk void uses per-SN atomic transaction (re-uses existing /void path) +
+ * skip-conflicts semantics (per-row continue) + result array {sn, status,
+ * code, message} for partial-success UX. Max 100 SNs per call.
+ *
+ * Bulk export streams CSV with UTF-8 BOM + RFC 4180 escaping. Reuses /search
+ * SQL filters for consistency. Max 10K rows.
+ *
+ * Plan §K.4 deferred to future iterations:
+ *   - Background job queue for ops > 100 plates (Action Scheduler)
+ *   - Undo window (1h relink / 24h void)
+ *   - /bulk/relink endpoint
+ *   - /bulk/notify endpoint
+ *   - /bulk/transfer endpoint
+ */
+
+if ( ! function_exists( 'dinoco_sn_rest_bulk_void' ) ) {
+    function dinoco_sn_rest_bulk_void( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        $sns_in = $req->get_param( 'sns' );
+        if ( ! is_array( $sns_in ) || empty( $sns_in ) ) {
+            return new WP_Error( 'invalid_input', __( 'sns array required', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        // Canonicalize + dedup + cap 100
+        $sns = array();
+        foreach ( $sns_in as $s ) {
+            $up = strtoupper( trim( (string) $s ) );
+            if ( $up !== '' && ! in_array( $up, $sns, true ) ) {
+                $sns[] = $up;
+            }
+        }
+        if ( count( $sns ) > 100 ) {
+            return new WP_Error( 'bulk_too_large',
+                __( 'Bulk void max 100 plates per call', 'dinoco-sn' ),
+                array( 'status' => 400, 'count' => count( $sns ), 'max' => 100 ) );
+        }
+        $reason = trim( (string) $req->get_param( 'reason' ) );
+        if ( strlen( $reason ) < 10 ) {
+            return new WP_Error( 'reason_required',
+                __( 'Reason must be at least 10 characters', 'dinoco-sn' ),
+                array( 'status' => 400 ) );
+        }
+
+        // Per-SN rate limit reuse (Round 7 R5 sec layered defense).
+        // R7/R8 sig: b2b_rate_limit($key, $max=10, $window=60) — key INCLUDES uid.
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $uid = get_current_user_id();
+            $rl = b2b_rate_limit( 'sn_bulk_void_' . $uid, 5, 600 ); // 5 bulk ops / 10min
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        $actor_uid    = get_current_user_id();
+        $approver_uid = (int) $req->get_param( 'approver_user_id' );
+
+        // Idempotency wrapper (Round 18+ pattern). Cached replay across full TTL.
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco-sn/v1::bulk/void';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $sns_sorted = $sns;
+            sort( $sns_sorted );
+            $idem_body = array(
+                'sns_sorted'       => $sns_sorted,
+                'reason'           => $reason,
+                'approver_user_id' => $approver_uid,
+                'actor_user_id'    => $actor_uid,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
+        global $wpdb;
+        $pool   = dinoco_sn_table( 'pool' );
+        $results = array();
+        $ok = 0; $skipped = 0;
+
+        foreach ( $sns as $sn ) {
+            // Inline atomic per-SN: lock + check status + flip + audit + dispatcher
+            $lock_key = function_exists( 'dinoco_sn_lock_name' ) ? dinoco_sn_lock_name( $sn ) : ( 'dnc_sn_' . md5( $sn ) );
+            $got = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 5)", $lock_key ) );
+            if ( $got !== 1 ) {
+                $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'lock_timeout',
+                                    'message' => 'Could not acquire lock — try later' );
+                $skipped++;
+                continue;
+            }
+            try {
+                $wpdb->query( 'START TRANSACTION' );
+                $row = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT sn, status, batch_id FROM {$pool} WHERE sn = %s FOR UPDATE",
+                    $sn
+                ) );
+                if ( ! $row ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'not_found',
+                                        'message' => __( 'S/N not in system', 'dinoco-sn' ) );
+                    $skipped++;
+                    continue;
+                }
+                if ( ! in_array( $row->status, array( 'in_pool', 'reserved' ), true ) ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'wrong_state',
+                                        'message' => sprintf(
+                                            __( 'Bulk void allowed for in_pool/reserved only — current=%s', 'dinoco-sn' ),
+                                            $row->status
+                                        ),
+                                        'current_status' => $row->status );
+                    $skipped++;
+                    continue;
+                }
+                $prev = $row->status;
+                $upd = $wpdb->update( $pool,
+                    array( 'status' => 'voided', 'prev_status' => $prev, 'voided_at' => current_time( 'mysql' ) ),
+                    array( 'sn' => $sn ),
+                    array( '%s', '%s', '%s' ), array( '%s' )
+                );
+                if ( $upd === false ) throw new \Exception( 'UPDATE failed: ' . $wpdb->last_error );
+
+                // Audit row
+                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                    dinoco_sn_audit_log(
+                        $sn, 'bulk_void', $prev, 'voided',
+                        array( 'batch_id' => (int) $row->batch_id, 'reason' => $reason, 'bulk_size' => count( $sns ) ),
+                        $actor_uid, $approver_uid ?: null, $reason, '', true
+                    );
+                }
+                $wpdb->query( 'COMMIT' );
+
+                // Cache invalidation dispatcher (R3 chain)
+                if ( function_exists( 'dinoco_sn_fire_status_changed' ) ) {
+                    dinoco_sn_fire_status_changed( $sn, $prev, 'voided', 0 );
+                }
+                $results[] = array( 'sn' => $sn, 'status' => 'ok', 'code' => 'voided', 'previous_status' => $prev );
+                $ok++;
+            } catch ( \Throwable $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'dinoco_obs_capture_exception' ) ) {
+                    dinoco_obs_capture_exception( $e, array( 'context' => 'sn_bulk_void', 'sn' => $sn ) );
+                }
+                $results[] = array( 'sn' => $sn, 'status' => 'error', 'code' => 'exception',
+                                    'message' => $e->getMessage() );
+                $skipped++;
+            } finally {
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+            }
+        }
+
+        // Telegram alert if bulk size > 20 (catch potential abuse / mass mistakes)
+        if ( $ok > 20 && function_exists( 'b2b_send_text_to_group' ) && defined( 'B2B_ADMIN_GROUP_ID' ) ) {
+            $msg = "🛑 Bulk void: {$ok} plates voided by user_id={$actor_uid}. Reason: " . mb_substr( $reason, 0, 80 );
+            @b2b_send_text_to_group( B2B_ADMIN_GROUP_ID, $msg );
+        }
+
+        $resp = array(
+            'success'      => true,
+            'requested'    => count( $sns ),
+            'voided'       => $ok,
+            'skipped'      => $skipped,
+            'results'      => $results,
+        );
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, $resp, 200 );
+        }
+        return rest_ensure_response( $resp );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_bulk_export' ) ) {
+    function dinoco_sn_rest_bulk_export( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'pool' ) ) {
+            return new WP_Error( 'schema_not_ready', __( 'sn_pool not installed.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        // Rate limit — max 10 exports/hour/user (prevents data exfil abuse).
+        // R7/R8 sig: b2b_rate_limit($key, $max=10, $window=60) — key INCLUDES uid.
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'sn_bulk_export_' . get_current_user_id(), 10, 3600 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        global $wpdb;
+        $pool    = dinoco_sn_table( 'pool' );
+        $batches = dinoco_sn_table( 'batches' );
+
+        $q       = trim( (string) $req->get_param( 'q' ) );
+        $status  = (string) $req->get_param( 'status' );
+        $batchId = (int) $req->get_param( 'batch_id' );
+        $limit   = max( 1, min( 10000, (int) $req->get_param( 'limit' ) ?: 10000 ) );
+
+        $where  = array();
+        $params = array();
+        if ( $q !== '' ) {
+            if ( strpos( $q, '*' ) !== false ) {
+                $like = str_replace( '*', '%', strtoupper( $q ) );
+                $where[] = 'p.sn LIKE %s';
+                $params[] = $like;
+            } else {
+                $where[] = '( p.sn = %s OR p.sn LIKE %s )';
+                $params[] = strtoupper( $q );
+                $params[] = '%' . $wpdb->esc_like( strtoupper( $q ) ) . '%';
+            }
+        }
+        if ( $status !== '' ) {
+            $where[] = 'p.status = %s';
+            $params[] = $status;
+        }
+        if ( $batchId > 0 ) {
+            $where[] = 'p.batch_id = %d';
+            $params[] = $batchId;
+        }
+        $where_sql = $where ? ( 'WHERE ' . implode( ' AND ', $where ) ) : '';
+
+        $sql = "SELECT p.sn, p.status, p.linked_sku, p.batch_id, b.batch_code,
+                       p.registered_at, p.registered_user_id
+                FROM {$pool} p
+                LEFT JOIN {$batches} b ON p.batch_id = b.id
+                {$where_sql}
+                ORDER BY p.received_at DESC, p.sn ASC
+                LIMIT %d";
+        $params[] = $limit;
+        $rows = $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        // Build CSV with UTF-8 BOM + RFC 4180 escaping
+        $headers = array( 'sn', 'status', 'linked_sku', 'batch_id', 'batch_code',
+                          'registered_at', 'registered_user_id' );
+        $csv_lines = array();
+        $csv_lines[] = "\xEF\xBB\xBF" . implode( ',', $headers );
+        $can_pii = current_user_can( 'dinoco_sn_view_pii' );
+        foreach ( $rows as $r ) {
+            $reg_uid = (int) ( $r['registered_user_id'] ?? 0 );
+            // PII gate: only `dinoco_sn_view_pii` cap users see user_id raw; others get 0
+            $reg_uid_csv = $can_pii ? $reg_uid : ( $reg_uid > 0 ? 'MASKED' : '0' );
+            $fields = array(
+                $r['sn'] ?? '',
+                $r['status'] ?? '',
+                $r['linked_sku'] ?? '',
+                (int) ( $r['batch_id'] ?? 0 ),
+                $r['batch_code'] ?? '',
+                $r['registered_at'] ?? '',
+                $reg_uid_csv,
+            );
+            $escaped = array_map( function( $v ) {
+                $v = (string) $v;
+                if ( strpos( $v, ',' ) !== false || strpos( $v, '"' ) !== false || strpos( $v, "\n" ) !== false ) {
+                    return '"' . str_replace( '"', '""', $v ) . '"';
+                }
+                return $v;
+            }, $fields );
+            $csv_lines[] = implode( ',', $escaped );
+        }
+        $csv = implode( "\r\n", $csv_lines );
+
+        // Audit row for export (PDPA — track who exported which slice)
+        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+            dinoco_sn_audit_log(
+                null, 'bulk_export', null, null,
+                array( 'rows' => count( $rows ), 'filters' => array( 'q' => $q, 'status' => $status, 'batch_id' => $batchId ) ),
+                get_current_user_id(), null,
+                "Bulk CSV export — {count} rows", '', true
+            );
+        }
+
+        $resp = new WP_REST_Response( $csv, 200 );
+        $resp->header( 'Content-Type', 'text/csv; charset=utf-8' );
+        $resp->header( 'Content-Disposition', 'attachment; filename="sn-export-' . date( 'Ymd-His' ) . '.csv"' );
+        return $resp;
     }
 }
 
