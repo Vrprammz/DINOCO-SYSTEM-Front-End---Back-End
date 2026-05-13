@@ -1,9 +1,9 @@
 # Feature Spec: DINOCO Claim Lifecycle Notifications + Payment + Flash Shipping
 
-**Version:** V.2.0 (2026-05-13) — boss-mandated "ไม่มีจุดตาย / หน้าตาย / ปุ่มตาย" rev
-**Previous:** V.1.0 (2026-05-13) — initial draft, superseded
+**Version:** V.2.1 (2026-05-13) — boss directive: NO PromptPay QR + separate claim bank from B2B + admin-editable
+**Previous:** V.2.0 (2026-05-13) — zero-dead-ends rev, superseded by V.2.1 payment-rail revision
 **Author:** Feature Architect
-**Status:** Draft — pending boss sign-off + DB_ID provisioning + 8 Open Questions
+**Status:** Draft — pending boss sign-off + DB_ID provisioning + Open Questions (now 9 with bank settings)
 **Related:**
 - `[System] DINOCO Claim System` V.31.0 (DB_ID 16) — entry point + claim_ticket CPT writer
 - `[Admin System] DINOCO Service Center & Claims` V.31.6 (DB_ID 27) — owner of `dinoco_set_claim_status()` + `dinoco/claim/state_changed` action
@@ -24,7 +24,8 @@
 | Version | Date | Author | Notes |
 |---|---|---|---|
 | V.1.0 | 2026-05-13 | Feature Architect | Initial draft; 10 sections; ~570 lines; surfaced 3 BLOCKERs in tech-lead review (helper name drift, walk-in bank context, Phase 1 dep lock) |
-| **V.2.0** | **2026-05-13** | **Feature Architect** | **Boss-mandated "ไม่มีจุดตาย / หน้าตาย / ปุ่มตาย"; closes 3 BLOCKERs + 4 HIDDEN RISKS + 4 SHOULD-FIXes; adds 9 new sections A-I (Journey, Button Matrix, Page States, Concurrency, Edge Cascades, FSM, Crons, REST flow, Error Catalog); Phase 1 effort 40h → 52h** |
+| V.2.0 | 2026-05-13 | Feature Architect | Boss-mandated "ไม่มีจุดตาย / หน้าตาย / ปุ่มตาย"; closes 3 BLOCKERs + 4 HIDDEN RISKS + 4 SHOULD-FIXes; adds 9 new sections A-I (Journey, Button Matrix, Page States, Concurrency, Edge Cascades, FSM, Crons, REST flow, Error Catalog); Phase 1 effort 40h → 52h |
+| **V.2.1** | **2026-05-13** | **Feature Architect** | **Boss directive 2026-05-13: (1) ไม่ใช้ PromptPay QR — replaced with bank-transfer + Slip2Go verify (B2B-style). (2) ออกแบบให้แก้เลขบัญชี — claim bank MUST be different account from B2B. NEW §6.4 Claim Bank Configuration: 3-tier resolver (wp_options → constants → sentinel), `[dinoco_claim_bank_settings]` admin UI shortcode, validation rules, audit trail, immutability of existing pending charges, REST endpoints (3). Helper `dinoco_claim_bank_resolve($use_walkin)`. Phase 1 effort 52h → 64h (+12h bank settings work). Schema: dropped `qr_payload` + `qr_image_base64` columns, added `bank_branch`. Open Questions: now 9 (NEW Q9 = walkin bank — same or separate?).** |
 
 ---
 
@@ -82,12 +83,13 @@ Admin Service Center → status select
    → b2b_rate_limit('claim_charge_create_' . $uid, 20, 3600)
    → validate amount ∈ [1, 50000] + reason ∈ whitelist + claim ownership
    → INSERT wp_dinoco_claim_charges (status=pending_payment, expires_at=NOW+24h)
-   → generate PromptPay QR via `dinoco_claim_generate_promptpay_qr($amount, $payment_ref)` (NEW helper — see B1 resolution)
-   → push customer Flex (amber) + push admin "ออกบิลเคลม #N — ฿500" Telegram (rate-limit aware)
+   → resolve bank info via `b2b_get_bank_info($claim_id, 'claim')` (B2 extension — context-aware bank account; supports walk-in B2B_WALKIN_BANK_*)
+   → push customer Flex (amber) "💰 ค่าใช้จ่ายเคลม #N ฿X — โอนที่บัญชี XXX-X-XXXXX-X" + push admin "ออกบิลเคลม #N — ฿500" Telegram (rate-limit aware)
 3. Customer LIFF → /claim-pay/{charge_id} (route registered by new shortcode `[dinoco_claim_pay]`)
-   → countdown timer (24h) + QR + bank info + upload area
+   → countdown timer (24h) + bank account card (name/number/holder/branch) + copy-to-clipboard button + upload-slip area
    → POST /charge/{id}/upload-slip (multipart) → verify via `dinoco_verify_slip_for_claim()` wrapper (NEW — see B1)
-   → status=verified | pending_review | failed
+   → Slip2Go verifies: bank_code match + amount ±2% + trans_ref dedup (cross-feature namespace = `claim_<charge_id>`)
+   → status=verified | pending_review (Slip2Go uncertain → admin manual) | failed
 4. If verified → fire `dinoco/claim/charge_paid` → notify customer + admin
 ```
 
@@ -133,7 +135,7 @@ sequenceDiagram
 
     ADM->>API: POST /charge/create (Idempotency-Key)
     API->>API: rate_limit + validate + insert charge
-    API->>LINE: push amber Flex w/ QR
+    API->>LINE: push amber Flex w/ bank details + amount
     LINE-->>CST: notification
     CST->>API: POST /charge/{id}/upload-slip
     API->>API: Slip2Go verify
@@ -167,13 +169,12 @@ CREATE TABLE wp_dinoco_claim_charges (
   reason_note     VARCHAR(500) DEFAULT NULL,
   status          VARCHAR(24) NOT NULL DEFAULT 'pending_payment',
                   -- pending_payment | pending_review | verified | rejected | refunded | expired | cancelled
-  qr_payload      TEXT DEFAULT NULL,
-  qr_image_base64 LONGTEXT DEFAULT NULL,                  -- cached server-side render
-  bank_code       VARCHAR(16) DEFAULT NULL,                -- frozen at create (snapshot)
-  bank_account    VARCHAR(32) DEFAULT NULL,
-  bank_holder     VARCHAR(128) DEFAULT NULL,
-  bank_name       VARCHAR(64) DEFAULT NULL,
-  bank_context    VARCHAR(16) DEFAULT 'order',             -- 'order' | 'walkin' | 'claim' (HR3 resolution — see B2)
+  bank_code       VARCHAR(16) DEFAULT NULL,                -- snapshot at create (immutable after)
+  bank_account    VARCHAR(32) DEFAULT NULL,                -- snapshot at create
+  bank_holder     VARCHAR(128) DEFAULT NULL,               -- snapshot at create
+  bank_name       VARCHAR(64) DEFAULT NULL,                -- snapshot at create
+  bank_branch     VARCHAR(64) DEFAULT NULL,                -- snapshot at create (optional)
+  bank_context    VARCHAR(16) DEFAULT 'claim',             -- 'claim' (default — uses DINOCO_CLAIM_BANK_*) | 'walkin' (uses DINOCO_CLAIM_WALKIN_BANK_*)
   slip_image_url  VARCHAR(500) DEFAULT NULL,
   slip_ref_hash   CHAR(64) DEFAULT NULL,
   slip_verify_data LONGTEXT DEFAULT NULL,
@@ -314,7 +315,7 @@ Color scheme aligned with Design Tokens V.1.0. All Flex obey LINE schema (no nul
 | 11 | Replacement Rejected by Company | `#EF4444` | เหตุผล + ทางเลือก (ติดต่อแอดมิน / ขอซ่อมแทน) | [💬 แชทแอดมิน] [📋 ดู] | YES |
 
 **Special Flex** (NOT status-driven):
-- **Charge Request** — amber gradient + PromptPay QR image + bank + amount + [📤 อัพโหลดสลิป] [📋 ดู]
+- **Charge Request** — amber gradient + bank account card (ชื่อธนาคาร + เลขบัญชี + ชื่อบัญชี + จำนวน ฿X + reference code) + [📤 อัพโหลดสลิป] [📋 คัดลอกเลข]
 - **Charge Verified** — green + receipt summary + [📋 ดูใบเสร็จ]
 - **Charge Rejected** — red + reason + [💬 แชทแอดมิน] + [📤 อัพโหลดใหม่]
 - **Charge Refunded** — gray + summary + [💬 แชทแอดมิน]
@@ -345,32 +346,57 @@ Route: `/claim-pay/{charge_id}` (shortcode `[dinoco_claim_pay]` in new snippet).
 
 **Verified by grep against current codebase (2026-05-13):**
 
-| Spec V.1.0 (WRONG) | Actual Codebase | V.2.0 Resolution |
+| Spec V.1.0 (WRONG) | Actual Codebase | V.2.1 Resolution (REVISED 2026-05-13 — boss directive: NO PromptPay QR, use bank transfer + Slip2Go) |
 |---|---|---|
-| `b2b_promptpay_qr_payload()` | **Does not exist.** Only `b2b_generate_promptpay_qr($amount, $payment_ref)` is referenced defensively in `[System] DINOCO SN REST API` line 9653 with `function_exists` guard. No `function b2b_generate_promptpay_qr` definition exists anywhere. Marketplace falls back to admin-contact when missing. | **NEW helper** `dinoco_claim_generate_promptpay_qr($amount, $payment_ref)` in new snippet "Claim Payment LIFF". Returns base64 PNG. Internally reads `B2B_PROMPTPAY_ID` constant + uses EMVCo BOT standard (mirror existing [B2B] Snippet 1 line 3242 implementation comment). When `B2B_PROMPTPAY_ID` undefined → return `''` + log warning + admin-fallback path same as Marketplace. **Cross-snippet**: also exposes alias `b2b_generate_promptpay_qr()` (with `function_exists` guard) so Marketplace gets a real impl too. |
-| `b2b_rest_manual_flash_create_internal()` | **Does not exist.** `b2b_rest_manual_flash_create(WP_REST_Request $r)` is the REST handler at [B2B] Snippet 3 line 5617 — takes `WP_REST_Request`, not plain params. No internal helper exists. | **Two-pronged refactor (V.2.0):** (a) **NEW internal helper** `dinoco_claim_create_flash_shipment($claim_id, array $params)` in new "Claim Flash Dispatcher" snippet — accepts plain PHP array, returns `{ok, pno, tracking_url, error}`. (b) Inside it, dispatch by calling `b2b_flash_dispatch_create_all($ticket_id)` is **NOT applicable** (that helper takes a B2B `ticket_id` int, not claim params — confirmed [B2B] Snippet 1 line 9178). Instead, **directly call `wp_remote_post()` to `B2B_FLASH_API_URL . '/open/v3/orders'`** with HMAC-signed body (reuse `b2b_flash_sign()` from Snippet 1 line ~ via `function_exists` guard). Encapsulates the same payload schema as `b2b_rest_manual_flash_create` but bypasses WP_REST_Request coupling. **Migration plan:** Phase 3 task 3.10 (NEW) — once Claim Flash Dispatcher is stable, refactor `b2b_rest_manual_flash_create` to call the same `dinoco_claim_create_flash_shipment()` helper internally (DRY) — but this is **out of MVP scope** for risk reasons. |
-| `b2f_verify_slip_image($image)` | Actual signature: `b2f_verify_slip_image($image_base64, $maker_id)` ([B2F] Snippet 1 line 3313). Requires maker bank info — **does not fit claim context**. | **NEW wrapper** `dinoco_verify_slip_for_claim($image_base64, $expected_amount_thb, $expected_bank_code)` in "Claim Payment LIFF" snippet. Internally calls Slip2Go API directly (mirror `b2f_verify_slip_image` payload shape but with **B2B_BANK** or **B2B_WALKIN_BANK** receiver depending on `bank_context` column — see B2 below). DOES NOT touch `b2f_verify_slip_image` (clean separation, no risk to B2F). Both helpers share `B2B_SLIP2GO_SECRET_KEY` constant. |
+| ~~`b2b_promptpay_qr_payload()`~~ | **N/A — DROPPED** | **REMOVED V.2.1** — Boss directive 2026-05-13: ไม่ใช้ PromptPay QR. ลูกค้าโอนเอง ผ่าน bank account + reference code. No QR helper needed. |
+| `b2b_rest_manual_flash_create_internal()` | **Does not exist.** `b2b_rest_manual_flash_create(WP_REST_Request $r)` is the REST handler at [B2B] Snippet 3 line 5617 — takes `WP_REST_Request`, not plain params. No internal helper exists. | **Two-pronged refactor:** (a) **NEW internal helper** `dinoco_claim_create_flash_shipment($claim_id, array $params)` in new "Claim Flash Dispatcher" snippet — accepts plain PHP array, returns `{ok, pno, tracking_url, error}`. (b) Inside it, **directly call `wp_remote_post()` to `B2B_FLASH_API_URL . '/open/v3/orders'`** with HMAC-signed body (reuse `b2b_flash_sign()` from Snippet 1 via `function_exists` guard). Encapsulates the same payload schema as `b2b_rest_manual_flash_create` but bypasses WP_REST_Request coupling. **Migration plan:** Phase 3 task 3.10 (NEW) — once Claim Flash Dispatcher is stable, refactor `b2b_rest_manual_flash_create` to call same helper (DRY) — out of MVP scope. |
+| `b2f_verify_slip_image($image)` | Actual signature: `b2f_verify_slip_image($image_base64, $maker_id)` ([B2F] Snippet 1 line 3313). Requires maker bank info. | **NEW wrapper** `dinoco_verify_slip_for_claim($image_base64, $expected_amount_thb, $expected_bank_code, $expected_account_no)` in "Claim Payment LIFF" snippet. Internally calls Slip2Go API directly (mirror `b2f_verify_slip_image` payload shape but with `DINOCO_CLAIM_BANK_*` or `DINOCO_CLAIM_WALKIN_BANK_*` receiver — NEW separate bank account, NOT shared with B2B per boss directive 2026-05-13). DOES NOT touch `b2f_verify_slip_image` (clean separation, no risk to B2F). Shares `B2B_SLIP2GO_SECRET_KEY` constant. |
 
 #### B2 — `b2b_get_bank_info()` Walk-in Extension
 
 **Verified** ([B2B] Snippet 1 line 2837): `b2b_get_bank_info($order_id = 0)` calls `b2b_is_walkin_order($order_id)` which checks `get_post_meta($order_id, '_b2b_is_walkin', true) === '1'`. Claim CPT does NOT have `_b2b_is_walkin` meta.
 
-**V.2.0 Resolution — Option B (chosen):** Extend `b2b_get_bank_info()` with a 2nd arg:
+**V.2.1 Resolution — Option B with SEPARATE claim bank account** (boss directive 2026-05-13 "ใช้บัญชีคนละบัญชีกับ B2B"):
+
+Claim system uses **dedicated bank constants** — NOT shared with B2B order bank:
+
+| Use case | Constants used (priority order) | Walk-in detection |
+| --- | --- | --- |
+| Order (`context='order'`) | `B2B_WALKIN_BANK_*` (if walk-in) → `B2B_BANK_*` (default) | `_b2b_is_walkin` postmeta on order |
+| Claim (`context='claim'`) | `DINOCO_CLAIM_WALKIN_BANK_*` (if walk-in) → `DINOCO_CLAIM_BANK_*` (default) | `_claim_walkin` postmeta on claim |
+
+Extended helper signature:
+
 ```php
-function b2b_get_bank_info( $order_id = 0, $context = 'order' ) {
-    // $context: 'order' (default, existing behavior) | 'claim' | 'walkin'
+function b2b_get_bank_info( $order_or_claim_id = 0, $context = 'order' ) {
+    // $context: 'order' (default, existing B2B behavior) | 'claim' (NEW)
     if ( $context === 'claim' ) {
-        $use_walkin = $order_id && get_post_meta( $order_id, '_claim_walkin', true ) === '1';
-    } else {
-        $use_walkin = $order_id && function_exists('b2b_is_walkin_order') && b2b_is_walkin_order($order_id);
+        $use_walkin = $order_or_claim_id
+            && get_post_meta( $order_or_claim_id, '_claim_walkin', true ) === '1';
+        // Read DINOCO_CLAIM_BANK_* / DINOCO_CLAIM_WALKIN_BANK_* via dinoco_claim_bank_resolve()
+        return dinoco_claim_bank_resolve( $use_walkin );
     }
-    // ... rest unchanged
+    // Existing B2B behavior — unchanged
+    $use_walkin = $order_or_claim_id
+        && function_exists('b2b_is_walkin_order')
+        && b2b_is_walkin_order($order_or_claim_id);
+    // ... B2B_BANK_* / B2B_WALKIN_BANK_* resolution (unchanged)
 }
 ```
 
-This is backward-compatible (default arg = existing behavior) and surfaces walk-in detection from claim context. Same pattern applied to `b2b_get_bank_logo_url($order_id, $context)` and `b2b_get_bank_copy_text($order_id, $context)`.
+NEW helper `dinoco_claim_bank_resolve($use_walkin = false)` in `[Admin System] DINOCO Claim Lifecycle Notifier` snippet reads from **3-tier source** (priority):
 
-**Migration plan:** [B2B] Snippet 1 V.34.26 (single version bump). Existing callers all pass `($order_id)` only — `$context` defaults to `'order'` → byte-identical behavior. PHPUnit test pinning signature.
+1. **wp_options** (admin-editable via Settings UI — see §6.4 NEW Bank Settings section):
+   - `dinoco_claim_bank_name`, `dinoco_claim_bank_account`, `dinoco_claim_bank_holder`, `dinoco_claim_bank_code`, `dinoco_claim_bank_branch`, `dinoco_claim_bank_logo_url`
+   - `dinoco_claim_walkin_bank_*` (parallel set)
+2. **WordPress constants** (wp-config.php fallback):
+   - `DINOCO_CLAIM_BANK_*` / `DINOCO_CLAIM_WALKIN_BANK_*`
+3. **Hardcoded fallback** (last resort to prevent NULL — admin error banner if reached):
+   - Returns sentinel `array('error' => 'no_claim_bank_configured', ...)` → admin sees red banner in Service Center
+
+Same pattern applied to `b2b_get_bank_logo_url($id, $context)` and `b2b_get_bank_copy_text($id, $context)`.
+
+**Migration plan:** [B2B] Snippet 1 V.34.26 (single version bump). Existing callers all pass `($order_id)` only — `$context` defaults to `'order'` → byte-identical behavior. PHPUnit test pinning signature + new test for `context='claim'` paths. New wp_options keys lazy-installed on `admin_init` via `add_option(..., false)` with defaults from constants if defined.
 
 #### B3 — Phase 1 Dependency Lock
 
@@ -437,24 +463,138 @@ PHPUnit test: `ClaimFlashWebhookRaceTest::test_terminal_state_silently_skipped()
 | SF3 | Modal Helpers drift detector | NEW Jest test `tests/jest/claim-modal-helpers-drift.test.js` — greps NEW Service Center snippet for `_scCfm(` calls + asserts options object contains `message:` field (not `content:`). Drift detector also enforces no `.dnc-modal-` CSS overrides + no inline-handler addition |
 | SF4 | `/approve` vs `/reject` separate endpoints — confirmed in §4 table |
 
-### 6.4 Files to Modify
+### 6.4 NEW — Claim Bank Configuration (separate from B2B per boss directive 2026-05-13)
+
+**Mandate**: Claim system uses a **different bank account from B2B orders**. Admin must be able to edit the claim bank info via UI (NOT just wp-config.php constants — flexible business operation).
+
+#### Data Source Priority (3-tier resolver)
+
+`dinoco_claim_bank_resolve($use_walkin = false)` reads in this order:
+
+1. **wp_options** (highest priority — admin-editable via Settings UI):
+
+   | wp_option key | Type | Example |
+   | --- | --- | --- |
+   | `dinoco_claim_bank_name` | string | "ธนาคารกสิกรไทย" |
+   | `dinoco_claim_bank_name_en` | string | "KASIKORNBANK" |
+   | `dinoco_claim_bank_account` | string | "123-4-56789-0" |
+   | `dinoco_claim_bank_holder` | string | "บริษัท DINOCO จำกัด" |
+   | `dinoco_claim_bank_code` | string (Slip2Go bank code) | "004" (KBANK) |
+   | `dinoco_claim_bank_branch` | string optional | "สาขารามอินทรา 14" |
+   | `dinoco_claim_bank_logo_url` | string optional | "https://.../kbank-logo.png" |
+   | `dinoco_claim_walkin_bank_*` | (parallel set, same 7 keys) | for walk-in claims |
+
+2. **WordPress constants** (wp-config.php fallback — if wp_options empty):
+   - `DINOCO_CLAIM_BANK_NAME`, `DINOCO_CLAIM_BANK_ACCOUNT`, `DINOCO_CLAIM_BANK_HOLDER`, etc.
+   - `DINOCO_CLAIM_WALKIN_BANK_*`
+
+3. **Sentinel error response** (last resort): `array('error' => 'no_claim_bank_configured', 'bank_name' => 'ไม่ได้ตั้งค่า', ...)` → admin sees **red error banner** in Service Center charge modal "⚠️ ยังไม่ได้ตั้งค่าบัญชี Claim — ตั้งค่าก่อนออกบิล" + link to Settings page.
+
+#### Admin Settings UI (NEW)
+
+**Shortcode**: `[dinoco_claim_bank_settings]` (rendered inside Service Center tab "ตั้งค่าบัญชีรับเงิน")
+
+**Layout** (mobile-friendly, 1-col on <768px, 2-col on ≥768px):
+
+```text
+┌───────────────────────────────────────────────────────────┐
+│ 💰 ตั้งค่าบัญชีรับเงินสำหรับเคลม                            │
+│ (แยกจากบัญชี B2B ตามนโยบาย)                                 │
+├───────────────────────────────────────────────────────────┤
+│ 🏦 บัญชีหลัก (Default)                                        │
+│ ┌─────────────────────────┬─────────────────────────┐    │
+│ │ ธนาคาร *                │ รหัสธนาคาร (Slip2Go) *   │    │
+│ │ [ธนาคารกสิกรไทย      ▼] │ [004 (KBANK)         ▼] │    │
+│ ├─────────────────────────┼─────────────────────────┤    │
+│ │ เลขบัญชี *               │ ชื่อบัญชี *               │    │
+│ │ [123-4-56789-0       ]  │ [บริษัท DINOCO จำกัด ]  │    │
+│ ├─────────────────────────┼─────────────────────────┤    │
+│ │ สาขา (optional)         │ Logo URL (optional)     │    │
+│ │ [รามอินทรา 14        ]  │ [https://...        ]  │    │
+│ └─────────────────────────┴─────────────────────────┘    │
+│                                                           │
+│ 🏪 บัญชี Walk-in (Optional — ถ้าต้องการแยกบัญชี walk-in)    │
+│ [ ☐ ใช้บัญชีเดียวกับบัญชีหลัก (default checked) ]            │
+│ (ถ้า uncheck → แสดง form เพิ่ม 7 fields เหมือนข้างบน)          │
+│                                                           │
+│ ──────────────────────────                                │
+│ [💾 บันทึก]  [🧪 ทดสอบ (สร้าง charge ทดลอง)]                │
+│                                                           │
+│ Last updated: 2026-05-13 14:32 by Boss                    │
+└───────────────────────────────────────────────────────────┘
+```
+
+#### Validation Rules (server-side on save)
+
+- `bank_account` required, regex `/^[0-9-]{8,20}$/` (Thai bank account format)
+- `bank_code` required, must be in Slip2Go whitelist (`004`, `014`, `002`, etc. — see B2F Snippet 1 line 3263 BANK_CODE_MAP)
+- `bank_holder` required, max 128 chars
+- `bank_name` required, max 64 chars
+- `bank_logo_url` optional, must be `https://` (no http) + image MIME validate via HEAD request (10s timeout)
+
+#### Audit Trail
+
+Every save → INSERT into `wp_dinoco_audit_log` (existing snippet `DB_ID 1187`):
+
+```text
+event_type: claim_bank_settings_changed
+actor: user_id
+diff: { before: {...}, after: {...} }  — JSON
+```
+
+→ Admin can see "ใครเปลี่ยนเลขบัญชีเมื่อไหร่" via Audit Log viewer
+
+#### Immutability of Existing Charges
+
+When admin changes bank info → **existing pending charges DO NOT update** (snapshot in `wp_dinoco_claim_charges.bank_*` columns at create time). Only NEW charges use the new bank. Reason: customer who already got Flex card with old account # must not have their slip rejected after they transfer.
+
+#### Permission
+
+`current_user_can('manage_options')` only. Settings link visible in Service Center sidebar only to admin role.
+
+#### REST API
+
+```text
+GET  /dinoco-claim/v1/bank-settings           — read current (admin only)
+POST /dinoco-claim/v1/bank-settings           — update (idempotent + audit)
+POST /dinoco-claim/v1/bank-settings/test      — sandbox: create test charge (THB 1) + render Flex preview (no actual push) — admin verifies setup before going live
+```
+
+#### Migration from Constants → wp_options
+
+On first activation, if any `DINOCO_CLAIM_BANK_*` constant is defined AND corresponding wp_option is empty → seed wp_option from constant (one-time, idempotent via flag `dinoco_claim_bank_seeded_from_constants`). Admin can override afterward.
+
+#### Effort Estimate
+
+| Task | Hours |
+| --- | --- |
+| NEW Admin Settings shortcode + form UI (mobile-first, Thai labels) | 4h |
+| NEW `dinoco_claim_bank_resolve()` helper + 3-tier resolver + audit log integration | 2h |
+| NEW REST endpoints (3 — GET / POST / test) + validation + Slip2Go bank_code whitelist | 3h |
+| Lazy install wp_options + migration from constants | 1h |
+| PHPUnit + Jest drift tests | 2h |
+| **Total** | **12h** |
+
+→ Add to Phase 1 effort: **52h → 64h** (Phase 1 MVP now 3 weeks instead of 2 due to bank settings requirement)
+
+### 6.5 Files to Modify
 
 | File | Snippet | Change | Estimated Lines |
 |---|---|---|---|
 | `[Admin System] DINOCO Service Center & Claims` | DB_ID 27 | Add 3 sections + create-modal + REST AJAX wiring + JS helper `_scCfm/_scAlert/_scPrompt` (mirrors Phase 6 pattern) | +500 LOC |
 | `[B2B] Snippet 3: LIFF E-Catalog REST API` | DB_ID 52 | EXTEND `b2b_flash_manual_shipment_webhook` to match `_claim_flash_pnos[]` | +40 LOC |
-| `[B2B] Snippet 1: Core Utilities & LINE Flex Builders` | DB_ID 72 | NEW Flex builders (10 status + 6 special = 16 total) + extend `b2b_get_bank_info($order_id, $context)` (B2) + alias `b2b_generate_promptpay_qr` (B1) | +700 LOC |
+| `[B2B] Snippet 1: Core Utilities & LINE Flex Builders` | DB_ID 72 | NEW Flex builders (10 status + 6 special = 16 total — including Charge Request with bank account display, NO QR) + extend `b2b_get_bank_info($order_or_claim_id, $context)` (B2 with `'claim'` branch) | +650 LOC (V.2.1 reduced — no QR helper) |
 | `[Admin System] DINOCO LINE Push Governance` | DB_ID 1203 | Register category `claim_status` as `transactional` (always-on) | +5 LOC |
 
-### 6.5 Files to Create (NEW snippets)
+### 6.6 Files to Create (NEW snippets)
 
 | File | DB_ID | Purpose | Estimated LOC |
 |---|---|---|---|
 | `[Admin System] DINOCO Claim Lifecycle Notifier` | **PENDING** | Listen `dinoco/claim/state_changed` + dispatch Flex + own Sub-Feature A logic | ~900 LOC |
-| `[System] DINOCO Claim Payment LIFF` | **PENDING** | Customer-facing shortcode `[dinoco_claim_pay]` + REST `/charge/*` + `dinoco_claim_generate_promptpay_qr` + `dinoco_verify_slip_for_claim` | ~1100 LOC |
+| `[System] DINOCO Claim Payment LIFF` | **PENDING** | Customer-facing shortcode `[dinoco_claim_pay]` + REST `/charge/*` + bank transfer instructions display + `dinoco_verify_slip_for_claim` (Slip2Go) | ~950 LOC (V.2.1 reduced — no QR generator) |
 | `[Admin System] DINOCO Claim Flash Dispatcher` | **PENDING** | REST `/flash-create` + `/flash-cancel` + RPi enqueue + `dinoco_claim_create_flash_shipment` internal helper | ~800 LOC |
 
-### 6.6 Prerequisites
+### 6.7 Prerequisites
 
 - Idempotency Helper V.1.4 ✓
 - Modal Helpers V.1.1 ✓
@@ -465,10 +605,10 @@ PHPUnit test: `ClaimFlashWebhookRaceTest::test_terminal_state_silently_skipped()
 - `dinoco_line_uid` user meta populated (Phase 1 LIFF AI strict mode already enforces)
 - B2B_SLIP2GO_SECRET_KEY defined (in use today)
 - B2B_FLASH_MCH_ID, B2B_FLASH_SECRET_KEY, B2B_FLASH_API_URL defined (in use today)
-- B2B_PROMPTPAY_ID defined for QR generation (graceful fallback if absent — see B1)
 - **Boss provisions 3 DB_IDs in WP** — creates 3 stub snippets, pushes IDs into headers (BLOCKER for Phase 1.2)
+- **DINOCO_CLAIM_BANK_* constants OR wp_options seeded** — boss configures claim bank via admin UI `[dinoco_claim_bank_settings]` (V.2.1 NEW — see §6.4). MUST be different account from `B2B_BANK_*` (boss directive 2026-05-13). Graceful fallback to placeholder text if absent — see §6.4 Tier 3.
 
-### 6.7 Side Effects
+### 6.8 Side Effects
 
 - LINE quota: peak ~5 statuses × 100 claims/day = 500 push/day → +1.6% of daily quota. Dedup + governance throttle.
 - DB size: ~2KB/row × 100 charges/mo = 200KB/mo (negligible)
@@ -476,7 +616,7 @@ PHPUnit test: `ClaimFlashWebhookRaceTest::test_terminal_state_silently_skipped()
 - No CSS conflicts (prefix `.dnc-claim-*`)
 - JS global scope: namespace `window.dincoClaim = {...}`
 
-### 6.8 Hook Dependency Chain
+### 6.9 Hook Dependency Chain
 
 ```
 dinoco/claim/state_changed (existing — fired by dinoco_set_claim_status)
@@ -496,9 +636,9 @@ dinoco/claim/shipment_delivered (NEW)
 
 ---
 
-## 7. Implementation Roadmap (revised V.2.0)
+## 7. Implementation Roadmap (revised V.2.1)
 
-### Phase 1: MVP — Notifications Only (Week 1-2, ~52h ← was 40h)
+### Phase 1: MVP — Notifications + Claim Bank Settings (Week 1-3, ~64h ← was 52h)
 
 | # | Task | File | Effort | Owner | Blocks |
 |---|---|---|---|---|---|
@@ -509,15 +649,16 @@ dinoco/claim/shipment_delivered (NEW)
 | 1.5 | Service Center "Notifications Log" section + `_scCfm/_scAlert` helpers + resend button + REST `/notif/log` `/notif/resend` | DB_ID 27 + new snippet | 8h | fullstack-developer | 1.6 |
 | 1.6 | PHPUnit: Flex schema validation + dedup + opt-out + hook chain (HR1) + idempotency-on-resend behavior (HR2) | tests/helpers | 5h | fullstack-developer | 1.7 |
 | 1.7 | Jest drift detectors: 10 builder names exist + hook wired priority 20 + Modal Helpers `message` field (SF3) + 3 new sections render under flag ON | tests/jest | 2.5h | fullstack-developer | 1.8 |
+| 1.9 V.2.1 | NEW `[dinoco_claim_bank_settings]` admin shortcode + 3-tier resolver `dinoco_claim_bank_resolve($use_walkin)` + REST 3 endpoints (GET/POST/test) + Slip2Go bank_code whitelist + validation + audit log integration + immutability gate + migration from constants + PHPUnit/Jest drift | New snippet + Snippet 1 | 12h | fullstack-developer + frontend-design | 1.8 (blocks flag flip — bank MUST be configured before payment goes live) |
 | 1.8 | Flag flip `dinoco_claim_notif_enabled=1` staging → 7-day observation → prod | — | 3h | Ops | — |
-| **Phase 1 deploy & QA** | | | **~52h** | | |
+| **Phase 1 deploy & QA** | | | **~64h** | | |
 
-### Phase 2: Payment Flow (Week 3-5, ~80h ← was 77h)
+### Phase 2: Payment Flow (Week 4-5, ~78h ← was 82h, -4h from no QR helper)
 
 | # | Task | File | Effort | Owner |
 |---|---|---|---|---|
 | 2.1 | Schema `wp_dinoco_claim_charges` (database-expert review) + dbDelta lazy install + `bank_context` column (B2) | New snippet | 7h | database-expert |
-| 2.2 | NEW snippet "Claim Payment LIFF" — REST endpoints (8) + LIFF shortcode + `dinoco_claim_generate_promptpay_qr` + `dinoco_verify_slip_for_claim` (B1) | New snippet | 26h | fullstack-developer |
+| 2.2 | NEW snippet "Claim Payment LIFF" — REST endpoints (8) + LIFF shortcode + bank instructions display (NO QR) + `dinoco_verify_slip_for_claim` (B1) | New snippet | 22h | fullstack-developer |
 | 2.3 | EXTEND `b2b_get_bank_info($order_id, $context='order')` (B2) + bump [B2B] Snippet 1 V.34.26 + PHPUnit signature pin | Snippet 1 | 4h | fullstack-developer |
 | 2.4 | Service Center "Charges" section + create modal (`window.dinocoModal.prompt({message: ...})`) + approve/reject/refund + 4-eyes UI | DB_ID 27 | 14h | frontend-design + fullstack-developer |
 | 2.5 | LIFF page UI + countdown + upload + state transitions (idle/uploading/verifying/success/failed) + offline detection | New snippet | 12h | frontend-design |
@@ -525,7 +666,7 @@ dinoco/claim/shipment_delivered (NEW)
 | 2.7 | Security review: 4-eyes refund + slip_replay + amount bounds + LIFF JWT replay | — | 5h | security-pentester |
 | 2.8 | PHPUnit: charge state machine + idempotency + slip_ref_hash collision + concurrency (FOR UPDATE) | tests/helpers | 6h | fullstack-developer |
 | 2.9 | Flag flip + 7-day canary on 1 distributor → prod | — | 4h | Ops |
-| **Phase 2 deploy & QA** | | | **~82h** | |
+| **Phase 2 deploy & QA** | | | **~78h** | |
 
 ### Phase 3: Flash Shipping (Week 6-8, ~64h ← was 60h)
 
@@ -545,7 +686,7 @@ dinoco/claim/shipment_delivered (NEW)
 ### Phase 4: Polish (Week 9, ~22h)
 - Charge admin export CSV · Refund audit dashboard · Multi-shipment grouping · Notif log filter/search · Customer LIFF "ประวัติเคลม" inline charges + Flash · Health Monitor cards for 3 new crons · pickup-at-warehouse opt-in UX
 
-**Total estimated effort: ~220h (~5.5 weeks for 1 fullstack-developer + parallel agents)**
+**Total estimated effort V.2.1: ~228h (~5.7 weeks for 1 fullstack-developer + parallel agents)** — Phase 1 64h + Phase 2 78h + Phase 3 64h + Phase 4 22h. Net delta vs V.2.0: +8h (added 12h bank settings, removed 4h PromptPay QR helper).
 
 ---
 
@@ -579,9 +720,11 @@ dinoco/claim/shipment_delivered (NEW)
 - [ ] Idempotency body hash determinism + `/notif/resend` bypass (HR2)
 - [ ] HR1 hook chain — sn_pool sync throw does NOT block notifier
 - [ ] HR4 terminal_state silent skip on webhook race
-- [ ] B2 `b2b_get_bank_info($oid, $context='claim')` reads `_claim_walkin` correctly
-- [ ] B1 `dinoco_claim_generate_promptpay_qr()` returns valid EMVCo payload
+- [ ] B2 `b2b_get_bank_info($oid, $context='claim')` reads claim bank account (NOT B2B account)
+- [ ] V.2.1 `dinoco_claim_bank_resolve($use_walkin)` returns separate claim bank (3-tier resolver)
+- [ ] V.2.1 Admin UI `[dinoco_claim_bank_settings]` saves bank config + immutability gate for active charges
 - [ ] B1 `dinoco_verify_slip_for_claim()` does NOT touch `b2f_verify_slip_image` (clean separation)
+- [ ] B1 `dinoco_verify_slip_for_claim()` rejects slip if destination account ≠ claim bank account
 
 ### Integration (DB-coupled)
 - [ ] Charge create → DB row + status_history append
@@ -1032,7 +1175,7 @@ Target: ~30 codes — currently 29. Add new codes here as discovered.
 
 ---
 
-## Open Questions for Boss (V.2.0 — 8 total: 4 carried from V.1.0 + 4 new)
+## Open Questions for Boss (V.2.1 — 9 total: 4 carried from V.1.0 + 4 from V.2.0 + 1 NEW from V.2.1)
 
 ### Carried from V.1.0
 1. **NUCLEAR opt-out behavior for `claim_status`**: Should `dinoco_line_opt_out_all=1` override transactional Flex pushes? Recommended **NO** (claim updates are critical service info). Need explicit decision.
@@ -1040,21 +1183,28 @@ Target: ~30 codes — currently 29. Add new codes here as discovered.
 3. **Refund 4-eyes threshold ฿5K** — match Q20 manual refund SOP or different?
 4. **DB_ID assignments** — boss must create 3 stub snippets to obtain IDs.
 
-### NEW in V.2.0
+### Carried from V.2.0
 5. **Q-NEW-1**: Should rejected charges allow customer self-retry, or always require admin re-issue? (V.2.0 default: customer retry — but rate-limited 3/hr.)
 6. **Q-NEW-2 (Edge cascade)**: Claim voided during active repair WHILE customer has paid pending charge — should system block void OR allow void + force admin refund prompt OR allow void silently + Telegram alert? (V.2.0 default: allow + Telegram alert + manual SOP — but boss should confirm.)
-7. **Q-NEW-3 (HR3)**: Walk-in distributor claim — should it use `B2B_WALKIN_BANK_*` bank account? (V.2.0 default: NO — claims always use B2B_BANK_*; admin can opt-in per-claim via `_claim_walkin` meta if boss wants alternate.)
+7. ~~**Q-NEW-3 (HR3)**: Walk-in distributor claim — should it use `B2B_WALKIN_BANK_*`?~~ **SUPERSEDED V.2.1** — claim bank is now fully separate from B2B (§6.4). Walk-in claim handling re-asked in Q-NEW-5 below.
 8. **Q-NEW-4 (Section F)**: Replacement Shipped webhook delivered — should claim auto-flip to terminal "Replacement Shipped (Delivered)" sub-state, or stay at "Replacement Shipped"? Currently spec keeps it at "Replacement Shipped" since that's the latest registered state. Boss decides if "Delivered" sub-state is worth adding to allowlist filter.
+
+### NEW in V.2.1
+9. **Q-NEW-5 (Claim Bank — walk-in mode)**: Now that claim bank is fully separate from B2B (§6.4), should walk-in distributor claims still receive a different bank than online claims, or should ALL claims (online + walk-in) share a single bank account?
+   - **Option A (V.2.1 default)**: single claim bank — admin can OPTIONALLY enable separate `dinoco_claim_walkin_bank_*` via Settings UI checkbox (default OFF → walk-in uses default claim bank)
+   - **Option B**: always require separate walkin bank (mandatory two-bank setup)
+   - **Boss decision impacts**: Settings UI complexity + `dinoco_claim_bank_resolve($use_walkin)` resolver logic + Slip2Go verification routing
 
 ---
 
-## Spec Readiness Assessment (V.2.0)
+## Spec Readiness Assessment (V.2.1)
 
 | Criterion | Status |
 |---|---|
 | 3 BLOCKERs (helper drift / walk-in bank / dep lock) | ✅ Resolved with concrete migration plans |
 | 4 HIDDEN RISKS (hook chain / idempotency-resend / walk-in claim / webhook-close race) | ✅ Resolved with defenses + tests |
 | 4 SHOULD-FIX (slip_ref_hash scope / Phase 1.3 effort / Modal drift / endpoint split) | ✅ Resolved |
+| **V.2.1 payment-rail revision** (NO PromptPay QR + separate claim bank + admin-editable) | ✅ §6.4 NEW — 3-tier resolver + admin UI shortcode + audit trail + immutability gate + REST endpoints + migration plan |
 | User journey "no dead ends" | ✅ Section A covers 11 steps + 8 charge sub-steps + recovery matrix |
 | "No dead buttons" | ✅ Section B button matrix covers all 16 buttons |
 | "No dead pages" | ✅ Section C page state matrix covers 5 surfaces |
@@ -1065,11 +1215,14 @@ Target: ~30 codes — currently 29. Add new codes here as discovered.
 | REST pipeline pattern | ✅ Section H — uniform skeleton |
 | Error catalog | ✅ Section I — 29 codes Thai messages |
 
-**Phase 1 effort revised:** 40h → **52h** (+12h from BLOCKER fixes + Modal drift detector + HR1 hook chain defense + Phase 1.3 Flex builders bumped 10h → 18h per SHOULD-FIX-2).
+**Phase 1 effort revised V.2.0 → V.2.1:** 52h → **64h** (+12h from §6.4 Claim Bank Configuration: NEW admin shortcode + 3-tier resolver helper + 3 REST endpoints + validation + audit trail + PHPUnit/Jest drift tests).
+
+**Net effort vs V.1.0:** 40h → 64h Phase 1. Phase 2 (Payment) reduced 26h → 22h (no PromptPay QR helper). Phase 3 (Flash) unchanged.
 
 **Overall verdict:** Spec is **READY for Phase 1 implementation** PENDING:
-1. Boss answers 8 Open Questions (especially Q4 DB_ID provisioning + Q-NEW-1/2/3 product decisions)
-2. database-expert review of schema (Phase 2 prereq)
+
+1. Boss answers 9 Open Questions (especially Q4 DB_ID provisioning + Q-NEW-5 walk-in bank decision)
+2. database-expert review of schema (Phase 2 prereq) + verify `bank_branch` column + dropped `qr_*` columns
 3. Boss provisions 3 DB_IDs in WP
 
 No outstanding architectural risks. All cross-agent handoffs identified.
