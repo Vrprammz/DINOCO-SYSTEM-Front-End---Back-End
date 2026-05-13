@@ -843,12 +843,20 @@ stateDiagram-v2
 
     pending_stock_review --> awaiting_confirm : bo-confirm-full [admin]
     pending_stock_review --> partial_fulfilled : bo-split [admin]
+    pending_stock_review --> all_backorder : bo-split qty_fulfill=0 ทุก SKU [admin] %% V.4.0
     pending_stock_review --> cancelled : bo-reject / 72h timeout cron [admin/system]
     pending_stock_review --> cancel_requested : ลูกค้าขอยกเลิก [customer]
 
     partial_fulfilled --> awaiting_confirm : ทุก BO resolved (last fulfill/cancel) [any]
     partial_fulfilled --> pending_stock_review : bo-undo-split (≤10min, 1 max) [admin]
     partial_fulfilled --> cancelled : manual escalation [admin]
+
+    %% V.4.0 (2026-05-12) all_backorder state — รอ BO ทั้งหมด, ยังไม่วางบิล
+    all_backorder --> awaiting_confirm : bo-fulfill last BO item [any]
+    all_backorder --> partial_fulfilled : bo-fulfill partial + still BO remaining [admin]
+    all_backorder --> cancelled : bo_cancel_all_customer postback / admin manual [any]
+    all_backorder --> cancel_requested : LIFF "ยกเลิก BO" button [customer]
+    all_backorder --> pending_stock_review : bo-undo-split (escape hatch) [admin]
 
     backorder --> checking_stock : restock [admin]
     backorder --> awaiting_confirm : ลูกค้ารับ partial [customer]

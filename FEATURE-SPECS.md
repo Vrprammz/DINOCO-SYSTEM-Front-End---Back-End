@@ -1,8 +1,10 @@
 # DINOCO Feature Specs -- Complete Wiki
 
-**Date:** 2026-04-07 (original) / 2026-04-16 (B2B Backorder System Phase A-D complete)
+**Date:** 2026-04-07 (original) / 2026-04-16 (B2B Backorder System Phase A-D complete) / 2026-05-12 (BO V.4.0 all_backorder)
 
 > Consolidated from: B2F-FEATURE-SPEC.md, INVENTORY-FEATURE-SPEC.md, FINANCE-DASHBOARD.md, BRAND-VOICE.md, MASTER-PLAN.md
+>
+> **2026-05-12 update (BO V.4.0):** บอส principle #6313 — "ลูกค้ายืนยันรอของ ยังไม่ต้องวางบิล + เห็น BO ชัดเจน + ยกเลิกได้ถ้าของยังไม่มา". NEW FSM state `all_backorder` (Snippet 14 V.1.9) — distinguishes partial_fulfilled (bill now) vs all_backorder (bill เมื่อของมา + cancellable anytime). Details in section 5.2.
 >
 > **2026-04-16 update (Big Feature):** B2B Backorder System Phase A-D **complete** — implementation details ใน section 5 ด้านล่าง + full spec ใน `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md` (1876 lines). Phase 0 Hotfix (Snippet 1 V.33.7 + Snippet 15 V.7.5) ยังทำงานเป็น safety net. Master flag `b2b_flag_bo_system` default OFF.
 
@@ -10,7 +12,7 @@
 
 ## 5. B2B Backorder System (Phase A-D Complete — LIVE in Production 2026-04-17)
 
-**Version:** V.1.6+ (patches V.1.7-V.1.11 during audit remediation) | **Snippet:** [B2B] Snippet 16 (~3497 LOC) | **Spec:** `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`
+**Version:** V.4.0 (BO V.4.0 NEW `all_backorder` state — 2026-05-12) | **Snippet:** [B2B] Snippet 16 (~3800 LOC) | **Spec:** `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`
 
 **Philosophy shift:** "realtime stock check on order" → **"opaque accept + admin split review"**
 
@@ -22,6 +24,54 @@
 - Enumeration flags: `_b2b_enumeration_flags` distributor meta bit field (rate_hit / cancel_abuse / qty_cap_hit / suspicious_pattern)
 - Pending review aging: orders stuck > 24h in `pending_stock_review` (72h auto-cancel cron catches edge cases)
 - Admin Dashboard → Backorders tab badge count + Security Log tab
+
+### 5.0 BO V.4.0 — `all_backorder` State (2026-05-12 บอส principle #6313)
+
+**Boss directive (verbatim):** "ลูกค้ายืนยันรอของ ยังไม่ต้องวางบิล > เค้าต้องกดดู Liff Order เห็น BO ชัดเจน ยกเลิกออเดอร์ BO ได้ถ้าสินค้ายังไม่มา ออกแบบมาใหม่ดีๆ"
+
+**Bug (Order #6313):** Admin split with `qty_fulfill=0/qty_bo=1/ETA=45d` routed order to `partial_fulfilled` state. Customer received Flex "ยืนยันบิล" button → pressing it added debt ฿5,300 + issued INV ทันที **45 days BEFORE goods arrive**. Revenue recognition violation + customer trust damage.
+
+**Root cause:** No state distinction between "partial fulfilled (some shipped now)" vs "all backordered (nothing shipped yet)".
+
+**Fix:** NEW FSM state `all_backorder` (Snippet 14 V.1.9) + branching in `bo-split` (Snippet 16 V.4.0):
+
+| Condition | State | Customer Experience |
+| --- | --- | --- |
+| `qty_fulfill > 0` (any) + `qty_bo > 0` | `partial_fulfilled` | Confirm bill now for fulfilled portion; BO ships later |
+| `qty_fulfill = 0` ทุก SKU + `qty_bo > 0` | **`all_backorder`** | **No bill issued. View order. Cancel anytime.** Bill only when goods arrive. |
+
+**5 transitions** from `all_backorder`:
+
+- `all_backorder → awaiting_confirm` (any) — bo-fulfill last BO item completed → graduate to billing flow
+- `all_backorder → partial_fulfilled` (admin) — bo-fulfill บางส่วน + still BO remaining
+- `all_backorder → cancelled` (any) — postback `bo_cancel_all_customer` or admin manual
+- `all_backorder → cancel_requested` (customer) — LIFF "ยกเลิก BO" button
+- `all_backorder → pending_stock_review` (admin) — bo-undo-split escape hatch (≤10min)
+
+**Defense in depth:** No FSM transition `all_backorder → awaiting_payment` exists. Snippet 2 V.34.34 confirm_bill handler ALSO rejects `all_backorder` ("ออเดอร์นี้รอสินค้า BO เข้าก่อนครับ") + rejects `partial_fulfilled` ที่ fulfilled_qty=0 (กัน customer กด "ยืนยันบิล" ที่ยอด ฿0 กรณี all-BO มาก่อน split).
+
+**Customer LIFF experience** (`[b2b_bo_customer_order_detail]` shortcode + Snippet 11 V.30.6 `[b2b_orders]`):
+
+- Amber header `#b45309` "⏳ ออเดอร์รอสินค้า BO ทั้งหมด"
+- Items list with qty + ETA + ready badge
+- Banner: "ℹ️ ยังไม่เรียกเก็บเงิน — ระบบจะเรียกเก็บเมื่อของพร้อมจัดส่งเท่านั้น"
+- Banner: "💡 ยกเลิกออเดอร์ได้ตลอดเวลา ตราบใดที่ของยังไม่มา"
+- Red "❌ ยกเลิกออเดอร์ BO" button → `POST /b2b/v1/cancel-request`
+- Total: "ยอดรวม (ค้างจ่ายเมื่อของถึง): ฿XXX"
+
+**Drift detector:** `tests/jest/b2b-bo-all-backorder-drift.test.js` (27 assertions) locks FSM + Flex + postback + bo-fulfill auto-promote + LIFF maps.
+
+**Files (5 bumped 2026-05-12):**
+
+- Snippet 14 V.1.8 → V.1.9 (FSM state + 5 transitions)
+- Snippet 1 (labels + colors maps + all_backorder entry)
+- Snippet 2 V.34.33 → V.34.34 (confirm_bill guards)
+- Snippet 16 V.3.25 → V.4.0 (bo-split branching + 2 new helpers + postback + bo-fulfill auto-promote + customer shortcode branch)
+- Snippet 11 V.30.5 → V.30.6 (LIFF Order page maps)
+
+**Commits:** `03ca761` (FSM + bo-split + Flex + postback + bo-fulfill auto-promote) + `86d7023` (LIFF Order page + customer view + cancel_requested transition)
+
+---
 
 ### 5.1 Problem & Goal
 

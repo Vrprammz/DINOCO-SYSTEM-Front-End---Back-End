@@ -149,7 +149,7 @@
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
 | Snippet 1: Core Utilities & LINE Flex Builders | V.34.25 | 72 | LINE push, Flex templates, HMAC URL, bank helpers + **V.34.25 (2026-04-29)**: code-reviewer CRIT — G2 + BUG-2 dead-code conflict (json_decode→mutate→re-encode roundtrip in G2 retry sync + DLQ PII mask). **V.34.24**: Flash V.42 deep audit — BUG-2 CRITICAL subParcel JSON encoding (was PHP nested array → sign() cast "Array" → Flash hash mismatch on every multi-box) + BUG-1 omit insureDeclareValue when not insured + ISSUE-5 V.41 returnXXX 7 fields (walk-in tickets ตีกลับโกดัง) + ISSUE-6 V.41 articleCategory 99→6. **V.34.23**: G4 async snapshot defer (wp_schedule_single_event closes Round 4-8 HIGH-2). **V.34.22**: B5 audit trace fields (original_out_trade_no + g2_attempts + g2_outcome). **V.34.21**: G2 1003 outTradeNo recovery (mchPno query first, regenerate -r{n} suffix fallback). Earlier: V.34.20 AI accuracy metrics, V.33.7 b2b_rate_limit GET_LOCK |
-| Snippet 2: LINE Webhook Gateway & Order Creator | V.34.4 | 51 | Webhook endpoint, order lifecycle + **V.34.4 C2 FIX**: BO system gate ใน `confirm_order` ก่อน OOS check — route ไป `pending_stock_review` + snapshot + notify admin + opaque customer reply (ถ้า `b2b_flag_bo_system=ON`) |
+| Snippet 2: LINE Webhook Gateway & Order Creator | V.34.34 | 51 | Webhook endpoint, order lifecycle + **V.34.4 C2 FIX**: BO system gate ใน `confirm_order` ก่อน OOS check — route ไป `pending_stock_review` + snapshot + notify admin + opaque customer reply (ถ้า `b2b_flag_bo_system=ON`). **V.34.34 (2026-05-12)**: confirm_bill guards — reject `all_backorder` status ("ออเดอร์นี้รอสินค้า BO เข้าก่อนครับ") + reject `partial_fulfilled` ที่ `fulfilled_qty=0 && fulfilled_val<=0` (กัน customer กด "ยืนยันบิล" ที่ยอด ฿0 หลัง all-BO มาก่อน split). |
 | Snippet 3: LIFF E-Catalog REST API | V.41.4 | 52 | REST API + **V.41.4 C1 FIX**: `do_action('b2b_place_order_post_process')` หลังสร้าง order (Snippet 16 listens). **V.41.3 H4**: cancel grace period 5 นาที + tighter rate limit 2/hr/10/day. **V.41.2**: manual-flash-create warehouse/registered split |
 | Snippet 4: LIFF E-Catalog Frontend | V.32.4 | 53 | LIFF SPA for distributors (catalog, cart, history, SET detail view) + **V.32.2-V.32.4 UX overhaul**: qty stepper SET Detail (1-999) + back button ← กลับ + cart bar 64px green CTA z-index 600 + main SET stepper + cart thumbnails + sub-item stepper toggle + 🗑️ red remove |
 | Snippet 5: Admin Dashboard | V.33.2 | 54 | `[b2b_admin_dashboard]` -- Admin order management + Flash, leaf-only cancel restore + **V.33.2 (2026-04-29)**: G1 admin "Flash Create" REST routed via `b2b_flash_dispatch_create_all()` (V.42 GET_LOCK + walk-in guard + idempotency) instead of bypassing dispatcher |
@@ -158,12 +158,12 @@
 | Snippet 8: Distributor Ticket View | V.30.4 | 57 | `/b2b-ticket/` -- Order detail page (admin/customer split) |
 | Snippet 9: Admin Control Panel | V.34.0 | 58 | `[b2b_admin_control]` -- Distributors, products, settings, Flash + **V.34.0 (2026-04-29)**: G1 flash-test/run-step routes through dispatcher (consistency with production V.42 path) |
 | Snippet 10: Invoice Image Generator | V.30.8 | 61 | A4 invoice PNG (GD Library) — V.30.7 push observability, V.30.8 admin notice scoped + dismissible |
-| Snippet 11: Customer LIFF Pages | V.30.2 | 64 | `[b2b_commands]`, `[b2b_orders]`, `[b2b_account]` |
+| Snippet 11: Customer LIFF Pages | V.30.6 | 64 | `[b2b_commands]`, `[b2b_orders]`, `[b2b_account]` + **V.30.6 (2026-05-12)**: `all_backorder` status visibility — labels + colors + bg + step_map maps + embed `[b2b_bo_customer_order_detail]` shortcode trigger เมื่อ status in {pending_stock_review, partial_fulfilled, all_backorder} |
 | Snippet 12: Admin Dashboard LIFF | V.31.2 | 65 | `[b2b_dashboard]`, `[b2b_stock_manager]`, `[b2b_tracking_entry]` |
 | Snippet 13: Debt Transaction Manager | V.2.0 | 1036 | Atomic debt operations (MySQL transactions, FOR UPDATE) |
-| Snippet 14: Order State Machine | V.1.6 | 1038 | B2B_Order_FSM class + **V.1.6**: `pending_stock_review` + `partial_fulfilled` states (BO system) — 16 statuses total |
+| Snippet 14: Order State Machine | V.1.9 | 1038 | B2B_Order_FSM class + **V.1.6**: `pending_stock_review` + `partial_fulfilled` states (BO system) — 16 statuses. **V.1.9 (2026-05-12)**: NEW state `all_backorder` (BO V.4.0) — admin split qty_fulfill=0 ทุก SKU = รอ BO ทั้งหมด → ยังไม่ออกบิล. 5 transitions: pending_stock_review → all_backorder (admin) / all_backorder → {awaiting_confirm, partial_fulfilled, cancelled, cancel_requested (customer), pending_stock_review undo}. confirm_bill blocked at FSM (ไม่มี → awaiting_payment) = defense in depth. |
 | Snippet 15: Custom Tables & JWT Session | V.7.5 | 1039 | Product catalog table, JWT, DINOCO_MotoDB class, 3-level SKU hierarchy helpers + **V.7.5 polish**: M1 header doc drift fix (ลบ "FOR UPDATE race safety" — idempotent unlock ไม่ต้อง lock) + H1 static cache caveat. **V.7.4 Phase 0 Hotfix**: `dinoco_stock_auto_status()` cascade auto-unlock manual_hold (whitelist reason + 72h buffer + flag `dinoco_auto_unlock_enabled`) |
-| Snippet 16: Backorder System | V.2.9 | pending | **Opaque Accept + Admin Split BO** (FEATURE-SPEC-B2B-BACKORDER-2026-04-16). 14 REST endpoints + 4 Flex + 6 cron + 4 shortcodes. Master flag `b2b_flag_bo_system` default OFF. **V.2.9 (2026-04-29)**: PERF /bo-pending-review cache priming (loop pre-fix called get_field + 2× get_post_meta + get_the_title per order = 4 DB queries × N orders worst 800 → fix `_prime_post_caches` + `update_meta_cache` once = 90%+ DB roundtrip elimination) + dead code stale comment cleanup. **V.2.8**: G3 BO secondary fallback removed (broken `b2b_flash_create_order($order_id, array(...))` array→int(1) coerce silent miscall) → new behavior set `_flash_bo_pending` meta for admin manual intervention. **V.1.6 gap fixes** (4 CRIT + 6 HIGH + 2 MEDIUM): C1 place-order hook + C2 confirm_order BO gate + C3 Split BO deep-link + H1 badge + H2-H6 endpoints + M3/M6/M7 fixes. ~3497 LOC. |
+| Snippet 16: Backorder System | V.4.0 | pending | **Opaque Accept + Admin Split BO** (FEATURE-SPEC-B2B-BACKORDER-2026-04-16). 14 REST endpoints + 5 Flex + 6 cron + 4 shortcodes. Master flag `b2b_flag_bo_system` default OFF. **V.4.0 (2026-05-12, บอส principle #6313)**: NEW `all_backorder` flow — admin split qty_fulfill=0 → state `all_backorder` (ไม่ใช่ partial_fulfilled). NEW `b2b_build_flex_all_backorder_customer()` (amber header + ไม่มีปุ่มบิล + "ยกเลิก BO" button). NEW `b2b_bo_notify_customer_all_backorder()` push helper. NEW postback `bo_cancel_all_customer` (ownership+status guard). bo-fulfill auto-promote (`$prev_status==='all_backorder'` → awaiting_confirm + clear marker). `[b2b_bo_customer_order_detail]` shortcode ได้ all_backorder branch. บอส principle: "ลูกค้ารอของ ยังไม่วางบิล + ยกเลิกได้ถ้าของยังไม่มา". **V.3.25** (2026-05-11): 13-commit emergency BO loop stabilization — FULL REDESIGN 7 Flex builders (admin stock_review with images + customer split view) + V.34.32-34.34 Snippet 2 fixes. **V.2.9 (2026-04-29)**: PERF /bo-pending-review cache priming (90%+ DB roundtrip elimination). **V.2.8**: G3 BO secondary fallback removed. **V.1.6 gap fixes** (4 CRIT + 6 HIGH + 2 MEDIUM): C1 place-order hook + C2 confirm_order BO gate + C3 Split BO deep-link + H1 badge + H2-H6 endpoints + M3/M6/M7 fixes. ~3800 LOC. |
 
 ### 2.5 [B2F] -- Factory Purchasing System (13 Snippets)
 
@@ -352,7 +352,7 @@ Namespace สำหรับ B2B Backorder System ([B2B] Snippet 16 V.1.6). Mast
 
 | Method | Endpoint | Purpose | Gates |
 |--------|----------|---------|-------|
-| POST | `/bo-split` | Split pending order → fulfilled + BO items | invariant check, per-SKU compound debt, 10min undo window |
+| POST | `/bo-split` | Split pending order → fulfilled + BO items | **V.4.0**: detects qty_fulfill=0 ทุก SKU → routes to `all_backorder` state (instead of `partial_fulfilled`) + sets `_b2b_all_backorder=1` postmeta. invariant check, per-SKU compound debt, 10min undo window. |
 | POST | `/bo-confirm-full` | Admin confirms full stock (no split) | FSM pending_stock_review → awaiting_confirm |
 | POST | `/bo-reject` | Admin rejects entire order | revert counters + notify customer cancelled |
 | POST | `/bo-undo-split` | Undo split within 10min window | 1 max/order, must have no fulfilled BO |
@@ -367,6 +367,21 @@ Namespace สำหรับ B2B Backorder System ([B2B] Snippet 16 V.1.6). Mast
 | GET | `/bo-pending-review` | List orders status=pending_stock_review | server-side meta_query (แก้ WP REST quirk) |
 | GET | `/bo-order-detail?order_id=N` | Single order + fresh_snapshot (real-time recompute) | fallback to stock_snapshot |
 | GET | `/bo-summary` | Badge counts for sidebar | pending_review + bo_pending + bo_ready + enumeration_flagged |
+
+**LINE postback handler** (V.4.0): `bo_cancel_all_customer` — customer LIFF "ยกเลิก BO" button → registered via `b2b_webhook_postback_action` filter. Ownership guard (verify order.distributor_id matches sender LINE group) + status guard (only `all_backorder` or `pending_stock_review`) + cancel `bo_queue` rows + FSM transition → cancelled + admin notify.
+
+**LINE Flex builders** (V.4.0): NEW `b2b_build_flex_all_backorder_customer($order_id)` — amber header `#b45309` "⏳ ออเดอร์รอสินค้า BO ทั้งหมด" + items list (qty + ETA + ready badge) + "ℹ️ ยังไม่เรียกเก็บเงิน" hint + "💡 ยกเลิกได้ตลอดเวลา" + red "❌ ยกเลิกออเดอร์ BO" button → `POST /b2b/v1/cancel-request`. NEW `b2b_bo_notify_customer_all_backorder($order_id)` push wrapper.
+
+**FSM transitions** (Snippet 14 V.1.9 — `all_backorder` state):
+
+| From | To | Actor | Trigger |
+| --- | --- | --- | --- |
+| `pending_stock_review` | `all_backorder` | admin | bo-split with qty_fulfill=0 ทุก SKU |
+| `all_backorder` | `awaiting_confirm` | any | bo-fulfill last BO item completed |
+| `all_backorder` | `partial_fulfilled` | admin | bo-fulfill บางส่วน + still BO remaining |
+| `all_backorder` | `cancelled` | any | bo_cancel_all_customer postback / admin manual |
+| `all_backorder` | `cancel_requested` | customer | LIFF cancel button via /cancel-request |
+| `all_backorder` | `pending_stock_review` | admin | bo-undo-split (escape hatch ≤10min) |
 
 **Supporting endpoints** (ใน Snippet 3 V.41.4): `do_action('b2b_place_order_post_process')` หลังสร้าง order → Snippet 16 listener ตรวจ flag + route ไป `pending_stock_review`.
 
