@@ -2,6 +2,12 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.44 (2026-05-13) — Phase 7 P0 B1: F#8 LIFF marketplace║
+ * ║    /{id}/status endpoint MISSING — customer LIFF polls every 10s ║
+ * ║    after slip upload waiting for admin verify, got 404 forever.   ║
+ * ║    NEW route registered + dinoco_sn_rest_marketplace_status()     ║
+ * ║    handler. Owner-only gate + admin bypass. Returns payment_status║
+ * ║    + warranty_until_new (paid) + rejection_reason (rejected).     ║
  * ║  Version: V.0.43 (2026-05-12) — R11 HIGH-2: pool_stats_v1        ║
  * ║    transient missing from cache invalidation chain. NEW listener ║
  * ║    on dinoco_sn_pool_status_changed @ priority 6 (alongside MCP).║
@@ -2189,6 +2195,19 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
         register_rest_route( DINOCO_SN_REST_NAMESPACE, '/marketplace/(?P<id>\d+)/receipt', array(
             'methods'             => 'GET',
             'callback'            => 'dinoco_sn_rest_marketplace_receipt',
+            'permission_callback' => 'dinoco_sn_perm_logged_in',
+            'args'                => array(
+                'id' => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /marketplace/{id}/status — Phase 7 P0 (2026-05-13) B1 bug fix
+        // Customer LIFF polls this every 10s after slip upload waiting for admin verify.
+        // Previously: route never registered → LIFF stuck in 404 verify loop forever.
+        // Returns payment_status + warranty_until_new (when paid) + rejection_reason (when rejected).
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/marketplace/(?P<id>\d+)/status', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_marketplace_status',
             'permission_callback' => 'dinoco_sn_perm_logged_in',
             'args'                => array(
                 'id' => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
@@ -9402,6 +9421,76 @@ if ( ! function_exists( 'dinoco_sn_rest_marketplace_receipt' ) ) {
             'receipt_url'  => $receipt_url,
             'note'         => 'Receipt PDF rendering deferred to W17',
         ) );
+    }
+}
+
+/* ─── Customer endpoint #5: GET /marketplace/{id}/status ─────────────────
+ *
+ * Phase 7 P0 B1 (2026-05-13) bug fix — Customer LIFF polls every 10s
+ * after slip upload waiting for admin verify. Route was missing → 404 loop.
+ *
+ * Returns payment_status + warranty_until_new (when paid) + rejection_reason
+ * (when rejected). Owner-only gate (registered_user_id match) + admin bypass.
+ */
+
+if ( ! function_exists( 'dinoco_sn_rest_marketplace_status' ) ) {
+    function dinoco_sn_rest_marketplace_status( $req ) {
+        if ( ! dinoco_sn_marketplace_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'Marketplace disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        global $wpdb;
+        $extension_id = (int) $req->get_param( 'id' );
+        $user_id      = get_current_user_id();
+
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'extensions' ) ) {
+            return new WP_Error( 'schema_not_ready', __( 'extensions table missing', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        $tbl = dinoco_sn_table( 'extensions' );
+
+        // Defensive: select columns that might not exist in legacy schema via try/catch.
+        $ext = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, user_id, sn, payment_status, payment_method, payment_ref,
+                    extension_months, price_paid,
+                    warranty_until_old, warranty_until_new,
+                    rejection_reason, slip_image_id, receipt_invoice_id,
+                    created_at, paid_at, cancelled_at
+             FROM {$tbl} WHERE id = %d",
+            $extension_id
+        ) );
+        if ( ! $ext ) {
+            return new WP_Error( 'not_found', __( 'Extension not found', 'dinoco-sn' ), array( 'status' => 404 ) );
+        }
+        if ( (int) $ext->user_id !== $user_id && ! current_user_can( 'manage_options' ) ) {
+            return new WP_Error( 'not_yours', __( 'Extension not yours', 'dinoco-sn' ), array( 'status' => 403 ) );
+        }
+
+        // Build status response — LIFF polling switches on `status` field
+        $resp = array(
+            'extension_id'      => (int) $ext->id,
+            'sn'                => (string) $ext->sn,
+            'status'            => (string) $ext->payment_status,  // 'pending_payment' | 'paid' | 'rejected' | 'expired' | 'refunded'
+            'payment_method'    => (string) ( $ext->payment_method ?? '' ),
+            'payment_ref'       => (string) ( $ext->payment_ref ?? '' ),
+            'extension_months'  => isset( $ext->extension_months ) ? (int) $ext->extension_months : null,
+            'price_paid'        => isset( $ext->price_paid ) ? (float) $ext->price_paid : null,
+            'has_slip'          => ! empty( $ext->slip_image_id ),
+            'created_at'        => (string) ( $ext->created_at ?? '' ),
+        );
+
+        // Add fields based on terminal status
+        if ( $ext->payment_status === 'paid' ) {
+            $resp['paid_at']           = (string) ( $ext->paid_at ?? '' );
+            $resp['new_warranty_end']  = (string) ( $ext->warranty_until_new ?? '' );
+            $resp['old_warranty_end']  = (string) ( $ext->warranty_until_old ?? '' );
+            $resp['has_receipt']       = ! empty( $ext->receipt_invoice_id );
+        } elseif ( $ext->payment_status === 'rejected' ) {
+            // PII-safe: redact dollar amounts in reason if any; admins see full via dashboard
+            $reason = (string) ( $ext->rejection_reason ?? '' );
+            $resp['rejection_reason'] = $reason !== '' ? $reason : __( 'Slip verification failed', 'dinoco-sn' );
+            $resp['cancelled_at']     = (string) ( $ext->cancelled_at ?? '' );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 
