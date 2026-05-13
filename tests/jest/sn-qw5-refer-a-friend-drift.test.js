@@ -91,3 +91,71 @@ describe("QW-5 Refer-a-Friend (Phase 6 backlog) drift detector", () => {
         expect(code).toMatch(/dinoco_obs_capture_exception\(\s*\$e,\s*array\(\s*'context'\s*=>\s*'sn_referral_auto_generate'/);
     });
 });
+
+// Phase 7 P2 (2026-05-13) — Member Dashboard refer card drift detector
+describe("QW-5 Member Dashboard refer card (Phase 7 P2)", () => {
+    let dash;
+
+    beforeAll(() => {
+        const dashPath = path.join(REPO_ROOT, "[System] Member Dashboard Main");
+        dash = fs.readFileSync(dashPath, "utf8");
+        // Don't strip <style>/<script> blocks inside heredocs
+    });
+
+    test("dinoco_dashboard_refer_friend_card function defined", () => {
+        expect(dash).toMatch(/function\s+dinoco_dashboard_refer_friend_card\s*\(/);
+    });
+
+    test("card uses dinoco_sn_get_or_create_referral_code (idempotent lazy)", () => {
+        expect(dash).toMatch(/dinoco_sn_get_or_create_referral_code\(\s*\$user_id\s*\)/);
+    });
+
+    test("defensive — function_exists guard before calling Notifier helpers", () => {
+        const idx = dash.indexOf("function dinoco_dashboard_refer_friend_card");
+        const body = dash.slice(idx, idx + 6000);
+        expect(body).toMatch(/function_exists\(\s*'dinoco_sn_get_or_create_referral_code'\s*\)/);
+    });
+
+    test("renders LINE share deep link (line.me/R/msg/text)", () => {
+        expect(dash).toMatch(/line\.me\/R\/msg\/text\//);
+    });
+
+    test("renders copy-to-clipboard button with data-code attr", () => {
+        expect(dash).toMatch(/dnc-sn-refer-copy-btn/);
+        expect(dash).toMatch(/data-code=/);
+    });
+
+    test("shows redeemed_count + reward_pending when > 0", () => {
+        const idx = dash.indexOf("function dinoco_dashboard_refer_friend_card");
+        const body = dash.slice(idx, idx + 6000);
+        expect(body).toMatch(/\$redeemed\s*>\s*0/);
+        expect(body).toMatch(/redeemed_count/);
+        expect(body).toMatch(/reward_pending/);
+    });
+
+    test("shortcode renders card only when user has plates", () => {
+        // Wired inside shortcode body — guard with has_plates check
+        expect(dash).toMatch(/dinoco_dashboard_refer_friend_card\(\s*\$current_user_id\s*\)/);
+        // The guard nearby: $has_plates = is_array( $rf_stats ) && ( (int) ... > 0 )
+        const callIdx = dash.indexOf("dinoco_dashboard_refer_friend_card( $current_user_id )");
+        expect(callIdx).toBeGreaterThan(-1);
+        const surrounding = dash.slice(Math.max(0, callIdx - 600), callIdx);
+        expect(surrounding).toMatch(/\$has_plates/);
+    });
+
+    test("clipboard fallback — textarea + execCommand for older browsers", () => {
+        expect(dash).toMatch(/execCommand\(\s*['"]copy['"]\s*\)/);
+        expect(dash).toMatch(/document\.body\.appendChild/);
+    });
+
+    test("scoped CSS prefix .dnc-sn-refer-* (no global namespace bleed)", () => {
+        expect(dash).toMatch(/\.dnc-sn-refer-friend-card/);
+        expect(dash).toMatch(/\.dnc-sn-refer-code-box/);
+        expect(dash).toMatch(/\.dnc-sn-refer-share-btn/);
+    });
+
+    test("a11y — share btn min-height 44px (WCAG AA touch target)", () => {
+        expect(dash).toMatch(/\.dnc-sn-refer-share-btn[\s\S]{0,300}min-height\s*:\s*44px/);
+    });
+});
+

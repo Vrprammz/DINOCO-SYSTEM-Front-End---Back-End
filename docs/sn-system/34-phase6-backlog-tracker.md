@@ -21,7 +21,7 @@ LT-1..LT-4 tracked separately in `docs/sn-system/33-phase6-strategic-foundations
 | ID | Feature | Status | Effort | Blocker | Owner |
 | --- | --- | --- | --- | --- | --- |
 | **QW-2** | Digital Wallet Card (Apple Wallet `.pkpass` + Google Pay JWT) | 🔴 BLOCKED | ~12h | Apple Developer account + Google Wallet partnership | บอส (vendor decision) |
-| **QW-5** | Refer-a-Friend Code | ✅ MVP LANDED 2026-05-13 (V.0.7) | 6/10h | Member dashboard UI surface pending | Tech Lead |
+| **QW-5** | Refer-a-Friend Code | ✅ MVP + Member Dashboard UI LANDED 2026-05-13 (V.0.7 + Member Dashboard Main V.31.6) | 9/10h | Redemption hook at warranty extension checkout (final 1h) | Tech Lead |
 | **QW-7** | Smart Service Reminder (1y check-up push) | 🟡 KB-BLOCKED | ~4h | Need product service interval data in KB | Tech Lead + KB team |
 
 **QW-5 implementation status** (commit pending this batch):
@@ -31,10 +31,10 @@ LT-1..LT-4 tracked separately in `docs/sn-system/33-phase6-strategic-foundations
 - ✅ Helper: `dinoco_sn_get_referral_stats($user_id)` — returns `{code, redeemed_count, reward_pending}`
 - ✅ Auto-trigger: listens to `dinoco_sn_pool_status_changed_for_user` (R3 cache invalidation chain) → fires on first registration
 - ✅ Defensive: try/catch + `dinoco_obs_capture_exception` (R11 signature)
-- ✅ Drift detector: `tests/jest/sn-qw5-refer-a-friend-drift.test.js` (11 assertions)
+- ✅ Drift detector: `tests/jest/sn-qw5-refer-a-friend-drift.test.js` (11+10 assertions Phase 6+7)
 - ✅ Reward configurable via `wp_option dinoco_sn_referral_reward_thb` (default 100.0)
-- ⏳ TODO: Member Dashboard UI section "Refer a Friend" (show code + redeemed count + share link)
-- ⏳ TODO: Redemption hook (when friend uses code → mark referrer reward credit pending)
+- ✅ **Member Dashboard UI** (Phase 7 P2 2026-05-13, V.31.6): green gradient card with code + copy-to-clipboard btn + LINE share deep link + stats row (when redeemed > 0). Renders only if user has plates registered.
+- ⏳ TODO: Redemption hook (when friend uses code → mark referrer reward credit pending) — wire to Warranty Extension Marketplace checkout coupon flow
 - ⏳ TODO: Admin approval flow for crediting referrer reward (manual review prevents abuse)
 
 ### RD (Revenue Drivers) — Analytics + ML
