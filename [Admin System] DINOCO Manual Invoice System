@@ -2,6 +2,14 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.36.1 (2026-05-14) — Round 54 Idempotency-Key wrapper on 4 retry-prone slip + destructive POSTs (🎯 80% milestone reached 157/196 = 80.1%):
+ *   - /invoice/verify-slip (CRITICAL Slip2Go quota burn — admin "ตรวจสลิป" double-click on ~1-3s API + record_payment cascade)
+ *   - /invoice/verify-slip-combined (CRITICAL Slip2Go quota burn + cross-invoice auto-match cascade — body sorts invoice_ids[] for order-stable hash)
+ *   - /invoice/upload-slip (binary-fingerprint pattern 2nd instance after R42 upload-image — base64 sha1 EXCLUDED-raw pattern; ~3-5s Slip2Go base64 verify + record_payment cascade)
+ *   - /invoice/delete (destructive admin double-click guard — audit row spam dedup)
+ *   All body hashes include actor_user_id (Round 30+ pattern). Layered defense over existing
+ *   5min Slip2Go transient cache + trans_ref dedup (different keys; both coexist).
+ *   Manual Invoice cluster coverage: 14 → 18/22 = 81.8%. Total: 153 → 157 / 196 = 🎯 80.1%.
  * Version: V.36.0 (2026-05-13) — Sprint 4D ARIA accessibility pass (WCAG 2.1 AA foundation):
  *   • Added 30+ ARIA attributes across List View / Builder View / 6 modals (picker, multi-picker,
  *     payment, refund, slip, combined-slip, summary). Patterns applied:
@@ -2485,6 +2493,36 @@ function dinoco_inv_rest_verify_slip(WP_REST_Request $req) {
     if ($inv_status === 'paid') return new WP_Error('already_paid', 'ใบแจ้งหนี้นี้ชำระครบแล้ว', ['status' => 400]);
     if ($inv_status !== 'awaiting_payment') return new WP_Error('invalid_status', 'ตรวจสลิปได้เฉพาะสถานะรอชำระเงินเท่านั้น', ['status' => 400]);
 
+    // V.35.3 Round 54: Idempotency-Key wrapper — CRITICAL retry-prone (Slip2Go API quota burn).
+    // Admin "ตรวจสลิป" double-click on slow Slip2Go API (~1-3s) → 2× Slip2Go quota burn + 2×
+    // record_payment cascade. Body hash = {id, slip_url, actor_user_id} — same slip on retry
+    // replays cached response; different slip_url mid-retry → 409 (admin pasted wrong URL).
+    // Layered defense over existing b2b_slip_get_cached_response_by_url 5min cache (different
+    // key — central helper uses standard X-Idempotency-Key HTTP header; both coexist).
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/verify-slip';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array(
+            'id'              => (int) $id,
+            'slip_url'        => $slip_url,
+            'actor_user_id'   => (int) get_current_user_id(),
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     $api_url = defined('B2B_SLIP2GO_API_URL') ? B2B_SLIP2GO_API_URL : '';
     $secret  = defined('B2B_SLIP2GO_SECRET_KEY') ? B2B_SLIP2GO_SECRET_KEY : '';
     if (!$api_url || !$secret) return new WP_Error('config', 'ยังไม่ได้ตั้งค่า Slip2Go API', ['status' => 500]);
@@ -2555,11 +2593,24 @@ function dinoco_inv_rest_verify_slip(WP_REST_Request $req) {
         $fake_req->set_param('id', $id);
         $fake_req->set_param('amount', $amount);
         $fake_req->set_param('note', $note);
-        return dinoco_inv_rest_record_payment($fake_req);
+        $resp_obj = dinoco_inv_rest_record_payment($fake_req);
+        if (!is_wp_error($resp_obj) && $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+            $resp_data = ($resp_obj instanceof WP_REST_Response) ? $resp_obj->get_data() : $resp_obj;
+            if (is_array($resp_data)) {
+                dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+                    array_merge($resp_data, array('_idem_code' => 200)), 200);
+            }
+        }
+        return $resp_obj;
     }
 
     $reason = (is_array($body) ? ($body['message'] ?? '') : '') ?: 'Slip2Go ปฏิเสธการตรวจสอบ';
-    return rest_ensure_response(['success' => false, 'verified' => false, 'reason' => $reason]);
+    $resp_arr = ['success' => false, 'verified' => false, 'reason' => $reason];
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($resp_arr, array('_idem_code' => 200)), 200);
+    }
+    return rest_ensure_response($resp_arr);
 }
 
 // --- COMBINED SLIP VERIFY (V.2.6) ---
@@ -2578,6 +2629,39 @@ function dinoco_inv_rest_verify_slip_combined(WP_REST_Request $req) {
     $dist_id  = intval($req->get_param('dist_id'));
     $manual_ids = $req->get_param('invoice_ids'); // optional: admin pre-selects invoices
     if (!$slip_url) return new WP_Error('invalid', 'กรุณาระบุ URL สลิป', ['status' => 400]);
+
+    // V.35.3 Round 54: Idempotency-Key wrapper — CRITICAL retry-prone (Slip2Go quota burn
+    // + cross-invoice auto-match cascade). Admin "ตรวจสลิปรวม" double-click on slow Slip2Go API
+    // + per-invoice record_payment loop → 2× Slip2Go quota + 2× audit row spam across N invoices.
+    // Body hash = {slip_url, dist_id, invoice_ids_sorted_normalized, actor_user_id}. Different
+    // dist_id or invoice_ids subset mid-retry → 409 (admin reselected scope). Layered defense
+    // over 5min slip_url transient cache (b2b_slip_get_cached_response_by_url) + trans_ref dedup.
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/verify-slip-combined';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $invoice_ids_norm = is_array($manual_ids) ? array_values(array_unique(array_map('intval', $manual_ids))) : array();
+        sort($invoice_ids_norm, SORT_NUMERIC);
+        $idem_body = array(
+            'slip_url'      => $slip_url,
+            'dist_id'       => (int) $dist_id,
+            'invoice_ids'   => $invoice_ids_norm,
+            'actor_user_id' => (int) get_current_user_id(),
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
 
     // Call Slip2Go (with H8 idempotency cache)
     $api_url = defined('B2B_SLIP2GO_API_URL') ? B2B_SLIP2GO_API_URL : '';
@@ -2778,6 +2862,10 @@ function dinoco_inv_rest_verify_slip_combined(WP_REST_Request $req) {
         ' match=' . $match_type . ' (' . count($paid_invoices) . ' ใบ) dist=' . ($pending_data['dist_name'] ?? '')
         . ($from_cache ? ' (cached)' : ''));
 
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($result, array('_idem_code' => 200)), 200);
+    }
     return rest_ensure_response($result);
 }
 
@@ -2795,6 +2883,36 @@ function dinoco_inv_rest_upload_slip(WP_REST_Request $req) {
     // Validate base64 data URI format
     if (!preg_match('/^data:image\/(jpeg|png|webp|jpg);base64,/', $image)) {
         return new WP_Error('invalid', 'รูปภาพไม่ถูกต้อง (รองรับ JPEG, PNG, WebP)', ['status' => 400]);
+    }
+
+    // V.35.3 Round 54: Idempotency-Key wrapper — binary-fingerprint pattern (2nd instance after
+    // Round 42 upload-image). Admin "อัพโหลดสลิป" double-click on slow Slip2Go base64 verify
+    // (~3-5s) → 2× quota burn + 2× record_payment cascade. Body hash = {id, image_sha1,
+    // actor_user_id} — sha1 fingerprint of base64 image (mirror combined-slip-upload R29 +
+    // upload-image R42 EXCLUDE-raw-image pattern); same image on retry replays cached response;
+    // different image mid-retry → 409 (admin selected different file).
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/upload-slip';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array(
+            'id'            => (int) $id,
+            'image_sha1'    => sha1((string) $image),
+            'actor_user_id' => (int) get_current_user_id(),
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
     }
 
     $api_url = defined('B2B_SLIP2GO_API_URL')
@@ -2969,7 +3087,7 @@ function dinoco_inv_rest_upload_slip(WP_REST_Request $req) {
             b2b_line_push_raw($gid, [$flex]);
         }
 
-        return rest_ensure_response([
+        $success_resp = [
             'success'    => true,
             'verified'   => true,
             'amount'     => $amount,
@@ -2978,7 +3096,12 @@ function dinoco_inv_rest_upload_slip(WP_REST_Request $req) {
             'ref'        => $trans_ref,
             'date'       => $trans_date,
             'fully_paid' => $fully_paid,
-        ]);
+        ];
+        if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+            dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+                array_merge($success_resp, array('_idem_code' => 200)), 200);
+        }
+        return rest_ensure_response($success_resp);
     }
 
     // Other error codes
@@ -3403,13 +3526,46 @@ function dinoco_inv_rest_distributor_detail(WP_REST_Request $req) {
 function dinoco_inv_rest_delete(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
+
+    // V.35.3 Round 54: Idempotency-Key wrapper — destructive admin op double-click guard.
+    // Admin "ลบ" double-click on slow delete_post_meta + audit log INSERT → 2× audit row spam
+    // (delete_post_meta itself is idempotent — no-op on 2nd call). Body hash = {id,
+    // actor_user_id} single shape. Cached replay skips 2× audit row + 2× any future hook chain.
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/delete';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array(
+            'id'            => (int) $id,
+            'actor_user_id' => (int) get_current_user_id(),
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     $status = get_field('order_status', $id);
     if (!in_array($status, ['draft', 'cancelled'])) return new WP_Error('invalid', 'ลบได้เฉพาะ Draft หรือ ยกเลิก', ['status' => 400]);
     // Remove the manual_invoice marker so post disappears from invoice list
     // but remains as a b2b_order (visible in B2B Orders tab)
     delete_post_meta($id, '_order_source');
     b2b_add_audit_log($id, 'invoice_removed', 'ลบออกจากรายการใบแจ้งหนี้ (b2b_order ยังคงอยู่)');
-    return rest_ensure_response(['success' => true]);
+    $resp = array('success' => true);
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+    return rest_ensure_response($resp);
 }
 
 
