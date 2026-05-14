@@ -10,6 +10,34 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Added — Phase 6 backlog sprint (2026-05-14)
+
+Closed all remaining unblocked items in `docs/sn-system/34-phase6-backlog-tracker.md`. Boss-confirmed plan v2.13 work surface for SN system = COMPLETE pending operational steps (boss QA staging, Q15 role seeding, F#8 legal workstream).
+
+**Commits**:
+
+- `ecb3fac` QW-5 finish — wire referral redemption into Marketplace checkout
+  - Notifier V.0.8 → V.0.10: NEW `dinoco_sn_redeem_referral_code()` + `dinoco_sn_promo_codes_has_referrer_col()` lazy ALTER guard (INFORMATION_SCHEMA precheck + idempotent ADD COLUMN + ADD KEY idx_referrer + MODIFY code VARCHAR(40))
+  - SN REST V.0.46 → V.0.47: marketplace `/checkout` wires 2-pass redemption (preview discount via template lookup → INSERT extension → commit redemption post-INSERT with extension_id as used_order_id)
+  - Manager V.0.59 → V.0.60: dbDelta schema declares `referrer_user_id` natively + `code` widened VARCHAR(40)
+  - Validation chain: expiry + self-referral block + per-friend dedup + 1 referrer code = 1 use per friend
+  - Template row stays `used_at=NULL` permanent; each friend redemption INSERTs separate audit row with `referrer_user_id` pointer
+  - `dinoco_sn_get_referral_stats()` counts via `referrer_user_id` (modern) with legacy code-match fallback
+  - 31-assertion drift detector `tests/jest/sn-qw5-redemption-drift.test.js`
+  - Admin reward credit UI deferred (manual SQL audit until volume justifies)
+- `d14a6b5` OP-3 expansion — 3 new bulk endpoints close plan §K.4 surface (5/5)
+  - SN REST V.0.47 → V.0.48
+  - `POST /bulk/relink` — in_pool/reserved only, max 100, target SKU validation, plate_relinked audit
+  - `POST /bulk/notify` — max 500 (LINE quota), preference gate `dinoco_sn_should_send_to_user('admin_announcement')`, defensive `b2b_send_text_message` guard, rate limit 3/10min, bulk_notify_sent audit with 80-char preview
+  - `POST /bulk/transfer` — in_pool/reserved only, max 100, target batch existence + closed/cancelled rejection, skip same-batch no-op, idempotent with target_batch_id in body hash, plate_transferred audit with from/to batch_id
+  - All 3 endpoints follow V.0.45 baseline: feature_disabled check + GET_LOCK + START TRANSACTION + FOR UPDATE per plate + skip-conflicts results[] + \\Throwable catch + dinoco_obs_capture R11 signature + dinoco_sn_perm_admin permission
+  - 37-assertion drift detector `tests/jest/sn-bulk-admin-wizard-expansion-drift.test.js`
+  - Wizard UI deferred (admin power-user can invoke REST until volume justifies UI)
+
+**Test infrastructure**: PHPUnit 2807 stable · Jest 89 → 91 suites · 3172 → 3240 tests (+68) · 0 regressions · PHP lint clean across 3 modified snippets.
+
+**Phase 6 backlog status post-sprint**: ✅ QW-5 (10/10h) · ✅ OP-3 (9/12h expansion, UI deferred) · ✅ QW-7 basic (2026-05-13) · ✅ RD-2 MVP (V.0.46) · ✅ RM-3 admin-only (2026-05-13). Blocked items unchanged (QW-2 vendor / RD-4 data / OP-4 business / RM-4 deferred Q22).
+
 ### Refactor — Sprint 32-35 Claim Lifecycle UX consolidation (2026-05-14)
 
 19-sprint Claim Lifecycle campaign culminated in Sprint 32 deprecation of standalone `/claim-pay/` + `/claim-history/` LIFF pages → collapsed into Member Dashboard hub (canonical surface pattern).
