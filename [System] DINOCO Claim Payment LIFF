@@ -1,6 +1,21 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO Claim Payment LIFF                              ║
+ * ║  Version: V.0.3 (2026-05-14) — Sprint 14 code-reviewer remediation:║
+ * ║    • H1 idempotency hash adds `from_state` + caller-supplied      ║
+ * ║      `discriminator` (R42 binary-fingerprint). Customer re-upload  ║
+ * ║      after admin rejected (rejected→pending_review) no longer     ║
+ * ║      hash-collides with initial upload — replay-blocking gap.     ║
+ * ║    • H3 anti-enumeration on upload-slip — rate limit (100/hr) BEFORE║
+ * ║      ownership SELECT + 404 (not 403) on mismatch. Closes timing  ║
+ * ║      + code oracle for unowned-charge probing.                    ║
+ * ║    • M2 expire sweep chunked + replication-safe — 100/iter × 5max,║
+ * ║      ORDER BY id ASC, 240s wall-clock deadline, heartbeat moved   ║
+ * ║      into `finally` block (R12 pattern). Was: single LIMIT 500 no ║
+ * ║      pagination → worst-case 2500s could overlap next cron run.   ║
+ * ║    • M3 sweep `actor_user_id => 0` explicit context — Health      ║
+ * ║      Monitor sees cron-actor transitions distinctly from user.    ║
+ * ║                                                                   ║
  * ║  Version: V.0.2 (2026-05-14) — Sprint 13 Phase 2.5 implementation: ║
  * ║    FSM helper + 5 REST mutation endpoints + action contract.    ║
  * ║    Per orchestrator FINAL bindings B1+B3+B4:                    ║
@@ -422,12 +437,34 @@ if ( ! function_exists( 'dinoco_claim_payment_wrapped_transition' ) ) {
             if ( is_wp_error( $rl ) ) return $rl;
         }
 
-        // Idempotency wrap (Round 30+ pattern)
+        // V.0.6 Sprint 14 H1 fix — idempotency body hash MUST include `from_state`
+        // (and `discriminator` if caller supplied) so identical (charge_id,
+        // to_state, actor_user_id) triples at different lifecycle moments
+        // produce distinct hashes. Without from_state: customer upload-slip
+        // (pending_payment→pending_review) and customer re-upload after admin
+        // rejected slip (rejected→pending_review) hash identically → cached
+        // replay returns stale prior result without firing FSM transition.
+        // We probe from_state via SELECT (cheap — single int read).
+        $from_state = '';
+        if ( function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            global $wpdb;
+            $table = dinoco_claim_charges_table_name();
+            $from_state = (string) $wpdb->get_var( $wpdb->prepare(
+                "SELECT status FROM {$table} WHERE id = %d", (int) $charge_id
+            ) );
+        }
         $body = array(
             'charge_id'     => (int) $charge_id,
+            'from_state'    => $from_state,
             'to_state'      => (string) $to_state,
             'actor_user_id' => $uid,
         );
+        // Caller may pass a `discriminator` (e.g. slip_sha256 for upload, or
+        // refund_amount_cents for refund) inside $context — copy it into hash
+        // body so binary-fingerprint pattern (R42) survives at this layer.
+        if ( isset( $context['idem_discriminator'] ) && $context['idem_discriminator'] !== '' ) {
+            $body['discriminator'] = (string) $context['idem_discriminator'];
+        }
         $idem_key = '';
         if ( function_exists( 'dinoco_idempotency_hash' ) && function_exists( 'dinoco_idempotency_check' ) ) {
             $idem_key = $idem_namespace . ':' . dinoco_idempotency_hash( $body );
@@ -451,6 +488,19 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_upload_slip' ) ) {
     function dinoco_claim_payment_rest_upload_slip( $req ) {
         $chid = (int) $req->get_param( 'id' );
 
+        // V.0.6 Sprint 14 H3 fix — rate-limit the ownership LOOKUP path itself
+        // BEFORE any SELECT. Without this, an attacker iterating charge_id=1..N
+        // gets a free per-ID DB probe (only the post-ownership transition path
+        // was rate-limited). Per-user lookup cap = 100/hr (separate bucket
+        // from claim_charge_upload). Returns 404 on ownership mismatch (not
+        // 403) so attacker cannot distinguish "charge does not exist" from
+        // "charge exists but not yours" — closes timing+code enumeration oracle.
+        $cuid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'claim_charge_lookup_' . $cuid, 100, 3600 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
         // Ownership check — customer can only upload their OWN slip
         global $wpdb;
         if ( function_exists( 'dinoco_claim_charges_table_name' ) ) {
@@ -458,9 +508,13 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_upload_slip' ) ) {
             $owner = (int) $wpdb->get_var( $wpdb->prepare(
                 "SELECT user_id FROM {$table} WHERE id = %d", $chid
             ) );
-            $cuid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
-            if ( $owner !== $cuid ) {
-                return new WP_Error( 'forbidden', 'You can only upload slips for your own charges', array( 'status' => 403 ) );
+            if ( $owner === 0 || $owner !== $cuid ) {
+                // 404 (not 403) — anti-enumeration: mask existence (R3 HIGH-5 pattern)
+                return new WP_Error(
+                    'charge_not_found',
+                    'ไม่พบใบเรียกเก็บนี้',
+                    array( 'status' => 404 )
+                );
             }
         }
 
@@ -468,10 +522,18 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_upload_slip' ) ) {
         // Phase 2.6 (separate task). V.0.2 only handles state transition; the
         // slip_image_url + slip_ref_hash + slip_verify_data columns will be
         // populated by that handler before invoking this endpoint.
+        //
+        // V.0.6 Sprint 14 H1 helper — when Phase 2.6 lands the actual slip
+        // upload, it should pass `idem_discriminator => sha1_file($slip)` in
+        // context so retries of the SAME slip dedup but DIFFERENT slip uploads
+        // get distinct hashes (binary-fingerprint R42 pattern).
         return dinoco_claim_payment_wrapped_transition(
             'claim_charge_upload', 'claim-charge-upload',
             $chid, 'pending_review', 'customer',
-            array( 'verify_method' => 'slip2go_pending' ),
+            array(
+                'verify_method'      => 'slip2go_pending',
+                'idem_discriminator' => '',  // Phase 2.6: sha1_file of slip image
+            ),
             10  // 10/hr per customer
         );
     }
@@ -548,19 +610,58 @@ if ( ! function_exists( 'dinoco_claim_payment_run_expire_sweep' ) ) {
         global $wpdb;
         if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) return;
         $table = dinoco_claim_charges_table_name();
-        $rows  = $wpdb->get_results( $wpdb->prepare(
-            "SELECT id FROM {$table} WHERE status = %s AND expires_at < %s LIMIT 500",
-            'pending_payment', current_time( 'mysql' )
-        ), ARRAY_A );
-        if ( empty( $rows ) ) return;
-        foreach ( $rows as $r ) {
-            $res = dinoco_claim_charge_transition( (int) $r['id'], 'expired', 'system', array( 'reason' => 'auto_expire_cron' ) );
-            if ( is_wp_error( $res ) && function_exists( 'dinoco_obs_capture' ) ) {
-                dinoco_obs_capture( 'warning', 'claim_charge_expire_skipped', array(
-                    'charge_id' => (int) $r['id'],
-                    'error'     => $res->get_error_code(),
-                ) );
+
+        // V.0.6 Sprint 14 M2 fix — chunked + replication-safe + deadline-guarded.
+        // Was: single LIMIT 500 without ORDER BY (Sprint 12 SEC-M3 spec)
+        //      and no per-run deadline → worst case 500 × 5s GET_LOCK = 2500s
+        //      could overlap next cron run.
+        // Now: chunked 100/iter + ORDER BY id ASC (replication safe) + 240s
+        //      total wall-clock deadline + finally-block heartbeat (R12).
+        $deadline_at    = microtime( true ) + 240.0;
+        $total_swept    = 0;
+        $max_iters      = 5;     // 5 × 100 = 500 max per run (matches old cap)
+        try {
+            for ( $i = 0; $i < $max_iters; $i++ ) {
+                if ( microtime( true ) >= $deadline_at ) break;
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT id FROM {$table} WHERE status = %s AND expires_at < %s
+                      ORDER BY id ASC LIMIT 100",
+                    'pending_payment', current_time( 'mysql' )
+                ), ARRAY_A );
+                if ( empty( $rows ) ) break;
+                foreach ( $rows as $r ) {
+                    if ( microtime( true ) >= $deadline_at ) break 2;
+                    // M3 — cron-actor transitions: do NOT idempotency-wrap here
+                    // (transition() itself doesn't wrap; we go direct + skip
+                    // PERF-H2 minute-bucket dedup which assumes user-driven).
+                    $res = dinoco_claim_charge_transition( (int) $r['id'], 'expired', 'system', array(
+                        'reason'        => 'auto_expire_cron',
+                        'actor_user_id' => 0,  // explicit — Health Monitor reads
+                    ) );
+                    if ( is_wp_error( $res ) && function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( 'warning', 'claim_charge_expire_skipped', array(
+                            'charge_id' => (int) $r['id'],
+                            'error'     => $res->get_error_code(),
+                        ) );
+                    } elseif ( ! is_wp_error( $res ) ) {
+                        $total_swept++;
+                    }
+                }
             }
+        } finally {
+            // R12 pattern — heartbeat in finally so Health Monitor sees the cron
+            // ran even if a transition throws. Sweep-level heartbeat distinct
+            // from cron-level heartbeat (set in Notifier handler).
+            update_option(
+                'dinoco_cron_claim_charge_expire_sweep_last_run',
+                current_time( 'mysql' ),
+                false
+            );
+            update_option(
+                'dinoco_cron_claim_charge_expire_sweep_swept_count',
+                (int) $total_swept,
+                false
+            );
         }
     }
 }

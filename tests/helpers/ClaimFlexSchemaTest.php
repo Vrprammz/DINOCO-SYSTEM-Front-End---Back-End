@@ -235,6 +235,41 @@ final class ClaimFlexSchemaTest extends TestCase {
         $this->assertTrue( true );
     }
 
+    /**
+     * Sprint 14 M1 — register b2b_build_flex_claim_slip_received (Sprint 13
+     * NEW Flex builder) in schema validator coverage. Without this, the
+     * builder bypassed Flex-schema policing (null colors / float opacity /
+     * lowercase hex would slip past CI).
+     */
+    public function test_slip_received_bubble_passes_schema(): void {
+        $bubble = array(
+            'type' => 'flex',
+            'altText' => '⏳ ได้รับสลิปแล้ว ฿500.00 — sub',
+            'contents' => array(
+                'type' => 'bubble', 'size' => 'kilo',
+                'header' => dinoco_flex_header( '⏳ ได้รับสลิปแล้ว — กำลังตรวจสอบ', 'sub', 'warning' ),
+                'body' => array(
+                    'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm',
+                    'contents' => array(
+                        array( 'type' => 'text', 'text' => 'ระบบกำลังตรวจสอบสลิป', 'size' => 'sm', 'color' => '#1F2937', 'wrap' => true ),
+                        array( 'type' => 'text', 'text' => 'จำนวน ฿500.00', 'size' => 'lg', 'weight' => 'bold', 'color' => '#B45309', 'margin' => 'sm' ),
+                        array( 'type' => 'separator', 'margin' => 'md' ),
+                        array( 'type' => 'text', 'text' => 'เราจะแจ้งผลใน LINE ภายใน 24 ชั่วโมง', 'size' => 'xs', 'color' => '#6B7280', 'margin' => 'md', 'wrap' => true ),
+                    ),
+                ),
+                'footer' => array(
+                    'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '12px',
+                    'contents' => array(
+                        array( 'type' => 'button', 'style' => 'secondary', 'height' => 'sm',
+                            'action' => array( 'type' => 'uri', 'label' => '📋 ดูสถานะ', 'uri' => 'https://dinoco.test/claim-system/?cid=100' ) ),
+                    ),
+                ),
+            ),
+        );
+        assert_flex_schema_valid( $this, $bubble );
+        $this->assertTrue( true );
+    }
+
     public function test_critical_severity_uses_dc2626_canonical_red(): void {
         $header = dinoco_flex_header( '❌ ปฏิเสธ', 'sub', 'critical' );
         $this->assertSame( '#DC2626', $header['backgroundColor'] );

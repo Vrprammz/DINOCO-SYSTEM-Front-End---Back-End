@@ -143,6 +143,20 @@ describe('Claim Lifecycle Notifier — Sprint 5 drift detector', () => {
             expect(code).toMatch(/dinoco_claim_charge_pending_review_sweep_cron/);
         });
 
+        // ─── Sprint 14 code-reviewer remediation pins ─────────────────
+        test('Sprint 14 C1 — expire cron anchored 02:30 ICT (not 02:25 collision)', () => {
+            expect(code).toMatch(/strtotime\(\s*'tomorrow 02:30:00'\s*\)/);
+            // Negative — old 02:25 must not appear in active scheduling code
+            const activeCode = code.replace(/\/\*[\s\S]*?\*\//g, '');  // strip block comments
+            expect(activeCode).not.toMatch(/strtotime\(\s*'tomorrow 02:25:00'\s*\)/);
+        });
+
+        test('Sprint 14 M5 — hourly sweep anchored next-hour :15 (deterministic)', () => {
+            expect(code).toMatch(/strtotime\(\s*'next hour'\s*\)/);
+            // Accept both `+= 15 * 60` (compound) and `+ 15 * 60` (binary) forms
+            expect(code).toMatch(/\+=?\s*15\s*\*\s*60/);
+        });
+
         test('DB_ID 1211 in header', () => {
             expect(code).toMatch(/DB_ID:\s*1211/);
         });
