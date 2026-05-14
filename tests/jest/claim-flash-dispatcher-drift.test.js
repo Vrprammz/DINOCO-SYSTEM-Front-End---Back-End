@@ -262,11 +262,14 @@ describe('Claim Flash Dispatcher — Sprint 23 Phase 3.1+3.2 drift detector', ()
         expect(dispatcher).toMatch(/'event_type'\s*=>\s*\$is_ok\s*\?\s*'claim_flash_create'\s*:\s*'claim_flash_create_fail'/);
     });
 
-    test('Audit row PII masked via b2b_flash_mask_request_for_dlq', () => {
-        // Sprint 25 CRIT-1 — input switched from $params_api to direction-
-        // aware $params_for_mask copy. Accept either form (older lineage
-        // tests must still pass for repos that may not have applied Sprint 25).
-        expect(dispatcher).toMatch(/b2b_flash_mask_request_for_dlq\(\s*\$params_(?:api|for_mask)\s*\)/);
+    test('Sprint 27 MED-6 — Audit row PII masked via b2b_flash_mask_request_for_dlq(params_for_mask)', () => {
+        // Strict: must use Sprint 25 CRIT-1 swap copy. Was alternation
+        // accepting either $params_api OR $params_for_mask (lineage cruft)
+        // which weakened regression guard — a future revert to $params_api
+        // would still pass. Sprint 27 MED-6 tightens to strict form only.
+        expect(dispatcher).toMatch(/b2b_flash_mask_request_for_dlq\(\s*\$params_for_mask\s*\)/);
+        // Negative: old PII-leak call site MUST be gone
+        expect(dispatcher).not.toMatch(/b2b_flash_mask_request_for_dlq\(\s*\$params_api\s*\)/);
     });
 
     test('Audit table is wp_dinoco_flash_audit', () => {

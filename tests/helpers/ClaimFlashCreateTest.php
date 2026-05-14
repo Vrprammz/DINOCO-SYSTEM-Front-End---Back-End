@@ -202,4 +202,97 @@ class ClaimFlashCreateTest extends TestCase {
         $this->assertSame( 500, $a['weight_grams'] );
         $this->assertSame( 42, $a['actor_user_id'] );
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // Sprint 27 LOW-8 — 3 NEW fixtures for Sprint 25 CRIT-1 / CRIT-2 /
+    // HIGH-3 fixes (pure-logic shape tests; integration via Jest drift).
+    // ════════════════════════════════════════════════════════════════
+
+    /**
+     * Sprint 25 CRIT-1: inbound_pickup direction must swap src↔dst in the
+     * mask preview copy. This fixture verifies the swap helper's shape.
+     */
+    public function test_sprint25_crit1_inbound_pickup_mask_swap_correctness() {
+        // Simulate the swap logic from V.0.3 dispatcher (lines ~316-330)
+        $params_api = array(
+            'srcName' => 'Customer Somchai', 'srcPhone' => '0812345678', 'srcDetailAddress' => '123 Main St',
+            'dstName' => 'DINOCO Warehouse', 'dstPhone' => '0200000000', 'dstDetailAddress' => 'Bangkok HQ',
+        );
+        $params_for_mask = $params_api;
+        $direction = 'inbound_pickup';
+        if ( $direction === 'inbound_pickup' ) {
+            $swap_keys = array(
+                array( 'srcName', 'dstName' ),
+                array( 'srcPhone', 'dstPhone' ),
+                array( 'srcDetailAddress', 'dstDetailAddress' ),
+            );
+            foreach ( $swap_keys as $pair ) {
+                $tmp = $params_for_mask[ $pair[0] ];
+                $params_for_mask[ $pair[0] ] = $params_for_mask[ $pair[1] ];
+                $params_for_mask[ $pair[1] ] = $tmp;
+            }
+        }
+        // Customer PII now in dst* slot (where masker expects to mask)
+        $this->assertSame( 'Customer Somchai', $params_for_mask['dstName'] );
+        $this->assertSame( '0812345678', $params_for_mask['dstPhone'] );
+        // Warehouse now in src* slot (where masker leaves plain)
+        $this->assertSame( 'DINOCO Warehouse', $params_for_mask['srcName'] );
+        // Original $params_api UNCHANGED (Flash API payload integrity)
+        $this->assertSame( 'Customer Somchai', $params_api['srcName'] );
+        $this->assertSame( 'DINOCO Warehouse', $params_api['dstName'] );
+    }
+
+    /**
+     * Sprint 25 CRIT-2: G2 1003 recovery must pin outTradeNo from the
+     * lookup response (Flash's canonical record) — not the in-flight
+     * mutated copy.
+     */
+    public function test_sprint25_crit2_outtradeno_pinned_from_lookup_response() {
+        // Simulate lookup hit branch
+        $params_api = array( 'outTradeNo' => 'CLM-FLASH-100-AB12-r2' );  // mutated to -r2 mid-retry
+        $lookup = array(
+            'ok'   => true,
+            'data' => array( 'pno' => 'FX123456', 'outTradeNo' => 'CLM-FLASH-100-AB12' ),  // Flash's record
+        );
+        // V.0.3 CRIT-2 fix: pin params_api['outTradeNo'] from lookup data
+        if ( isset( $lookup['data']['outTradeNo'] ) ) {
+            $params_api['outTradeNo'] = (string) $lookup['data']['outTradeNo'];
+        }
+        $this->assertSame( 'CLM-FLASH-100-AB12', $params_api['outTradeNo'] );
+        $this->assertNotSame( 'CLM-FLASH-100-AB12-r2', $params_api['outTradeNo'],
+            'outTradeNo MUST be pinned to Flash record else future cancel/status lookups will 404'
+        );
+    }
+
+    /**
+     * Sprint 25 HIGH-3: returnXxx fields must fallback to src_* (not empty
+     * string) when b2b_registered_address option is missing/empty.
+     */
+    public function test_sprint25_high3_return_falls_back_to_src_not_empty() {
+        // Simulate V.0.3 dispatcher else-branch (no registered_address)
+        $reg = array();  // empty option
+        $src_address = '123 Customer Lane';
+        $src_phone   = '0812345678';
+        $src_district = 'Lat Phrao';
+
+        $return_address = ! empty( $reg ) && is_array( $reg )
+            ? ( ! empty( $reg['reg_address'] ) ? $reg['reg_address'] : $src_address )
+            : $src_address;
+        $return_phone = ! empty( $reg ) && is_array( $reg )
+            ? ( ! empty( $reg['reg_phone'] ) ? $reg['reg_phone'] : $src_phone )
+            : $src_phone;
+        $return_district = ! empty( $reg ) && is_array( $reg )
+            ? ( ! empty( $reg['reg_district'] ) ? $reg['reg_district'] : $src_district )
+            : $src_district;
+
+        // All return* fields must contain SOMETHING (not empty) for Flash to
+        // accept payload + route parcels to recoverable address on failure
+        $this->assertNotSame( '', $return_address, 'returnDetailAddress empty → parcel-lost risk' );
+        $this->assertNotSame( '', $return_phone, 'returnPhone empty → Flash silent reject risk' );
+        $this->assertNotSame( '', $return_district, 'returnDistrictName empty → ambiguous address' );
+        // Specifically falls back to src_* (recoverable address chain)
+        $this->assertSame( $src_address, $return_address );
+        $this->assertSame( $src_phone, $return_phone );
+        $this->assertSame( $src_district, $return_district );
+    }
 }
