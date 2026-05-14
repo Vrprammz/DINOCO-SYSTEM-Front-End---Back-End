@@ -1,6 +1,21 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Flash Dispatcher                    ║
+ * ║  Version: V.0.7 (2026-05-14) — Sprint 30 Phase 4 Batch C Item 5: ║
+ * ║    • NEW endpoint `GET /dinoco-claim/v1/my-flash?claim_id=X` —   ║
+ * ║      owner-scoped mirror of admin /flash/list. Permission =      ║
+ * ║      is_user_logged_in; handler walks 3-tier ownership chain     ║
+ * ║      (customer_id ACF → post_author → warranty owner_user_id —   ║
+ * ║      via `dinoco_claim_payment_resolve_claim_owner` helper from  ║
+ * ║      Claim Payment LIFF V.0.10) and 404s on mismatch (anti-      ║
+ * ║      enumeration). EXCLUDES `inbound_pickup` direction (admin-   ║
+ * ║      only — customer never sees that path; their parcel is in    ║
+ * ║      transit TO company). Strips PII (recipient_*, sender_*) —   ║
+ * ║      response carries only pno + status + direction + sort_code  ║
+ * ║      + created_at + updated_at + tracking_url (Flash portal).    ║
+ * ║      Rate limit 30/min/user via `b2b_rate_limit('claim_my_flash')║
+ * ║      Powers Customer LIFF [dinoco_claim_history] "ประวัติเคลม".  ║
+ * ║                                                                    ║
  * ║  Version: V.0.6 (2026-05-14) — Sprint 29 Phase 4 Batch B Item 7: ║
  * ║    • NEW endpoint `POST /dinoco-claim/v1/pickup-at-warehouse`     ║
  * ║      — opt-in path for "ลูกค้ามารับเองที่โกดัง" (customer picks    ║
@@ -642,6 +657,23 @@ if ( ! function_exists( 'dinoco_claim_flash_register_routes' ) ) {
                 'claim_id' => array( 'type' => 'integer', 'required' => true ),
             ),
         ) );
+
+        // V.0.7 Sprint 30 Phase 4 Batch C Item 5 — owner-scoped Flash list for
+        // customer LIFF "ประวัติเคลม". Mirror of /flash/list but:
+        //   - Permission = is_user_logged_in (handler walks ownership chain).
+        //   - Excludes `inbound_pickup` direction (admin-only).
+        //   - Strips PII (no recipient_/sender_ fields in response).
+        //   - Includes `tracking_url` built from PNO (Flash portal).
+        //   - Rate limit 30/min/user.
+        register_rest_route( 'dinoco-claim/v1', '/my-flash', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_claim_flash_rest_my_flash',
+            'permission_callback' => function() { return is_user_logged_in(); },
+            'args'                => array(
+                'claim_id' => array( 'type' => 'integer', 'required' => true, 'minimum' => 1 ),
+                'limit'    => array( 'type' => 'integer', 'required' => false, 'default' => 50, 'minimum' => 1, 'maximum' => 200 ),
+            ),
+        ) );
     }
 }
 
@@ -858,6 +890,105 @@ if ( ! function_exists( 'dinoco_claim_flash_rest_list' ) ) {
         } catch ( \Throwable $e ) {
             if ( function_exists( 'dinoco_obs_capture' ) ) {
                 dinoco_obs_capture( 'error', 'claim_flash_rest_list_exception', array( 'msg' => $e->getMessage() ) );
+            }
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'Internal error', 'code' => 'internal_error', 'items' => array() ), 500 );
+        }
+    }
+}
+
+// V.0.7 Sprint 30 Phase 4 Batch C Item 5 — GET /dinoco-claim/v1/my-flash
+// Owner-scoped Flash shipments list for customer LIFF "ประวัติเคลม".
+// Filters out admin-only `inbound_pickup` direction; strips PII; appends
+// Flash portal tracking URL per row.
+if ( ! function_exists( 'dinoco_claim_flash_rest_my_flash' ) ) {
+    function dinoco_claim_flash_rest_my_flash( WP_REST_Request $req ) {
+        try {
+            $uid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+            if ( $uid <= 0 ) {
+                return new WP_REST_Response( array( 'success' => false, 'message' => 'not_logged_in', 'code' => 'not_logged_in', 'items' => array() ), 401 );
+            }
+
+            // Rate limit owner reads (polling defense).
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $rl = b2b_rate_limit( 'claim_my_flash_' . $uid, 30, 60 );
+                if ( is_wp_error( $rl ) ) return $rl;
+            }
+
+            $claim_id = intval( $req->get_param( 'claim_id' ) );
+            $limit    = max( 1, min( 200, intval( $req->get_param( 'limit' ) ?: 50 ) ) );
+
+            if ( $claim_id <= 0 || get_post_type( $claim_id ) !== 'claim_ticket' ) {
+                // 404 not 422 — anti-enumeration parity with charges endpoint.
+                return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่พบรายการเคลมนี้', 'code' => 'claim_not_found', 'items' => array() ), 404 );
+            }
+
+            // Ownership resolution — reuse helper from Claim Payment LIFF V.0.10
+            // (3-tier fallback chain). When helper not yet synced, inline the
+            // same chain so this snippet remains self-contained for staging.
+            $owner_uid = 0;
+            if ( function_exists( 'dinoco_claim_payment_resolve_claim_owner' ) ) {
+                $owner_uid = (int) dinoco_claim_payment_resolve_claim_owner( $claim_id );
+            } else {
+                // Inline fallback — same 3-tier chain.
+                if ( function_exists( 'get_field' ) ) {
+                    $maybe = get_field( 'customer_id', $claim_id );
+                    if ( is_numeric( $maybe ) && (int) $maybe > 0 ) $owner_uid = (int) $maybe;
+                }
+                if ( $owner_uid === 0 ) {
+                    $cp = get_post( $claim_id );
+                    if ( $cp && (int) $cp->post_author > 0 ) $owner_uid = (int) $cp->post_author;
+                }
+                if ( $owner_uid === 0 && function_exists( 'get_field' ) ) {
+                    $warr_id = (int) get_field( 'linked_warranty_id', $claim_id );
+                    if ( $warr_id > 0 ) {
+                        $warr_owner = (int) get_field( 'owner_user_id', $warr_id );
+                        if ( $warr_owner > 0 ) $owner_uid = $warr_owner;
+                    }
+                }
+            }
+
+            if ( $owner_uid <= 0 || $owner_uid !== $uid ) {
+                return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่พบรายการเคลมนี้', 'code' => 'claim_not_found', 'items' => array() ), 404 );
+            }
+
+            $pnos = get_post_meta( $claim_id, '_claim_flash_pnos', true );
+            if ( ! is_array( $pnos ) ) $pnos = array();
+
+            $items = array();
+            // Reverse — newest first.
+            $pnos_rev = array_reverse( $pnos );
+            foreach ( $pnos_rev as $entry ) {
+                if ( ! is_array( $entry ) ) continue;
+                $pno = isset( $entry['pno'] ) ? (string) $entry['pno'] : '';
+                if ( $pno === '' ) continue;
+                $dir = isset( $entry['direction'] ) ? (string) $entry['direction'] : '';
+                // EXCLUDE inbound_pickup — admin-only direction (customer
+                // parcel in transit TO company is irrelevant to customer
+                // history view).
+                if ( $dir === 'inbound_pickup' ) continue;
+
+                $items[] = array(
+                    'pno'          => $pno,
+                    'direction'    => $dir,
+                    'status'       => isset( $entry['status'] ) ? (string) $entry['status'] : 'created',
+                    'flash_state'  => isset( $entry['flash_state'] ) ? intval( $entry['flash_state'] ) : 0,
+                    'sort_code'    => isset( $entry['sort_code'] ) ? (string) $entry['sort_code'] : '',
+                    'created_at'   => isset( $entry['created_at'] ) ? (string) $entry['created_at'] : '',
+                    'updated_at'   => isset( $entry['updated_at'] ) ? (string) $entry['updated_at'] : '',
+                    'tracking_url' => 'https://www.flashexpress.co.th/tracking/?se=' . rawurlencode( $pno ),
+                );
+                if ( count( $items ) >= $limit ) break;
+            }
+
+            return new WP_REST_Response( array(
+                'success'  => true,
+                'claim_id' => $claim_id,
+                'items'    => $items,
+                'total'    => count( $items ),
+            ), 200 );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_flash_rest_my_flash_exception', array( 'msg' => $e->getMessage() ) );
             }
             return new WP_REST_Response( array( 'success' => false, 'message' => 'Internal error', 'code' => 'internal_error', 'items' => array() ), 500 );
         }

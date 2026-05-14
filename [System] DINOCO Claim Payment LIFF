@@ -1,6 +1,25 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO Claim Payment LIFF                              ║
+ * ║  Version: V.0.10 (2026-05-14) — Sprint 30 Phase 4 Batch C Item 5: ║
+ * ║    • NEW shortcode `[dinoco_claim_history]` — customer-facing     ║
+ * ║      "ประวัติเคลม" page (route `/claim-history/?claim_id=X`).     ║
+ * ║      Read-only owner-scoped — lists charges + Flash shipments     ║
+ * ║      tap-to-expand inline (no new page). Loading skeleton +       ║
+ * ║      empty state + error state + retry button. Buddhist year      ║
+ * ║      dates. Mobile-first scoped `.dnc-claim-hist-*` CSS. UX-H3   ║
+ * ║      strict (data-action delegation, NO inline handlers). Flag-  ║
+ * ║      gated `dinoco_claim_payment_enabled`. Re-uses existing       ║
+ * ║      `.dnc-claim-pay-back/-close` header pattern.                 ║
+ * ║    • NEW REST `GET /dinoco-claim/v1/my-charges?claim_id=X` —     ║
+ * ║      owner-scoped mirror of admin `/charges` list. Resolves claim ║
+ * ║      owner via 3-tier fallback (customer_id ACF → post_author →   ║
+ * ║      warranty.owner_user_id) and rejects 403 owner_mismatch when  ║
+ * ║      caller != owner. Permission = is_user_logged_in (handler     ║
+ * ║      tier-gates). Rate limit 30/min/user. Returns sanitized rows  ║
+ * ║      (no slip_image_url for unverified charges per V.0.7 owner    ║
+ * ║      tier rules; slip_url is auth-gated proxy path).              ║
+ * ║                                                                    ║
  * ║  Version: V.0.9 (2026-05-14) — Sprint 22 code-reviewer remediation:║
  * ║    • HIGH-3 split slip-image proxy rate limit per tier — admin    ║
  * ║      120/min (batch slip review) vs owner 30/min (personal view). ║
@@ -635,6 +654,27 @@ if ( ! function_exists( 'dinoco_claim_payment_register_rest' ) ) {
             'permission_callback' => function() { return is_user_logged_in(); },
             'args' => array(
                 'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),
+            ),
+        ) );
+
+        // V.0.10 Sprint 30 Phase 4 Batch C Item 5 — owner-scoped charges list
+        // for "ประวัติเคลม" customer LIFF. Mirror of admin /charges list but
+        // permission_callback only requires is_user_logged_in; handler walks
+        // 3-tier ownership chain (customer_id ACF → post_author → warranty
+        // owner_user_id) per V.0.7 HIGH-3 fix, rejects 403 owner_mismatch
+        // when caller != owner. Status filter optional (same whitelist).
+        // Rate limit 30/min/user. Slip image URL sanitized per V.0.7 owner
+        // tier rules (only verified/refunded expose the auth-gated proxy
+        // path; pre-verify pending review remains private to admin).
+        register_rest_route( $base, '/my-charges', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_claim_payment_rest_my_charges',
+            'permission_callback' => function() { return is_user_logged_in(); },
+            'args' => array(
+                'claim_id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),
+                'status'   => array( 'required' => false, 'type' => 'string' ),
+                'limit'    => array( 'required' => false, 'type' => 'integer', 'minimum' => 1, 'maximum' => 50, 'default' => 20 ),
+                'offset'   => array( 'required' => false, 'type' => 'integer', 'minimum' => 0, 'default' => 0 ),
             ),
         ) );
     }
@@ -1760,6 +1800,162 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_charges_list' ) ) {
     }
 }
 
+if ( ! function_exists( 'dinoco_claim_payment_resolve_claim_owner' ) ) {
+    /**
+     * V.0.10 — extracted ownership resolver (mirrors V.0.7 HIGH-3 fallback
+     * chain from `dinoco_claim_payment_rest_charge_create`). Returns the
+     * user_id who owns this claim_ticket or 0 if unresolvable.
+     *
+     * @param int $claim_id
+     * @return int owner user_id (0 if unresolvable)
+     */
+    function dinoco_claim_payment_resolve_claim_owner( $claim_id ) {
+        $claim_id = (int) $claim_id;
+        if ( $claim_id <= 0 ) return 0;
+        if ( get_post_type( $claim_id ) !== 'claim_ticket' ) return 0;
+        $claim_user_id = 0;
+        if ( function_exists( 'get_field' ) ) {
+            $maybe = get_field( 'customer_id', $claim_id );
+            if ( is_numeric( $maybe ) && (int) $maybe > 0 ) $claim_user_id = (int) $maybe;
+        }
+        if ( $claim_user_id === 0 ) {
+            $cp = get_post( $claim_id );
+            if ( $cp && (int) $cp->post_author > 0 ) $claim_user_id = (int) $cp->post_author;
+        }
+        if ( $claim_user_id === 0 && function_exists( 'get_field' ) ) {
+            $warr_id = (int) get_field( 'linked_warranty_id', $claim_id );
+            if ( $warr_id > 0 ) {
+                $warr_owner = (int) get_field( 'owner_user_id', $warr_id );
+                if ( $warr_owner > 0 ) $claim_user_id = $warr_owner;
+            }
+        }
+        return $claim_user_id;
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_my_charges' ) ) {
+    /**
+     * V.0.10 Sprint 30 Phase 4 Batch C Item 5 —
+     * GET /dinoco-claim/v1/my-charges?claim_id=X (owner-scoped).
+     *
+     * Owner tier of /charges list endpoint. Same shape as admin list but:
+     *   - Permission = is_user_logged_in (handler walks ownership chain).
+     *   - WHERE user_id = caller_uid (AND claim_id = X).
+     *   - 403 owner_mismatch if caller is not the resolved claim owner.
+     *   - 404 charge-style is via empty items[] (claim itself may be
+     *     non-existent — handler 404s that case for anti-enumeration).
+     *   - slip_image_url is the auth-gated proxy path (never raw uploads).
+     *
+     * Powers Customer LIFF [dinoco_claim_history] "ประวัติเคลม" page.
+     */
+    function dinoco_claim_payment_rest_my_charges( $req ) {
+        global $wpdb;
+
+        $uid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+        if ( $uid <= 0 ) {
+            return new WP_Error( 'not_logged_in', 'กรุณาเข้าสู่ระบบ', array( 'status' => 401 ) );
+        }
+
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'claim_my_charges_' . $uid, 30, 60 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            return new WP_Error( 'schema_missing', 'Charges schema not installed', array( 'status' => 500 ) );
+        }
+        $table = dinoco_claim_charges_table_name();
+
+        $claim_id = (int) $req->get_param( 'claim_id' );
+        $status   = sanitize_text_field( (string) $req->get_param( 'status' ) );
+        $limit    = (int) $req->get_param( 'limit' );
+        $offset   = (int) $req->get_param( 'offset' );
+        if ( $limit < 1 || $limit > 50 ) $limit = 20;
+        if ( $offset < 0 ) $offset = 0;
+
+        if ( $claim_id <= 0 ) {
+            return new WP_Error( 'invalid_claim_id', 'claim_id required', array( 'status' => 422 ) );
+        }
+
+        // Resolve claim ownership — must match caller.
+        $owner_uid = dinoco_claim_payment_resolve_claim_owner( $claim_id );
+        if ( $owner_uid <= 0 ) {
+            return new WP_Error( 'claim_not_found', 'ไม่พบรายการเคลมนี้', array( 'status' => 404 ) );
+        }
+        if ( $owner_uid !== $uid ) {
+            // 404 (anti-enumeration) — never let caller probe other claims.
+            return new WP_Error( 'claim_not_found', 'ไม่พบรายการเคลมนี้', array( 'status' => 404 ) );
+        }
+
+        $where  = "claim_id = %d AND user_id = %d";
+        $params = array( $claim_id, $uid );
+        if ( $status !== '' ) {
+            if ( ! defined( 'DINOCO_CLAIM_CHARGES_STATUS_WHITELIST' ) ) {
+                return new WP_Error( 'schema_missing', 'Status whitelist missing', array( 'status' => 500 ) );
+            }
+            $wl = explode( ',', DINOCO_CLAIM_CHARGES_STATUS_WHITELIST );
+            if ( ! in_array( $status, $wl, true ) ) {
+                return new WP_Error( 'invalid_status', 'invalid status', array( 'status' => 422 ) );
+            }
+            $where   .= " AND status = %s";
+            $params[] = $status;
+        }
+
+        $params[] = $limit;
+        $params[] = $offset;
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, claim_id, user_id, amount_thb, reason, reason_note, status,
+                    payment_ref, bank_context, expires_at, created_at,
+                    verified_at, refunded_at, refund_reason
+               FROM {$table}
+              WHERE {$where}
+              ORDER BY created_at DESC
+              LIMIT %d OFFSET %d",
+            $params
+        ), ARRAY_A );
+
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        $items = array();
+        foreach ( $rows as $r ) {
+            $st = (string) $r['status'];
+            // Slip URL exposure rule — only for verified/refunded (mirror V.0.7
+            // owner tier in /charges/{id} single read; pre-verify slips are
+            // private to admin). Uses the auth-gated proxy path, never raw.
+            $slip_url = '';
+            if ( in_array( $st, array( 'verified', 'refunded' ), true ) ) {
+                $slip_url = '/wp-json/dinoco-claim/v1/charges/' . (int) $r['id'] . '/slip-image';
+            }
+            $items[] = array(
+                'id'           => (int) $r['id'],
+                'charge_id'    => (int) $r['id'],
+                'claim_id'     => (int) $r['claim_id'],
+                'amount_thb'   => (float) $r['amount_thb'],
+                'reason'       => (string) $r['reason'],
+                'reason_note'  => (string) $r['reason_note'],
+                'status'       => $st,
+                'payment_ref'  => (string) $r['payment_ref'],
+                'bank_context' => (string) $r['bank_context'],
+                'expires_at'   => (string) $r['expires_at'],
+                'created_at'   => (string) $r['created_at'],
+                'verified_at'  => (string) $r['verified_at'],
+                'refunded_at'  => (string) $r['refunded_at'],
+                'refund_reason'=> (string) $r['refund_reason'],
+                'slip_image_url' => $slip_url,
+                'liff_url'     => home_url( '/claim-pay/?cid=' . (int) $r['id'] ),
+            );
+        }
+
+        return rest_ensure_response( array(
+            'items'    => $items,
+            'claim_id' => $claim_id,
+            'limit'    => $limit,
+            'offset'   => $offset,
+            'count'    => count( $items ),
+        ) );
+    }
+}
+
 // Cache invalidation listener — purge per-charge transients on state change.
 if ( ! function_exists( 'dinoco_claim_payment_invalidate_charge_cache' ) ) {
     function dinoco_claim_payment_invalidate_charge_cache( $claim_id, $charge_id, $from_state, $to_state, $context ) {
@@ -2621,6 +2817,363 @@ if ( ! function_exists( 'dinoco_claim_pay_render' ) ) {
 // Register shortcode (flag-gated to honor REG-029 byte-identical when off).
 if ( $dinoco_claim_payment_enabled ) {
     add_shortcode( 'dinoco_claim_pay', 'dinoco_claim_pay_render' );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7B. SHORTCODE — [dinoco_claim_history] customer "ประวัติเคลม" page
+ * ─────────────────────────────────────────────────────────────────────────
+ * Phase 4 Batch C Item 5 — surgical add (separate shortcode, NOT a tab in
+ * the existing 3-screen [dinoco_claim_pay] flow). Two REST calls:
+ *   - GET /dinoco-claim/v1/my-charges?claim_id=X   (owner-scoped charges)
+ *   - GET /dinoco-claim/v1/my-flash?claim_id=X     (owner-scoped Flash)
+ * Both endpoints walk identical 3-tier ownership resolver and 403 mismatch
+ * cases out, so the LIFF JS need only render. Inline expansion (no new
+ * page) — tap row → toggle .dnc-claim-hist-row[data-expanded].
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_history_render' ) ) {
+    function dinoco_claim_history_render( $atts = array() ) {
+        $claim_id = isset( $_GET['claim_id'] ) ? (int) $_GET['claim_id'] : 0;
+
+        $logged_in = is_user_logged_in();
+        $logout_card = '';
+        if ( ! $logged_in ) {
+            $logout_card = '<div class="dnc-claim-hist-warn" role="alert">'
+                . '<p>กรุณาเข้าสู่ระบบด้วย LINE เพื่อดูประวัติเคลม</p>'
+                . '<a class="dnc-claim-hist-btn-line" href="' . esc_url( home_url( '/login/?redirect=' . urlencode( '/claim-history/?claim_id=' . $claim_id ) ) ) . '">เข้าสู่ระบบด้วย LINE</a>'
+                . '</div>';
+        }
+
+        ob_start();
+        ?>
+<div class="dnc-claim-hist-app" data-claim-id="<?php echo esc_attr( (string) $claim_id ); ?>">
+    <style>
+        /* Scoped — prefix `.dnc-claim-hist-` */
+        .dnc-claim-hist-app{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#F9FAFB;color:#111827;min-height:100vh;padding-bottom:40px}
+        .dnc-claim-hist-app *{box-sizing:border-box}
+        .dnc-claim-hist-header{background:#1A3A5C;color:#fff;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:20}
+        .dnc-claim-hist-header h1{font-size:16px;font-weight:600;margin:0}
+        .dnc-claim-hist-back,.dnc-claim-hist-close{background:transparent;color:#fff;border:0;width:44px;height:44px;cursor:pointer;font-size:22px;line-height:1;display:flex;align-items:center;justify-content:center;border-radius:8px}
+        .dnc-claim-hist-back:focus-visible,.dnc-claim-hist-close:focus-visible{outline:2px solid #fff;outline-offset:2px}
+        .dnc-claim-hist-section{margin:12px 16px}
+        .dnc-claim-hist-section-title{font-size:14px;font-weight:600;color:#6B7280;margin:14px 0 8px;letter-spacing:.4px;text-transform:uppercase}
+        .dnc-claim-hist-row{background:#fff;border:1px solid #E5E7EB;border-radius:10px;margin-bottom:8px;overflow:hidden}
+        .dnc-claim-hist-row-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;min-height:64px;cursor:pointer;background:#fff;border:0;width:100%;text-align:left;color:#111827;font-family:inherit;font-size:14px}
+        .dnc-claim-hist-row-head:focus-visible{outline:2px solid #1A3A5C;outline-offset:-2px}
+        .dnc-claim-hist-row-head:active{background:#F9FAFB}
+        .dnc-claim-hist-row-main{flex:1;min-width:0}
+        .dnc-claim-hist-row-title{font-weight:600;color:#111827;font-size:14px;line-height:1.3;margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .dnc-claim-hist-row-sub{font-size:12px;color:#6B7280}
+        .dnc-claim-hist-chev{flex-shrink:0;margin-left:8px;color:#9CA3AF;font-size:14px;transition:transform .15s ease;line-height:1;width:24px;text-align:center}
+        @media (prefers-reduced-motion: reduce){.dnc-claim-hist-chev{transition:none}}
+        .dnc-claim-hist-row[data-expanded="1"] .dnc-claim-hist-chev{transform:rotate(90deg)}
+        .dnc-claim-hist-row-body{padding:0 16px 14px;display:none;border-top:1px solid #F9FAFB}
+        .dnc-claim-hist-row[data-expanded="1"] .dnc-claim-hist-row-body{display:block}
+        .dnc-claim-hist-detail-kv{display:flex;gap:10px;padding:6px 0;border-bottom:1px solid #F9FAFB;font-size:13px}
+        .dnc-claim-hist-detail-kv:last-child{border-bottom:0}
+        .dnc-claim-hist-detail-k{color:#6B7280;width:96px;flex-shrink:0}
+        .dnc-claim-hist-detail-v{color:#111827;word-break:break-all;font-weight:500}
+        .dnc-claim-hist-badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:600}
+        .dnc-claim-hist-badge-ok{background:#dcfce7;color:#166534}
+        .dnc-claim-hist-badge-pend{background:#fef3c7;color:#B45309}
+        .dnc-claim-hist-badge-rej{background:#fee2e2;color:#DC2626}
+        .dnc-claim-hist-badge-neu{background:#F9FAFB;color:#6B7280;border:1px solid #E5E7EB}
+        .dnc-claim-hist-badge-info{background:#dbeafe;color:#1e40af}
+        .dnc-claim-hist-empty{text-align:center;padding:24px 16px;color:#9CA3AF;background:#fff;border:1px solid #E5E7EB;border-radius:10px;font-size:14px}
+        .dnc-claim-hist-error{background:#fee2e2;border:1px solid #fecaca;color:#DC2626;padding:14px;border-radius:10px;margin:8px 0}
+        .dnc-claim-hist-error-retry{display:inline-block;margin-top:8px;background:#1A3A5C;color:#fff;border:0;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;min-height:36px}
+        .dnc-claim-hist-warn{background:#fef3c7;border:1px solid #fde68a;color:#92400e;padding:12px;border-radius:10px;margin:12px 16px}
+        .dnc-claim-hist-warn p{margin:0 0 8px}
+        .dnc-claim-hist-btn-line{display:inline-block;background:#06C755;color:#fff;text-decoration:none;padding:10px 20px;border-radius:10px;font-weight:600;margin-top:8px}
+        .dnc-claim-hist-skel{height:64px;background:linear-gradient(90deg,#F3F4F6 25%,#E5E7EB 50%,#F3F4F6 75%);background-size:200% 100%;border-radius:10px;margin-bottom:8px}
+        @media (prefers-reduced-motion: no-preference){.dnc-claim-hist-skel{animation:dncHistShimmer 1.2s linear infinite}}
+        @keyframes dncHistShimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+        .dnc-claim-hist-track-btn{display:inline-block;background:#1A3A5C;color:#fff;text-decoration:none;padding:8px 14px;border-radius:8px;font-size:12px;font-weight:600;margin-top:8px;min-height:36px;line-height:20px}
+        .dnc-claim-hist-track-btn:hover{background:#152d49}
+        .dnc-claim-hist-footer-link{display:block;text-align:center;color:#6B7280;font-size:13px;padding:16px;text-decoration:none}
+    </style>
+
+    <header class="dnc-claim-hist-header">
+        <button type="button" class="dnc-claim-hist-back" data-action="back" aria-label="ย้อนกลับ">←</button>
+        <h1 id="dnc-claim-hist-title">ประวัติเคลม</h1>
+        <button type="button" class="dnc-claim-hist-close" data-action="close" aria-label="ปิด">×</button>
+    </header>
+
+    <?php echo $logout_card; // safe — built with esc_url ?>
+
+    <div id="dnc-claim-hist-charges-section" class="dnc-claim-hist-section" role="region" aria-labelledby="dnc-claim-hist-charges-h">
+        <h2 id="dnc-claim-hist-charges-h" class="dnc-claim-hist-section-title">💳 ใบเรียกเก็บ</h2>
+        <div id="dnc-claim-hist-charges-body" role="status" aria-live="polite">
+            <div class="dnc-claim-hist-skel"></div>
+            <div class="dnc-claim-hist-skel"></div>
+        </div>
+    </div>
+
+    <div id="dnc-claim-hist-flash-section" class="dnc-claim-hist-section" role="region" aria-labelledby="dnc-claim-hist-flash-h">
+        <h2 id="dnc-claim-hist-flash-h" class="dnc-claim-hist-section-title">📦 พัสดุจัดส่ง</h2>
+        <div id="dnc-claim-hist-flash-body" role="status" aria-live="polite">
+            <div class="dnc-claim-hist-skel"></div>
+            <div class="dnc-claim-hist-skel"></div>
+        </div>
+    </div>
+
+    <a class="dnc-claim-hist-footer-link" href="https://lin.ee/dinoco">💬 ติดต่อแอดมิน</a>
+</div>
+
+<script>
+(function(){
+    var app = document.querySelector('.dnc-claim-hist-app');
+    if (!app) return;
+    var claimId = parseInt(app.getAttribute('data-claim-id') || '0', 10);
+    if (claimId <= 0) {
+        // No claim_id param — render error in both sections + bail.
+        var emsg = '<div class="dnc-claim-hist-error" role="alert">ไม่พบรหัสเคลมในลิงก์ — กรุณาเปิดจากลิงก์เคลมโดยตรง</div>';
+        var cb = document.getElementById('dnc-claim-hist-charges-body');
+        var fb = document.getElementById('dnc-claim-hist-flash-body');
+        if (cb) cb.innerHTML = emsg;
+        if (fb) fb.innerHTML = emsg;
+        return;
+    }
+
+    var REST_CHARGES = '/wp-json/dinoco-claim/v1/my-charges?claim_id=' + claimId;
+    var REST_FLASH   = '/wp-json/dinoco-claim/v1/my-flash?claim_id=' + claimId;
+    var NONCE = (window.wpApiSettings && window.wpApiSettings.nonce) || '';
+
+    // Buddhist year date formatter (Thai locale-aware).
+    function fmtThaiDate(mysqlTs){
+        if (!mysqlTs) return '';
+        var d = new Date(String(mysqlTs).replace(' ', 'T') + '+07:00');
+        if (isNaN(d.getTime())) return mysqlTs;
+        var months = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+        var be = d.getFullYear() + 543;
+        return d.getDate() + ' ' + months[d.getMonth()] + ' ' + be;
+    }
+
+    function fmtTHB(n){
+        var v = parseFloat(n);
+        if (!isFinite(v)) return '0.00';
+        return v.toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    function escHtml(s){
+        return String(s == null ? '' : s)
+            .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+            .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+
+    function reasonLabel(r){
+        var map = { 'return_shipping':'ค่าส่งคืน', 'repair_oow':'ค่าซ่อมนอกประกัน', 'extra_parts':'ค่าอะไหล่เพิ่ม', 'other':'อื่น ๆ' };
+        return map[r] || (r || '-');
+    }
+
+    function chargeStatusBadge(st){
+        // Thai label + variant
+        var map = {
+            'pending_payment':{ t:'รอชำระ',       v:'pend' },
+            'pending_review' :{ t:'กำลังตรวจสอบ', v:'pend' },
+            'verified'       :{ t:'ชำระแล้ว',      v:'ok'   },
+            'rejected'       :{ t:'ปฏิเสธสลิป',    v:'rej'  },
+            'refunded'       :{ t:'คืนเงินแล้ว',    v:'info' },
+            'expired'        :{ t:'หมดเขต',        v:'neu'  },
+            'cancelled'      :{ t:'ยกเลิก',         v:'neu'  }
+        };
+        var x = map[st] || { t:(st || '-'), v:'neu' };
+        return '<span class="dnc-claim-hist-badge dnc-claim-hist-badge-' + x.v + '">' + escHtml(x.t) + '</span>';
+    }
+
+    function flashDirectionLabel(d){
+        var map = {
+            'replacement'    : 'ส่งของแทน',
+            'repaired_return': 'ส่งคืนหลังซ่อม'
+            // inbound_pickup intentionally excluded — admin-only (we filter
+            // it out at the API tier; this map covers customer-facing values).
+        };
+        return map[d] || d || '-';
+    }
+
+    function flashStatusBadge(st, fstate){
+        var s = String(st || '');
+        // Flash state code 5 = delivered → ok; created/queued/etc = pend; cancelled = neu
+        if (s === 'delivered' || parseInt(fstate || 0, 10) === 5) {
+            return '<span class="dnc-claim-hist-badge dnc-claim-hist-badge-ok">จัดส่งสำเร็จ</span>';
+        }
+        if (s === 'cancelled') return '<span class="dnc-claim-hist-badge dnc-claim-hist-badge-neu">ยกเลิก</span>';
+        if (s === 'failed')    return '<span class="dnc-claim-hist-badge dnc-claim-hist-badge-rej">ล้มเหลว</span>';
+        return '<span class="dnc-claim-hist-badge dnc-claim-hist-badge-pend">กำลังจัดส่ง</span>';
+    }
+
+    function buildChargeRow(c){
+        var rowKvs = ''
+            + '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">ประเภท</span><span class="dnc-claim-hist-detail-v">' + escHtml(reasonLabel(c.reason)) + '</span></div>'
+            + '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">ยอด</span><span class="dnc-claim-hist-detail-v">฿' + fmtTHB(c.amount_thb) + '</span></div>'
+            + '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">สถานะ</span><span class="dnc-claim-hist-detail-v">' + chargeStatusBadge(c.status) + '</span></div>'
+            + '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">รหัสอ้างอิง</span><span class="dnc-claim-hist-detail-v">' + escHtml(c.payment_ref || '-') + '</span></div>'
+            + '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">สร้างเมื่อ</span><span class="dnc-claim-hist-detail-v">' + escHtml(fmtThaiDate(c.created_at)) + '</span></div>';
+        if (c.verified_at) {
+            rowKvs += '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">ชำระเมื่อ</span><span class="dnc-claim-hist-detail-v">' + escHtml(fmtThaiDate(c.verified_at)) + '</span></div>';
+        }
+        if (c.refunded_at) {
+            rowKvs += '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">คืนเงินเมื่อ</span><span class="dnc-claim-hist-detail-v">' + escHtml(fmtThaiDate(c.refunded_at)) + '</span></div>';
+        }
+        if (c.status === 'rejected' && c.refund_reason) {
+            rowKvs += '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">เหตุผล</span><span class="dnc-claim-hist-detail-v">' + escHtml(c.refund_reason) + '</span></div>';
+        }
+        if (c.reason_note) {
+            rowKvs += '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">หมายเหตุ</span><span class="dnc-claim-hist-detail-v">' + escHtml(c.reason_note) + '</span></div>';
+        }
+        // Don't expose raw slip URL — but for verified/refunded charges, do
+        // surface a "ดูสลิป" link to the auth-gated proxy in a new tab.
+        if (c.slip_image_url && (c.status === 'verified' || c.status === 'refunded')) {
+            rowKvs += '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">สลิป</span><span class="dnc-claim-hist-detail-v"><a class="dnc-claim-hist-track-btn" href="' + escHtml(c.slip_image_url) + '" target="_blank" rel="noopener">📄 ดูสลิป</a></span></div>';
+        }
+        return ''
+            + '<div class="dnc-claim-hist-row" data-row-type="charge" data-expanded="0">'
+            +   '<button type="button" class="dnc-claim-hist-row-head" data-action="toggle-row" aria-expanded="false">'
+            +     '<span class="dnc-claim-hist-row-main">'
+            +       '<span class="dnc-claim-hist-row-title">฿' + fmtTHB(c.amount_thb) + ' · ' + escHtml(reasonLabel(c.reason)) + '</span>'
+            +       '<span class="dnc-claim-hist-row-sub">' + chargeStatusBadge(c.status) + ' · ' + escHtml(fmtThaiDate(c.created_at)) + '</span>'
+            +     '</span>'
+            +     '<span class="dnc-claim-hist-chev" aria-hidden="true">›</span>'
+            +   '</button>'
+            +   '<div class="dnc-claim-hist-row-body">' + rowKvs + '</div>'
+            + '</div>';
+    }
+
+    function buildFlashRow(s){
+        var trackUrl = 'https://www.flashexpress.co.th/tracking/?se=' + encodeURIComponent(s.pno || '');
+        var rowKvs = ''
+            + '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">PNO</span><span class="dnc-claim-hist-detail-v">' + escHtml(s.pno || '-') + '</span></div>'
+            + '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">ประเภท</span><span class="dnc-claim-hist-detail-v">' + escHtml(flashDirectionLabel(s.direction)) + '</span></div>'
+            + '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">สถานะ</span><span class="dnc-claim-hist-detail-v">' + flashStatusBadge(s.status, s.flash_state) + '</span></div>'
+            + (s.sort_code ? '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">รหัสคัดแยก</span><span class="dnc-claim-hist-detail-v">' + escHtml(s.sort_code) + '</span></div>' : '')
+            + '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">สร้างเมื่อ</span><span class="dnc-claim-hist-detail-v">' + escHtml(fmtThaiDate(s.created_at)) + '</span></div>'
+            + (s.updated_at ? '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">อัปเดตล่าสุด</span><span class="dnc-claim-hist-detail-v">' + escHtml(fmtThaiDate(s.updated_at)) + '</span></div>' : '')
+            + '<div class="dnc-claim-hist-detail-kv"><span class="dnc-claim-hist-detail-k">ติดตาม</span><span class="dnc-claim-hist-detail-v"><a class="dnc-claim-hist-track-btn" href="' + escHtml(trackUrl) + '" target="_blank" rel="noopener">📦 ติดตามที่ Flash</a></span></div>';
+        return ''
+            + '<div class="dnc-claim-hist-row" data-row-type="flash" data-expanded="0">'
+            +   '<button type="button" class="dnc-claim-hist-row-head" data-action="toggle-row" aria-expanded="false">'
+            +     '<span class="dnc-claim-hist-row-main">'
+            +       '<span class="dnc-claim-hist-row-title">' + escHtml(s.pno || '-') + ' · ' + escHtml(flashDirectionLabel(s.direction)) + '</span>'
+            +       '<span class="dnc-claim-hist-row-sub">' + flashStatusBadge(s.status, s.flash_state) + ' · ' + escHtml(fmtThaiDate(s.created_at)) + '</span>'
+            +     '</span>'
+            +     '<span class="dnc-claim-hist-chev" aria-hidden="true">›</span>'
+            +   '</button>'
+            +   '<div class="dnc-claim-hist-row-body">' + rowKvs + '</div>'
+            + '</div>';
+    }
+
+    function renderEmpty(target, msg){
+        target.innerHTML = '<div class="dnc-claim-hist-empty">' + escHtml(msg) + '</div>';
+    }
+
+    function renderError(target, msg, retryAction){
+        var html = '<div class="dnc-claim-hist-error" role="alert">' + escHtml(msg) + '<br>'
+            + '<button type="button" class="dnc-claim-hist-error-retry" data-action="' + escHtml(retryAction) + '">🔄 ลองอีกครั้ง</button>'
+            + '</div>';
+        target.innerHTML = html;
+    }
+
+    function loadCharges(){
+        var target = document.getElementById('dnc-claim-hist-charges-body');
+        if (!target) return;
+        target.innerHTML = '<div class="dnc-claim-hist-skel"></div><div class="dnc-claim-hist-skel"></div>';
+        fetch(REST_CHARGES, { credentials: 'same-origin', headers: { 'X-WP-Nonce': NONCE } })
+            .then(function(r){
+                var ct = r.headers.get('content-type') || '';
+                if (!r.ok) {
+                    if (r.status === 404) { renderEmpty(target, 'ยังไม่มีรายการ'); return; }
+                    if (r.status === 401 || r.status === 403) { renderError(target, 'กรุณาเข้าสู่ระบบ LINE เพื่อดูประวัติเคลม', 'retry-charges'); return; }
+                    if (ct.indexOf('application/json') === 0) {
+                        return r.json().then(function(d){
+                            renderError(target, (d && d.message) || ('โหลดข้อมูลล้มเหลว (HTTP ' + r.status + ')'), 'retry-charges');
+                        });
+                    }
+                    renderError(target, 'โหลดข้อมูลล้มเหลว (HTTP ' + r.status + ')', 'retry-charges');
+                    return;
+                }
+                return r.json().then(function(d){
+                    var items = (d && d.items) || [];
+                    if (!items.length) { renderEmpty(target, 'ยังไม่มีรายการ'); return; }
+                    var html = '';
+                    for (var i = 0; i < items.length; i++) html += buildChargeRow(items[i]);
+                    target.innerHTML = html;
+                });
+            })
+            .catch(function(){ renderError(target, 'เครือข่ายขัดข้อง — กรุณาลองใหม่', 'retry-charges'); });
+    }
+
+    function loadFlash(){
+        var target = document.getElementById('dnc-claim-hist-flash-body');
+        if (!target) return;
+        target.innerHTML = '<div class="dnc-claim-hist-skel"></div><div class="dnc-claim-hist-skel"></div>';
+        fetch(REST_FLASH, { credentials: 'same-origin', headers: { 'X-WP-Nonce': NONCE } })
+            .then(function(r){
+                var ct = r.headers.get('content-type') || '';
+                if (!r.ok) {
+                    if (r.status === 404) { renderEmpty(target, 'ยังไม่มีรายการ'); return; }
+                    if (r.status === 401 || r.status === 403) { renderError(target, 'กรุณาเข้าสู่ระบบ LINE เพื่อดูประวัติพัสดุ', 'retry-flash'); return; }
+                    if (ct.indexOf('application/json') === 0) {
+                        return r.json().then(function(d){
+                            renderError(target, (d && d.message) || ('โหลดข้อมูลล้มเหลว (HTTP ' + r.status + ')'), 'retry-flash');
+                        });
+                    }
+                    renderError(target, 'โหลดข้อมูลล้มเหลว (HTTP ' + r.status + ')', 'retry-flash');
+                    return;
+                }
+                return r.json().then(function(d){
+                    var items = (d && d.items) || [];
+                    if (!items.length) { renderEmpty(target, 'ยังไม่มีรายการ'); return; }
+                    var html = '';
+                    for (var i = 0; i < items.length; i++) html += buildFlashRow(items[i]);
+                    target.innerHTML = html;
+                });
+            })
+            .catch(function(){ renderError(target, 'เครือข่ายขัดข้อง — กรุณาลองใหม่', 'retry-flash'); });
+    }
+
+    // ── Event delegation (UX-H3 strict — NO inline handlers) ─────────────
+    app.addEventListener('click', function(ev){
+        var t = ev.target;
+        while (t && t !== app && !t.getAttribute('data-action')) t = t.parentNode;
+        if (!t || t === app) return;
+        var action = t.getAttribute('data-action');
+
+        if (action === 'close') { window.history.length > 1 ? window.history.back() : window.close(); return; }
+        if (action === 'back')  { if (window.history.length > 1) window.history.back(); else window.location.href = '/member-dashboard/'; return; }
+        if (action === 'toggle-row') {
+            var row = t.closest ? t.closest('.dnc-claim-hist-row') : null;
+            if (!row) {
+                // Fallback closest() polyfill for old browsers
+                var p = t.parentNode;
+                while (p && p.className && p.className.indexOf('dnc-claim-hist-row') === -1) p = p.parentNode;
+                row = p;
+            }
+            if (!row) return;
+            var cur = row.getAttribute('data-expanded') === '1';
+            row.setAttribute('data-expanded', cur ? '0' : '1');
+            t.setAttribute('aria-expanded', cur ? 'false' : 'true');
+            return;
+        }
+        if (action === 'retry-charges') { loadCharges(); return; }
+        if (action === 'retry-flash')   { loadFlash();   return; }
+    });
+
+    // Initial load — only if logged in
+    if (<?php echo $logged_in ? 'true' : 'false'; ?>) {
+        loadCharges();
+        loadFlash();
+    }
+})();
+</script>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+// Register customer history shortcode (flag-gated).
+if ( $dinoco_claim_payment_enabled ) {
+    add_shortcode( 'dinoco_claim_history', 'dinoco_claim_history_render' );
 }
 
 
