@@ -2753,22 +2753,30 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toContain('update_user_meta');
         });
 
-        test('W7.3 scan-first button + html5-qrcode lazy load', () => {
+        test('W7.3 scan-first entry point + html5-qrcode lazy load (V.31.13: moved to action row)', () => {
             const code = readByPath(HEADER_PATH);
-            // Boss Q29 = A scan-first
-            expect(code).toMatch(/dnc-sn-scan-first-btn|dincocoScanFirstQr|dinocoScanFirstQr/);
+            // V.31.13 — green CTA in .search-box-wrap deleted; SCAN now lives
+            // in the 3-col quick action row (center, emphasis) above.
+            // Verify the canonical scan handler + lazy loader still exist.
+            expect(code).toContain('dinocoScanFirstQr');
+            // SCAN button + data-action delegation (UX-H3, replaces inline onclick)
+            expect(code).toMatch(/data-action="dnc-scan-qr"/);
+            expect(code).toMatch(/dnc-dash-quick-card--scan/);
             // Lazy load via dynamic script tag
             expect(code).toMatch(/unpkg\.com\/html5-qrcode/);
             // Reuses startQR from Global App Menu when available (P02 dedup)
             expect(code).toContain('startQR');
+            // Legacy green CTA class MUST NOT return
+            expect(code).not.toMatch(/dnc-sn-scan-first-btn/);
         });
 
         test('W7.3 typed S/N input retained as fallback', () => {
             const code = readByPath(HEADER_PATH);
             // Existing typed input must still exist
             expect(code).toContain('name="register_serial"');
-            // "หรือ พิมพ์ S/N เอง" fallback hint
-            expect(code).toMatch(/หรือ\s+พิมพ์\s+S\/N/);
+            // V.31.13 — label simplified from "หรือ พิมพ์ S/N เอง" → "พิมพ์ S/N เอง"
+            // (SCAN now in 3-col action row above, so this is no longer "the alternative")
+            expect(code).toMatch(/พิมพ์\s+S\/N\s+เอง/);
         });
 
         test('W7 F#3 register_serial DNCSS prefix → /warranty/activate redirect', () => {
@@ -2791,20 +2799,44 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toContain('/warranty/activate');
         });
 
-        test('W7.1 quick action row REFINED in V.31.12 — 2 cards (claim + transfer)', () => {
-            // V.31.10 removed 3 buttons. V.31.12 restored 2 (claim+transfer) per boss
-            // feedback. "ลงทะเบียน" stays absorbed into scan CTA (the only true dupe).
+        test('W7.1 quick action row REFINED in V.31.13 — 3 cards (claim + SCAN center + transfer)', () => {
+            // V.31.10 removed 3 buttons. V.31.12 restored 2. V.31.13 boss directive
+            // "QR สแกน อยู่ตรงกลาง" → 3-col with SCAN center (emphasis). Green scan
+            // CTA in .search-box-wrap deleted (moved up to action row).
             const code = readByPath(HEADER_PATH);
             const stripped = code
                 .replace(/<!--[\s\S]*?-->/g, '')
+                .replace(/<\?php[\s\S]*?\?>/g, '')
                 .replace(/\/\*[\s\S]*?\*\//g, '');
             // Old markup gone
             expect(stripped).not.toMatch(/class="action-grid dnc-sn-action-grid-4"/);
             expect(stripped).not.toMatch(/btn-reg/);
-            // New canonical markup present
+            // New canonical 3-card markup present
             expect(stripped).toMatch(/dnc-dash-quick-actions/);
             expect(stripped).toMatch(/dnc-dash-quick-card--claim/);
+            expect(stripped).toMatch(/dnc-dash-quick-card--scan/);
             expect(stripped).toMatch(/dnc-dash-quick-card--transfer/);
+            // SCAN delegates via data-action (UX-H3 NO inline onclick)
+            expect(stripped).toMatch(/data-action="dnc-scan-qr"/);
+            // Grid layout — center card 25% wider (1fr 1.25fr 1fr)
+            expect(code).toMatch(/grid-template-columns:\s*1fr\s+1\.25fr\s+1fr/);
+        });
+
+        test('W7.1 V.31.13 logo PIVOT to text wordmark', () => {
+            const code = readByPath(HEADER_PATH);
+            // Strip comments (version-header narrates the removed class name)
+            const stripped = code
+                .replace(/<!--[\s\S]*?-->/g, '')
+                .replace(/<\?php[\s\S]*?\?>/g, '')
+                .replace(/\/\*[\s\S]*?\*\//g, '')
+                .replace(/^\s*\/\/.*$/gm, '');
+            // PNG image markup removed (in active code, not comments)
+            expect(stripped).not.toMatch(/class="card-title-logo"/);
+            // Text wordmark present
+            expect(code).toMatch(/<span class="card-title-wordmark">DINOCO<\/span>/);
+            // Wordmark CSS fundamentals (allow newlines in block)
+            expect(code).toMatch(/\.card-title-wordmark\s*\{[\s\S]*?font-size:\s*16px/);
+            expect(code).toMatch(/\.card-title-wordmark\s*\{[\s\S]*?font-weight:\s*800/);
         });
 
         test('W7 SnTierBadgeTest helper test file exists with required cases', () => {

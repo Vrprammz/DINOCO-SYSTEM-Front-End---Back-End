@@ -78,23 +78,57 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         expect(code).toMatch(/<\?php if \(\s*\$has_legacy_warranty\s*\)\s*:\s*\?>[\s\S]{0,500}?royal-upgrade-btn[\s\S]{0,500}?<\?php endif;\s*\?>/);
     });
 
-    test('C4 — quick action row REFINED in V.31.12 (2 cards: แจ้งเคลม + โอนสิทธิ์, no ลงทะเบียน dupe)', () => {
+    test('C4 — quick action row REFINED in V.31.13 (3 cards: claim + SCAN center + transfer)', () => {
         const code = read('header');
-        // V.31.10 removed all 3 buttons. V.31.12 restored 2 (claim + transfer) per
-        // boss feedback "บ้อบอหายทั้งเมนู". "ลงทะเบียน" stays absorbed in green scan
-        // CTA (true dupe). Claim + transfer are NOT scan-related → visible primary.
+        // V.31.10 removed all 3 buttons. V.31.12 restored 2 (claim + transfer).
+        // V.31.13 boss directive 2026-05-14 "QR สแกน อยู่ตรงกลาง" → 3-col layout
+        // with SCAN in center. Green scan CTA in .search-box-wrap deleted (moved up).
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<\?php[\s\S]*?\?>/g, '')   // strip PHP comment blocks too
             .replace(/\/\*[\s\S]*?\*\//g, '');
-        // New canonical markup
+        // New canonical markup — 3 cards
         expect(stripped).toMatch(/<div class="dnc-dash-quick-actions"/);
         expect(stripped).toMatch(/<a[^>]*href="\/claim-system\/"[^>]*dnc-dash-quick-card--claim/);
         expect(stripped).toMatch(/<a[^>]*href="\/transfer-warranty"[^>]*dnc-dash-quick-card--transfer/);
+        // SCAN center button (button element + data-action delegation, UX-H3)
+        expect(stripped).toMatch(/<button[^>]*dnc-dash-quick-card--scan[^>]*data-action="dnc-scan-qr"|<button[^>]*data-action="dnc-scan-qr"[^>]*dnc-dash-quick-card--scan/);
         // UX-H3: no inline onclick on quick cards (data-action delegation)
         expect(stripped).not.toMatch(/dnc-dash-quick-card[^>]*onclick=/);
         // Legacy "btn-reg" (ลงทะเบียน) MUST NOT return — that was the dupe
         expect(stripped).not.toMatch(/btn-reg/);
         expect(stripped).not.toMatch(/<div class="action-grid dnc-sn-action-grid-4">/);
+        // V.31.13 — green scan CTA in search-box-wrap is GONE (moved up to row)
+        expect(stripped).not.toMatch(/dnc-sn-scan-first-btn/);
+    });
+
+    test('V.31.13 — Logo wordmark replaces PNG (deep review pivot)', () => {
+        const code = read('header');
+        // Strip comments (version-header narrates the removed class name)
+        const stripped = code
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<\?php[\s\S]*?\?>/g, '')
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .replace(/^\s*\/\/.*$/gm, '');
+        // PNG image markup removed (in active code, not comments)
+        expect(stripped).not.toMatch(/class="card-title-logo"/);
+        expect(stripped).not.toMatch(/src="https?:\/\/[^"]*\/sss\.png"/);
+        // Text wordmark present
+        expect(code).toMatch(/<span class="card-title-wordmark">DINOCO<\/span>/);
+        // Wordmark CSS exists with correct fundamentals (allow newlines in block)
+        expect(code).toMatch(/\.card-title-wordmark\s*\{[\s\S]*?font-size:\s*16px/);
+        expect(code).toMatch(/\.card-title-wordmark\s*\{[\s\S]*?font-weight:\s*800/);
+        // <360px scaling
+        expect(code).toMatch(/\.card-title-wordmark\s*\{\s*font-size:\s*14px/);
+    });
+
+    test('V.31.13 — Scan delegation handler wired (data-action="dnc-scan-qr")', () => {
+        const code = read('header');
+        // Idempotent global click listener
+        expect(code).toMatch(/__dncScanDelegationWired/);
+        expect(code).toMatch(/data-action="dnc-scan-qr"/);
+        // Handler calls dinocoScanFirstQr (which reuses Global App Menu's startQR)
+        expect(code).toContain('dinocoScanFirstQr');
     });
 
     test('C5 — Profile form has Thai-mobile-correct inputmode + autocomplete + pattern', () => {

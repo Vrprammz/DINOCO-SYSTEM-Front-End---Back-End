@@ -207,7 +207,14 @@ const SNIPPET_PREFIXES = [
 //     at once — deferred to Phase 9 a11y sweep when all banner UX
 //     can be migrated together. PARITY ADDITION: 1 new occurrence
 //     mirrors 3 pre-existing identical sites.
-const BASELINE_INLINE_HANDLER_COUNT = 988;
+// 988 → 987 (2026-05-14 Sprint 35 A1 — Header & Forms V.31.13): -1
+//   - Green scan CTA (`onclick="dinocoScanFirstQr()"` on
+//     `.dnc-sn-scan-first-btn` button in .search-box-wrap) DELETED.
+//     SCAN moved up into 3-col quick action row as a <button> with
+//     `data-action="dnc-scan-qr"` delegation (new idempotent global
+//     click listener wired via `window.__dncScanDelegationWired`).
+//     Net: -1 inline handler.
+const BASELINE_INLINE_HANDLER_COUNT = 987;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
