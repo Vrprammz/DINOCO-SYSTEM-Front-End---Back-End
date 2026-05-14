@@ -45,8 +45,8 @@ describe('Sprint 17 Phase 2.6 — Claim Charge Create + Tiered Read drift', () =
         expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.6\s*\(2026-05-14\)\s*—\s*Sprint 17/);
     });
 
-    test('LIFF defines DINOCO_CLAIM_PAYMENT_LIFF_LOADED = 0.9 (Sprint 22)', () => {
-        expect(LIFF_CODE).toMatch(/DINOCO_CLAIM_PAYMENT_LIFF_LOADED['"][^;]*['"]0\.9['"]/);
+    test('LIFF defines DINOCO_CLAIM_PAYMENT_LIFF_LOADED = 0.11 (Sprint 32)', () => {
+        expect(LIFF_CODE).toMatch(/DINOCO_CLAIM_PAYMENT_LIFF_LOADED['"][^;]*['"]0\.11['"]/);
     });
 
     // ─── REST route registrations ────────────────────────────────────

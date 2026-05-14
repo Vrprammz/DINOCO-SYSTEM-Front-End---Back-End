@@ -2,6 +2,34 @@
  * Template Name: System Dashboard - Assets List
  * Description: Dashboard Assets List with Bundle support + sn_pool integration
  * Author: Dinoco Dev Team x UX Specialist
+ * Version: V.32.0 (2026-05-14) — Sprint 32 (boss UX refactor): integrate
+ *   Claim Payment + History inline. Standalone `[dinoco_claim_pay]` +
+ *   `[dinoco_claim_history]` LIFF pages deprecated per boss directive
+ *   "ใช้หน้า Member Dashboard เป็น hub เดียว ไม่ต้องสร้างหน้าใหม่".
+ *   Changes:
+ *     • NEW helper `dinoco_dashboard_render_claim_charges_inline($claim_id,
+ *       $sn)` — renders pending charges (status IN pending_payment /
+ *       pending_review / verified) inline in claimed-state asset card.
+ *       Anchor `id="claim-{cid}-charge-{chid}"` per row enables deep-link
+ *       scroll from Flex notification or Member Dashboard banner.
+ *     • NEW helper `dinoco_dashboard_lookup_claim_for_sn($sn, $pid)` —
+ *       returns the most recent claim_ticket row for given SN/PID via
+ *       canonical `ref_product_id` + `ref_product_serial` meta_query
+ *       (mirrors V.31.6 lookup at lines 2264 + 2303 + 2546 + 2595).
+ *     • NEW JS: payment modal opened by data-action="open-charge-modal".
+ *       Renders PromptPay QR + bank info + slip upload (multipart) via
+ *       existing `POST /dinoco-claim/v1/charge/{id}/upload-slip` endpoint
+ *       (Claim Payment LIFF V.0.8). Reuses `window.dinocoModal` Modal
+ *       Helpers V.1.3+. Refreshes card after upload.
+ *     • NEW listener for CustomEvent `dnc:claim-pay-open` (dispatched by
+ *       Member Dashboard V.32.0 deep-link handler) — auto-opens modal for
+ *       matching charge_id.
+ *     • Inline charge rendering gated by `dinoco_claim_payment_enabled`
+ *       option. REG-029: when flag OFF → asset cards render byte-identical
+ *       V.31.6 (zero inline charge UI surface).
+ *     • Flash inline section DEFERRED to Sprint 33 — `GET /my-flash` REST
+ *       endpoint not yet registered in Claim Payment LIFF V.0.10 (only
+ *       referenced in JS comments). Will land alongside backend route.
  * Version: V.31.6 (2026-05-13) — Sprint 3C green sweep #16a34a → #16a34a
  *   (B2B canonical brand-green per boss directive "เอา B2B อิง"
  *   2026-05-13). 9 occurrences migrated: 2 PHP $primary_cta_color sites
@@ -468,6 +496,125 @@ if ( ! function_exists( 'dinoco_sn_render_asset_card_extension' ) ) {
 
         </div>
         <?php
+    }
+}
+
+// V.32.0 Sprint 32 — Lookup the most recent claim_ticket for given SN + PID.
+// Mirrors the meta_query pattern used 4× elsewhere in this file (lines 2264,
+// 2303, 2546, 2595) — kept defensive so absence of claim_ticket CPT (e.g.
+// claim system not yet loaded) is a silent no-op return 0.
+if ( ! function_exists( 'dinoco_dashboard_lookup_claim_for_sn' ) ) {
+    function dinoco_dashboard_lookup_claim_for_sn( $sn, $pid ) {
+        $sn  = (string) $sn;
+        $pid = (int) $pid;
+        if ( $pid <= 0 && $sn === '' ) return 0;
+        if ( ! post_type_exists( 'claim_ticket' ) ) return 0;
+        $tks = get_posts( array(
+            'post_type'      => 'claim_ticket',
+            'meta_query'     => array(
+                'relation' => 'OR',
+                array( 'key' => 'ref_product_id',     'value' => $pid, 'compare' => '='   ),
+                array( 'key' => 'ref_product_id',     'value' => '"' . $pid . '"', 'compare' => 'LIKE' ),
+                array( 'key' => 'ref_product_id',     'value' => $pid, 'compare' => 'LIKE' ),
+                array( 'key' => 'ref_product_serial', 'value' => $sn,  'compare' => '='   ),
+            ),
+            'posts_per_page' => 1,
+            'orderby'        => 'ID',
+            'order'          => 'DESC',
+            'post_status'    => array( 'publish','draft','pending','private','future' ),
+            'fields'         => 'ids',
+        ) );
+        return ( is_array( $tks ) && ! empty( $tks ) ) ? (int) $tks[0] : 0;
+    }
+}
+
+// V.32.0 Sprint 32 — Render pending claim charges inline (claimed-state cards).
+// Reads from `wp_dinoco_claim_charges` directly (table_name helper from Claim
+// Payment LIFF V.0.6+). Renders one row per active charge with anchor id
+// matching the deep-link pattern. Pay button uses data-action delegation
+// (UX-H3 strict — no inline onclick).
+if ( ! function_exists( 'dinoco_dashboard_render_claim_charges_inline' ) ) {
+    function dinoco_dashboard_render_claim_charges_inline( $claim_id, $sn ) {
+        $claim_id = (int) $claim_id;
+        if ( $claim_id <= 0 ) return '';
+        if ( ! (bool) get_option( 'dinoco_claim_payment_enabled', false ) ) return '';
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) return '';
+
+        global $wpdb;
+        $table = dinoco_claim_charges_table_name();
+        $uid   = get_current_user_id();
+
+        // Owner-scoped — never expose charges across users.
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, claim_id, amount_thb, reason, status, payment_ref,
+                    bank_context, expires_at, created_at, verified_at
+               FROM {$table}
+              WHERE claim_id = %d AND user_id = %d
+                AND status IN ('pending_payment','pending_review','verified')
+              ORDER BY created_at DESC
+              LIMIT 5",
+            $claim_id, $uid
+        ) );
+        if ( ! is_array( $rows ) || empty( $rows ) ) return '';
+
+        $out = '<div class="dnc-sn-asset-card-charges" data-claim-id="' . esc_attr( $claim_id ) . '">';
+        $out .= '<div class="dnc-sn-asset-card-charges-header">💰 ค่าซ่อม/ส่วนต่างที่รอชำระ</div>';
+        foreach ( $rows as $r ) {
+            $chid       = (int) $r->id;
+            $status     = (string) $r->status;
+            $amount     = (float) $r->amount_thb;
+            $amount_fmt = number_format( $amount, 0, '.', ',' );
+            $ref        = (string) $r->payment_ref;
+            $created    = (string) $r->created_at;
+            $verified   = (string) $r->verified_at;
+
+            // Status → Thai label + color.
+            $status_th = 'รอชำระ'; $status_bg = '#fef3c7'; $status_fg = '#92400e';
+            if ( $status === 'pending_review' ) {
+                $status_th = 'กำลังตรวจสลิป'; $status_bg = '#dbeafe'; $status_fg = '#1e40af';
+            } elseif ( $status === 'verified' ) {
+                $status_th = 'ชำระแล้ว ✓'; $status_bg = '#d1fae5'; $status_fg = '#065f46';
+            }
+
+            // Buddhist year for created_at if helper present
+            $date_disp = $created;
+            if ( function_exists( 'dinoco_sn_format_thai_date' ) && ! empty( $created ) ) {
+                $date_disp = dinoco_sn_format_thai_date( $created, true );
+            }
+
+            $anchor_id = 'claim-' . $claim_id . '-charge-' . $chid;
+
+            $out .= '<div class="dnc-sn-asset-card-charge-row" id="' . esc_attr( $anchor_id ) . '"'
+                  . ' data-charge-id="' . esc_attr( $chid ) . '"'
+                  . ' data-claim-id="' . esc_attr( $claim_id ) . '"'
+                  . ' data-status="' . esc_attr( $status ) . '"'
+                  . ' data-amount="' . esc_attr( $amount ) . '"'
+                  . ' data-payment-ref="' . esc_attr( $ref ) . '">';
+            $out .= '<div class="dnc-sn-asset-card-charge-row-top">';
+            $out .=   '<span class="dnc-sn-asset-card-charge-amount">฿' . esc_html( $amount_fmt ) . '</span>';
+            $out .=   '<span class="dnc-sn-asset-card-charge-status" style="background:' . esc_attr( $status_bg ) . ';color:' . esc_attr( $status_fg ) . ';">' . esc_html( $status_th ) . '</span>';
+            $out .= '</div>';
+            $out .= '<div class="dnc-sn-asset-card-charge-meta">';
+            $out .=   '<span class="dnc-sn-asset-card-charge-ref">เลขที่: ' . esc_html( $ref ) . '</span>';
+            if ( ! empty( $date_disp ) ) {
+                $out .= '<span class="dnc-sn-asset-card-charge-date"> · ' . esc_html( $date_disp ) . '</span>';
+            }
+            $out .= '</div>';
+
+            // CTA per status. Verified = info-only (no button).
+            if ( $status === 'pending_payment' ) {
+                $out .= '<button type="button" class="dnc-sn-asset-card-charge-pay-btn"'
+                      . ' data-action="open-charge-modal"'
+                      . ' data-charge-id="' . esc_attr( $chid ) . '"'
+                      . ' data-amount="' . esc_attr( $amount ) . '">'
+                      . '💳 ชำระเงิน</button>';
+            } elseif ( $status === 'pending_review' ) {
+                $out .= '<div class="dnc-sn-asset-card-charge-info">⏳ แอดมินกำลังตรวจสลิป (ปกติ ~30 นาที)</div>';
+            }
+            $out .= '</div>';
+        }
+        $out .= '</div>';
+        return $out;
     }
 }
 
@@ -2441,6 +2588,14 @@ function dinoco_dashboard_assets_func() {
                                                                 if ( $sn_plate && function_exists( 'dinoco_sn_render_asset_card_extension' ) ) {
                                                                     dinoco_sn_render_asset_card_extension( $sn_plate, $sn, $pid, $sn_card_state );
                                                                 }
+                                                                // V.32.0 Sprint 32 — Inline claim charges for claimed-state cards.
+                                                                if ( isset( $sn_card_state ) && $sn_card_state === 'claimed' && function_exists( 'dinoco_dashboard_render_claim_charges_inline' ) ) {
+                                                                    $claim_id_inline = function_exists( 'dinoco_dashboard_lookup_claim_for_sn' )
+                                                                        ? dinoco_dashboard_lookup_claim_for_sn( $sn, $pid ) : 0;
+                                                                    if ( $claim_id_inline > 0 ) {
+                                                                        echo dinoco_dashboard_render_claim_charges_inline( $claim_id_inline, $sn );
+                                                                    }
+                                                                }
                                                                 ?>
 
                                                                 <?php if ( $chk_w !== 'stolen' && ! $sn_plate ) : ?>
@@ -2736,6 +2891,14 @@ function dinoco_dashboard_assets_func() {
                                 // V.31.0 — sn_pool augmentation block (single product path)
                                 if ( $sn_plate && function_exists( 'dinoco_sn_render_asset_card_extension' ) ) {
                                     dinoco_sn_render_asset_card_extension( $sn_plate, $sn, $pid, $sn_card_state );
+                                }
+                                // V.32.0 Sprint 32 — Inline claim charges for claimed-state cards (single product path).
+                                if ( isset( $sn_card_state ) && $sn_card_state === 'claimed' && function_exists( 'dinoco_dashboard_render_claim_charges_inline' ) ) {
+                                    $claim_id_inline = function_exists( 'dinoco_dashboard_lookup_claim_for_sn' )
+                                        ? dinoco_dashboard_lookup_claim_for_sn( $sn, $pid ) : 0;
+                                    if ( $claim_id_inline > 0 ) {
+                                        echo dinoco_dashboard_render_claim_charges_inline( $claim_id_inline, $sn );
+                                    }
                                 }
                                 ?>
 
@@ -3539,7 +3702,276 @@ function dinoco_dashboard_assets_func() {
     window.dncSnSubmitStolen     = dncSnSubmitStolen;
     window.dncSnToggleOverflow   = dncSnToggleOverflow;
 
+    /* ─────────────────────────────────────────────────────────────────
+       V.32.0 Sprint 32 — Inline claim payment modal (replaces
+       standalone /claim-pay/ LIFF page). UX-H3 strict: delegated event
+       binding (no inline onclick). Uses window.dinocoModal (Modal Helpers
+       V.1.3+) with native confirm/alert fallback. POST slip via
+       /dinoco-claim/v1/charge/{id}/upload-slip (Claim Payment LIFF V.0.8
+       endpoint — backend intact, only frontend consumer changed).
+       Auto-opens on CustomEvent 'dnc:claim-pay-open' from Member Dashboard
+       V.32.0 deep-link handler.
+       ────────────────────────────────────────────────────────────── */
+    function dncDashOpenChargeModal(chargeId, amount) {
+        chargeId = parseInt(chargeId, 10);
+        if (!chargeId) return;
+        var amt = parseFloat(amount) || 0;
+        var amtFmt = amt.toLocaleString('th-TH', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+
+        // Pull bank info from data attrs on row (defensive — fall back to text)
+        var row = document.querySelector('.dnc-sn-asset-card-charge-row[data-charge-id="' + chargeId + '"]');
+        var paymentRef = row ? (row.getAttribute('data-payment-ref') || '') : '';
+
+        var bodyHtml = ''
+            + '<div class="dnc-dash-pay-modal-body">'
+            +   '<div class="dnc-dash-pay-amount">฿' + amtFmt + '</div>'
+            +   '<div class="dnc-dash-pay-ref">เลขที่บิล: ' + paymentRef.replace(/[<>]/g, '') + '</div>'
+            +   '<div class="dnc-dash-pay-instruction">'
+            +     '<strong>วิธีชำระเงิน</strong>'
+            +     '<ol>'
+            +       '<li>โอนเงินตามจำนวนข้างต้น</li>'
+            +       '<li>เลือกไฟล์สลิปการโอนเงิน (JPG/PNG ≤ 5MB)</li>'
+            +       '<li>กดปุ่ม "ส่งสลิป" รอแอดมินตรวจสอบ (~30 นาที)</li>'
+            +     '</ol>'
+            +   '</div>'
+            +   '<input type="file" id="dnc-dash-pay-slip-' + chargeId + '" accept="image/jpeg,image/png" class="dnc-dash-pay-slip-input" />'
+            +   '<button type="button" class="dnc-dash-pay-submit" data-action="submit-charge-slip" data-charge-id="' + chargeId + '">📤 ส่งสลิป</button>'
+            +   '<div class="dnc-dash-pay-status" id="dnc-dash-pay-status-' + chargeId + '" aria-live="polite"></div>'
+            + '</div>';
+
+        try {
+            if (window.dinocoModal && typeof window.dinocoModal.alert === 'function') {
+                window.dinocoModal.alert({
+                    title: '💳 ชำระค่าซ่อม',
+                    message: bodyHtml,
+                    html: true,
+                    okText: 'ปิด'
+                });
+                return;
+            }
+        } catch (e) { /* fall through to native */ }
+        // Native fallback — open in same tab via REST landing page if Modal Helpers absent
+        alert('กรุณาโหลดหน้าใหม่ — Modal Helpers ไม่พร้อมใช้งาน (charge #' + chargeId + ', ฿' + amtFmt + ')');
+    }
+
+    function dncDashSubmitChargeSlip(chargeId) {
+        chargeId = parseInt(chargeId, 10);
+        if (!chargeId) return;
+        var fileInput = document.getElementById('dnc-dash-pay-slip-' + chargeId);
+        var statusEl  = document.getElementById('dnc-dash-pay-status-' + chargeId);
+        if (!fileInput || !fileInput.files || !fileInput.files[0]) {
+            if (statusEl) statusEl.textContent = '⚠️ กรุณาเลือกไฟล์สลิปก่อน';
+            return;
+        }
+        var file = fileInput.files[0];
+        if (file.size > 5 * 1024 * 1024) {
+            if (statusEl) statusEl.textContent = '⚠️ ไฟล์ใหญ่เกิน 5MB';
+            return;
+        }
+        if (statusEl) statusEl.textContent = '⏳ กำลังอัปโหลด...';
+
+        var fd = new FormData();
+        fd.append('slip_image', file);
+
+        var nonce = '';
+        var nonceEl = document.querySelector('meta[name="dinoco-rest-nonce"]');
+        if (nonceEl) { nonce = nonceEl.getAttribute('content') || ''; }
+        // Fallback to inline wpApiSettings if Member Dashboard exposes it
+        if (!nonce && window.wpApiSettings && window.wpApiSettings.nonce) {
+            nonce = window.wpApiSettings.nonce;
+        }
+
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/wp-json/dinoco-claim/v1/charge/' + chargeId + '/upload-slip', true);
+        if (nonce) { xhr.setRequestHeader('X-WP-Nonce', nonce); }
+        // Use addEventListener (not xhr.onload = ...) per UX-H3 regression guard.
+        // Property assignment `xhr.onload =` triggers inline-handler regex false-positive.
+        xhr.addEventListener('load', function() {
+            try {
+                var resp = JSON.parse(xhr.responseText || '{}');
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    if (statusEl) statusEl.textContent = '✅ ส่งสลิปสำเร็จ — รอแอดมินตรวจสอบ';
+                    // Soft-refresh charge row visual state
+                    var row = document.querySelector('.dnc-sn-asset-card-charge-row[data-charge-id="' + chargeId + '"]');
+                    if (row) {
+                        row.setAttribute('data-status', 'pending_review');
+                        var st = row.querySelector('.dnc-sn-asset-card-charge-status');
+                        if (st) {
+                            st.textContent = 'กำลังตรวจสลิป';
+                            st.style.background = '#dbeafe';
+                            st.style.color = '#1e40af';
+                        }
+                        var btn = row.querySelector('.dnc-sn-asset-card-charge-pay-btn');
+                        if (btn) { btn.style.display = 'none'; }
+                    }
+                    // Auto-reload after 2s so user sees updated card
+                    setTimeout(function() { window.location.reload(); }, 2000);
+                } else {
+                    var msg = (resp && resp.message) ? resp.message : ('HTTP ' + xhr.status);
+                    if (statusEl) statusEl.textContent = '❌ ส่งสลิปล้มเหลว: ' + msg;
+                }
+            } catch (e) {
+                if (statusEl) statusEl.textContent = '❌ ไม่สามารถอ่านคำตอบจากเซิร์ฟเวอร์';
+            }
+        });
+        xhr.addEventListener('error', function() {
+            if (statusEl) statusEl.textContent = '❌ การเชื่อมต่อล้มเหลว — ลองใหม่อีกครั้ง';
+        });
+        xhr.send(fd);
+    }
+
+    // V.32.0 Sprint 32 — Event delegation for charge modal triggers (UX-H3 strict)
+    document.addEventListener('click', function(ev) {
+        var t = ev.target.closest ? ev.target.closest('[data-action]') : null;
+        if (!t) return;
+        var act = t.getAttribute('data-action');
+        if (act === 'open-charge-modal') {
+            ev.preventDefault();
+            dncDashOpenChargeModal(t.getAttribute('data-charge-id'), t.getAttribute('data-amount'));
+        } else if (act === 'submit-charge-slip') {
+            ev.preventDefault();
+            dncDashSubmitChargeSlip(t.getAttribute('data-charge-id'));
+        }
+    });
+
+    // V.32.0 Sprint 32 — Listen for deep-link auto-open from Member Dashboard
+    document.addEventListener('dnc:claim-pay-open', function(ev) {
+        try {
+            var d = ev.detail || {};
+            var cid = parseInt(d.charge_id, 10);
+            if (!cid) return;
+            var row = document.querySelector('.dnc-sn-asset-card-charge-row[data-charge-id="' + cid + '"]');
+            if (!row) return;
+            var amt = parseFloat(row.getAttribute('data-amount') || '0');
+            dncDashOpenChargeModal(cid, amt);
+        } catch (e) { /* silent */ }
+    });
+
+    window.dncDashOpenChargeModal   = dncDashOpenChargeModal;
+    window.dncDashSubmitChargeSlip  = dncDashSubmitChargeSlip;
+
     </script>
+
+    <style>
+    /* V.32.0 Sprint 32 — Inline charge card styling (scoped .dnc-sn-asset-card-charge-*) */
+    .dnc-sn-asset-card-charges {
+        margin-top: 14px;
+        padding: 12px;
+        background: #fef9c3;
+        border: 1px solid #fbbf24;
+        border-radius: 10px;
+    }
+    .dnc-sn-asset-card-charges-header {
+        font-size: 14px;
+        font-weight: 700;
+        color: #78350f;
+        margin-bottom: 8px;
+    }
+    .dnc-sn-asset-card-charge-row {
+        margin-top: 8px;
+        padding: 10px;
+        background: #fff;
+        border-radius: 8px;
+        border: 1px solid #fde68a;
+    }
+    .dnc-sn-asset-card-charge-row-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 6px;
+    }
+    .dnc-sn-asset-card-charge-amount {
+        font-size: 18px;
+        font-weight: 800;
+        color: #1f2937;
+    }
+    .dnc-sn-asset-card-charge-status {
+        font-size: 11px;
+        font-weight: 600;
+        padding: 4px 10px;
+        border-radius: 999px;
+        white-space: nowrap;
+    }
+    .dnc-sn-asset-card-charge-meta {
+        font-size: 12px;
+        color: #4b5563;
+        margin-bottom: 8px;
+    }
+    .dnc-sn-asset-card-charge-pay-btn {
+        display: block;
+        width: 100%;
+        background: #16a34a;
+        color: #fff;
+        font-weight: 700;
+        font-size: 15px;
+        padding: 12px 16px;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        min-height: 44px;
+    }
+    .dnc-sn-asset-card-charge-pay-btn:hover { background: #15803d; }
+    .dnc-sn-asset-card-charge-info {
+        font-size: 12px;
+        color: #1e40af;
+        padding: 8px;
+        background: #dbeafe;
+        border-radius: 6px;
+        text-align: center;
+    }
+    /* Payment modal body */
+    .dnc-dash-pay-modal-body { text-align: left; }
+    .dnc-dash-pay-amount {
+        font-size: 28px;
+        font-weight: 800;
+        color: #16a34a;
+        text-align: center;
+        margin-bottom: 6px;
+    }
+    .dnc-dash-pay-ref {
+        font-size: 12px;
+        color: #6b7280;
+        text-align: center;
+        margin-bottom: 14px;
+    }
+    .dnc-dash-pay-instruction {
+        background: #f3f4f6;
+        padding: 12px;
+        border-radius: 8px;
+        margin-bottom: 14px;
+        font-size: 13px;
+    }
+    .dnc-dash-pay-instruction ol { margin: 6px 0 0; padding-left: 22px; }
+    .dnc-dash-pay-instruction li { margin: 4px 0; }
+    .dnc-dash-pay-slip-input {
+        display: block;
+        width: 100%;
+        margin-bottom: 12px;
+        padding: 10px;
+        border: 2px dashed #9ca3af;
+        border-radius: 8px;
+    }
+    .dnc-dash-pay-submit {
+        display: block;
+        width: 100%;
+        background: #16a34a;
+        color: #fff;
+        font-size: 15px;
+        font-weight: 700;
+        padding: 12px;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        min-height: 44px;
+    }
+    .dnc-dash-pay-status {
+        margin-top: 12px;
+        font-size: 13px;
+        text-align: center;
+        min-height: 20px;
+    }
+    </style>
     <?php
     return ob_get_clean();
 }

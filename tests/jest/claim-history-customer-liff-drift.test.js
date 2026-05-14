@@ -63,7 +63,10 @@ const HIST_RENDER_BODY = sliceBetween(
 describe('Claim Customer LIFF History — Phase 4 Batch C Item 5 drift detector', () => {
 
     // ─── Version pins ──────────────────────────────────────────────────
-    test('Claim Payment LIFF version stamped V.0.10', () => {
+    test('Claim Payment LIFF version stamped V.0.11 + V.0.10 lineage', () => {
+        // Sprint 32 — V.0.11 deprecation redirect. V.0.10 customer history
+        // shortcode kept as dead code (drift baseline).
+        expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.11\s*\(2026-05-14\)\s*—\s*Sprint 32/);
         expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.10\s*\(2026-05-14\)/);
     });
 
@@ -71,13 +74,18 @@ describe('Claim Customer LIFF History — Phase 4 Batch C Item 5 drift detector'
         expect(FLASH_SRC).toMatch(/Version:\s*V\.0\.7\s*\(2026-05-14\)/);
     });
 
-    // ─── Shortcode registration ─────────────────────────────────────────
-    test('NEW shortcode [dinoco_claim_history] registered', () => {
-        expect(LIFF_CODE).toMatch(/add_shortcode\(\s*['"]dinoco_claim_history['"]\s*,\s*['"]dinoco_claim_history_render['"]/);
+    // ─── Shortcode registration (V.0.11 deprecation) ─────────────────
+    test('Sprint 32 — [dinoco_claim_history] routes to deprecation handler (NOT legacy render)', () => {
+        // V.0.11 (Sprint 32) — shortcode redirects to Member Dashboard inline UI.
+        // Original dinoco_claim_history_render preserved as dead code.
+        expect(LIFF_CODE).toMatch(/add_shortcode\(\s*['"]dinoco_claim_history['"]\s*,\s*['"]dinoco_claim_pay_deprecated_redirect['"]/);
+        // Negative — no live registration of legacy render fn.
+        expect(LIFF_CODE).not.toMatch(/add_shortcode\(\s*['"]dinoco_claim_history['"]\s*,\s*['"]dinoco_claim_history_render['"]/);
     });
 
     test('Shortcode registration is flag-gated by dinoco_claim_payment_enabled', () => {
-        // The shortcode add_shortcode call sits inside if ( $dinoco_claim_payment_enabled )
+        // The shortcode add_shortcode call sits inside if ( $dinoco_claim_payment_enabled ).
+        // V.0.11 — handler is now dinoco_claim_pay_deprecated_redirect (Sprint 32).
         expect(LIFF_CODE).toMatch(/if\s*\(\s*\$dinoco_claim_payment_enabled\s*\)\s*\{[^}]*add_shortcode\(\s*['"]dinoco_claim_history['"]/);
     });
 

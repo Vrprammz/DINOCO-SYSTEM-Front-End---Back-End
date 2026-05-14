@@ -34,13 +34,17 @@ describe('Sprint 20 Phase 2.7 — Claim Pay customer LIFF drift', () => {
 
     // ─── Version header + LIFF_LOADED constant ────────────────────
 
-    test('LIFF V.0.9 latest + V.0.8 lineage preserved', () => {
+    test('LIFF V.0.11 latest + V.0.10 + V.0.9 + V.0.8 lineage preserved', () => {
+        // V.0.11 = Sprint 32 deprecation redirect (boss UX refactor moved
+        // customer flow inline to Member Dashboard).
+        expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.11\s*\(2026-05-14\)\s*—\s*Sprint 32/);
+        expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.10\s*\(2026-05-14\)/);
         expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.9\s*\(2026-05-14\)\s*—\s*Sprint 22/);
         expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.8\s*\(2026-05-14\)\s*—\s*Sprint 20/);
     });
 
-    test('Sprint 22 — DINOCO_CLAIM_PAYMENT_LIFF_LOADED bumped to 0.9', () => {
-        expect(LIFF_CODE).toMatch(/DINOCO_CLAIM_PAYMENT_LIFF_LOADED['"]\s*,\s*['"]0\.9['"]/);
+    test('Sprint 32 — DINOCO_CLAIM_PAYMENT_LIFF_LOADED bumped to 0.11', () => {
+        expect(LIFF_CODE).toMatch(/DINOCO_CLAIM_PAYMENT_LIFF_LOADED['"]\s*,\s*['"]0\.11['"]/);
     });
 
     // ─── Sprint 22 audit fixes ───────────────────────────────────────
@@ -57,8 +61,11 @@ describe('Sprint 20 Phase 2.7 — Claim Pay customer LIFF drift', () => {
 
     // ─── Shortcode registration ───────────────────────────────────
 
-    test('[dinoco_claim_pay] shortcode registered', () => {
-        expect(LIFF_CODE).toMatch(/add_shortcode\(\s*'dinoco_claim_pay'\s*,\s*'dinoco_claim_pay_render'\s*\)/);
+    test('[dinoco_claim_pay] shortcode registered (V.0.11 deprecation redirect)', () => {
+        // Sprint 32 — shortcode now routes to deprecation redirect handler
+        // (Member Dashboard hub). Original render fn `dinoco_claim_pay_render`
+        // retained as dead code (drift detector below verifies).
+        expect(LIFF_CODE).toMatch(/add_shortcode\(\s*'dinoco_claim_pay'\s*,\s*'dinoco_claim_pay_deprecated_redirect'\s*\)/);
     });
 
     test('Shortcode flag-gated by dinoco_claim_payment_enabled', () => {

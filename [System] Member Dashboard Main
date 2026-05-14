@@ -2,6 +2,32 @@
  * Template Name: System Member Dashboard Main (Controller)
  * Description: Main Controller that handles Logic, AJAX, CSS and calls sub-components.
  * Author: Dinoco Dev Team
+ * Version: V.32.0 (2026-05-14) — Sprint 32 (boss UX refactor): integrate
+ *   Claim Payment + History into existing Member Dashboard. Standalone LIFF
+ *   pages `[dinoco_claim_pay]` + `[dinoco_claim_history]` deprecated —
+ *   customer claim payment flow now renders inline inside
+ *   `[dinoco_dashboard_assets]` claimed-state cards (Assets List V.32.0).
+ *   Changes here:
+ *     • NEW banner type `charge_pending` in `dinoco_dashboard_banner_data()`
+ *       — queries `wp_dinoco_claim_charges` for status IN (pending_payment,
+ *       pending_review) for current user, surfaces top entry as red banner
+ *       "🔴 มีค่าซ่อมรอชำระ ฿X — กดเพื่อดูรายละเอียด". Defensive
+ *       function_exists guards (no charge_table → skip silently).
+ *     • NEW banner rendering branch in `dinoco_dashboard_banners()` —
+ *       extends rotation `picked` array with charge_pending key, kept FIRST
+ *       in $ordered (financial urgency > expiry > anniversary > review).
+ *       Banner click scrolls to `#claim-{claim_id}-charge-{charge_id}`
+ *       anchor in the inline assets list.
+ *     • NEW JS: `dncDashClaimAutoScroll()` reads `?action=pay&claim_id=X
+ *       &charge_id=Y` from URL on DOMContentLoaded, finds the matching
+ *       asset card anchor, smooth-scrolls + dispatches `dnc:claim-pay-open`
+ *       CustomEvent which the Assets List listens for to auto-open the
+ *       payment modal.
+ *     • Cache invalidation listener `dinoco/claim/charge_state_changed`
+ *       fires `dinoco_sn_invalidate_banner_cache()` so charge state flips
+ *       (paid / refunded / rejected) clear the banner immediately.
+ *     • REG-029: when `dinoco_claim_payment_enabled=0` → byte-identical
+ *       V.31.8 (banner branch + URL handler both gated by flag).
  * Version: V.31.8 (2026-05-13) — Sprint 3D: CSS namespace clash fix.
  *   Renamed ALL Member Dashboard local CSS vars from `--mdash-*` prefix
  *   to `--mdash-*` prefix (115 occurrences: 30 definitions + 71 var()
@@ -268,6 +294,42 @@ if ( ! function_exists( 'dinoco_dashboard_banner_data' ) ) {
         $items = array();
         $total = 0;
 
+        // V.32.0 Sprint 32 — Claim charge pending banner (flag-gated).
+        // Renders FIRST (highest priority — financial urgency outranks
+        // expiry/anniversary/review). Defensive function_exists +
+        // table_name guard; silent skip when feature off or schema
+        // missing (REG-029 preserves V.31.8 behavior when flag OFF).
+        if ( (bool) get_option( 'dinoco_claim_payment_enabled', false )
+             && function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            global $wpdb;
+            $ch_table = dinoco_claim_charges_table_name();
+            // Cheap row count — short-circuits when no pending charges.
+            // user_id column populated by V.0.7 / V.0.8 paths (claim
+            // owner mirrored at INSERT). Status whitelist matches
+            // DINOCO_CLAIM_CHARGES_STATUS_WHITELIST `pending_payment`
+            // (awaiting customer slip) + `pending_review` (slip uploaded,
+            // admin verifying).
+            $ch_rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT id, claim_id, amount_thb FROM {$ch_table}
+                  WHERE user_id = %d AND status IN ('pending_payment','pending_review')
+                  ORDER BY created_at DESC
+                  LIMIT 5",
+                $user_id
+            ) );
+            if ( is_array( $ch_rows ) ) {
+                foreach ( $ch_rows as $chrow ) {
+                    $items[] = array(
+                        'type'      => 'charge_pending',
+                        'sn'        => '', // not SN-bound — claim-bound
+                        'claim_id'  => isset( $chrow->claim_id )  ? (int)   $chrow->claim_id  : 0,
+                        'charge_id' => isset( $chrow->id )        ? (int)   $chrow->id        : 0,
+                        'amount'    => isset( $chrow->amount_thb )? (float) $chrow->amount_thb: 0.0,
+                    );
+                    $total++;
+                }
+            }
+        }
+
         // F#1 Expiry
         if ( function_exists( 'dinoco_sn_get_user_expiring_plates' ) ) {
             $rows = dinoco_sn_get_user_expiring_plates( $user_id, 30 );
@@ -340,6 +402,26 @@ if ( ! function_exists( 'dinoco_sn_invalidate_banner_cache' ) ) {
     add_action( 'dinoco_sn_pool_status_changed_for_user', 'dinoco_sn_invalidate_banner_cache', 10, 1 );
 }
 
+// V.32.0 Sprint 32 — Claim charge state change → invalidate banner cache for
+// owner. Listens to `dinoco/claim/charge_state_changed` fired by Claim Payment
+// LIFF charge state machine (verified / refunded / cancelled / rejected →
+// banner should disappear instantly, not wait for 5min transient TTL).
+if ( ! function_exists( 'dinoco_sn_invalidate_banner_cache_on_charge_state' ) ) {
+    function dinoco_sn_invalidate_banner_cache_on_charge_state( $charge_id, $from_state, $to_state, $context = array() ) {
+        $owner_uid = isset( $context['user_id'] ) ? (int) $context['user_id'] : 0;
+        if ( $owner_uid <= 0 && function_exists( 'dinoco_claim_payment_resolve_claim_owner' ) ) {
+            $claim_id = isset( $context['claim_id'] ) ? (int) $context['claim_id'] : 0;
+            if ( $claim_id > 0 ) {
+                $owner_uid = (int) dinoco_claim_payment_resolve_claim_owner( $claim_id );
+            }
+        }
+        if ( $owner_uid > 0 ) {
+            delete_transient( 'dinoco_sn_banner_' . $owner_uid );
+        }
+    }
+    add_action( 'dinoco/claim/charge_state_changed', 'dinoco_sn_invalidate_banner_cache_on_charge_state', 10, 4 );
+}
+
 if ( ! function_exists( 'dinoco_dashboard_banners' ) ) {
     /**
      * Render banner stack on home (V.31.1 priority rotation).
@@ -362,14 +444,19 @@ if ( ! function_exists( 'dinoco_dashboard_banners' ) ) {
         $items_all = isset( $data['items'] ) && is_array( $data['items'] ) ? $data['items'] : array();
         $total     = isset( $data['total_pending'] ) ? (int) $data['total_pending'] : count( $items_all );
 
-        // Rotation: 1 per category max (boss Q25 cap=3)
-        $picked = array( 'expiry' => null, 'anniversary' => null, 'review' => null );
+        // Rotation: 1 per category max (boss Q25 cap=3 raised to 4 in V.32.0
+        // when charge_pending present — financial urgency overrides cap).
+        $picked = array( 'charge_pending' => null, 'expiry' => null, 'anniversary' => null, 'review' => null );
         foreach ( $items_all as $row ) {
             $type = isset( $row['type'] ) ? $row['type'] : '';
             if ( ! isset( $picked[ $type ] ) || $picked[ $type ] !== null ) continue;
             $picked[ $type ] = $row;
         }
+        // V.32.0 Sprint 32 — charge_pending banner rendered FIRST (financial
+        // urgency outranks expiry/anniversary/review). Boss principle:
+        // "ลูกค้าเห็นยอดค้างชำระทันที ไม่ต้องเลื่อนหา"
         $ordered = array_filter( array(
+            $picked['charge_pending'],
             $picked['expiry'],
             $picked['anniversary'],
             $picked['review'],
@@ -383,7 +470,39 @@ if ( ! function_exists( 'dinoco_dashboard_banners' ) ) {
             // Stable banner ID → JS reads localStorage with this key
             $bid = $type . '_' . substr( md5( $sn . '|' . $user_id ), 0, 10 );
 
-            if ( $type === 'expiry' ) {
+            if ( $type === 'charge_pending' ) {
+                // V.32.0 Sprint 32 — Claim charge pending banner.
+                // Red bg + 💰 icon. Click scrolls to inline asset card anchor
+                // + auto-opens payment modal via ?action=pay URL param.
+                $claim_id  = (int) ( $row['claim_id']  ?? 0 );
+                $charge_id = (int) ( $row['charge_id'] ?? 0 );
+                $amount    = (float) ( $row['amount']  ?? 0.0 );
+                $amount_fmt = number_format( $amount, 0, '.', ',' );
+                // Resolve dashboard URL — fall back to home_url('/') if /dashboard/
+                // page slug not set. Frontend JS auto-scrolls + opens modal.
+                $dash_url = home_url( '/dashboard/' )
+                          . '?action=pay&claim_id=' . $claim_id
+                          . '&charge_id=' . $charge_id
+                          . '#claim-' . $claim_id . '-charge-' . $charge_id;
+                $html[] = sprintf(
+                    '<div class="dnc-sn-banner dnc-sn-banner-charge-pending" data-banner-id="%s" data-charge-id="%d" data-claim-id="%d">'
+                    . '<button type="button" class="dnc-sn-banner-dismiss" aria-label="ปิดการแจ้งเตือน" onclick="dncSnDismissBanner(this)">✕</button>'
+                    . '<div class="dnc-sn-banner-icon">💰</div>'
+                    . '<div class="dnc-sn-banner-body">'
+                    .   '<div class="dnc-sn-banner-title">🔴 มีค่าซ่อมรอชำระ ฿%s</div>'
+                    .   '<div class="dnc-sn-banner-sub">กดเพื่อดูรายละเอียดและชำระเงิน</div>'
+                    .   '<div class="dnc-sn-banner-actions">'
+                    .     '<a href="%s" class="dnc-sn-banner-cta" data-action="open-charge">ดูรายละเอียด</a>'
+                    .   '</div>'
+                    . '</div>'
+                    . '</div>',
+                    esc_attr( 'charge_pending_' . substr( md5( $charge_id . '|' . $user_id ), 0, 10 ) ),
+                    $charge_id,
+                    $claim_id,
+                    esc_html( $amount_fmt ),
+                    esc_url( $dash_url )
+                );
+            } elseif ( $type === 'expiry' ) {
                 $days = (int) ( $row['days_left'] ?? 0 );
                 $html[] = sprintf(
                     '<div class="dnc-sn-banner dnc-sn-banner-expiry" data-banner-id="%s">'
@@ -1893,10 +2012,50 @@ function dinoco_dashboard_main_controller() {
                     });
                 }
 
+                /* V.32.0 Sprint 32 — Deep-link from Flex notification or
+                   charge_pending banner. URL pattern:
+                     /dashboard/?action=pay&claim_id=X&charge_id=Y#claim-X-charge-Y
+                   On DOMContentLoaded we read the query, find the matching
+                   asset card anchor (rendered by Assets List V.32.0), smooth-
+                   scroll to it, then dispatch CustomEvent 'dnc:claim-pay-open'
+                   which Assets List listens for to auto-open the payment
+                   modal. Defensive — silent no-op when params absent or
+                   anchor missing (e.g. customer landed before assets loaded).
+                */
+                window.dncDashClaimAutoScroll = function() {
+                    try {
+                        var params = new URLSearchParams(window.location.search || '');
+                        if (params.get('action') !== 'pay') return;
+                        var cid = parseInt(params.get('claim_id') || '0', 10);
+                        var chid = parseInt(params.get('charge_id') || '0', 10);
+                        if (!cid || !chid) return;
+                        var anchor = document.getElementById('claim-' + cid + '-charge-' + chid);
+                        if (!anchor) {
+                            // Anchor not yet rendered (lazy load race) — retry once after 500ms
+                            setTimeout(function() {
+                                var late = document.getElementById('claim-' + cid + '-charge-' + chid);
+                                if (late) {
+                                    late.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                    document.dispatchEvent(new CustomEvent('dnc:claim-pay-open', {
+                                        detail: { claim_id: cid, charge_id: chid }
+                                    }));
+                                }
+                            }, 500);
+                            return;
+                        }
+                        anchor.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        document.dispatchEvent(new CustomEvent('dnc:claim-pay-open', {
+                            detail: { claim_id: cid, charge_id: chid }
+                        }));
+                    } catch (e) { /* silent */ }
+                };
+
                 document.addEventListener('DOMContentLoaded', function() {
                     scrubOtherUserKeys();
                     applyDismissFilter();
                     setupBannerCarousel();
+                    // V.32.0 Sprint 32 — trigger URL deep-link scroll/modal
+                    window.dncDashClaimAutoScroll();
                 });
                 window.addEventListener('pageshow', applyDismissFilter);
             })();

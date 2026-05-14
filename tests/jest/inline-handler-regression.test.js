@@ -197,7 +197,17 @@ const SNIPPET_PREFIXES = [
 //   - Activation LIFF V.0.16 date picker gains onchange handler that
 //     updates Buddhist year live below the input. Inline preferred
 //     because handler is single-purpose + scoped to one element.
-const BASELINE_INLINE_HANDLER_COUNT = 987;
+// 987 → 988 (2026-05-14 Sprint 32 charge_pending banner): +1
+//   - Member Dashboard V.32.0 adds NEW banner type `charge_pending`
+//     rendered via existing 3-banner template pattern (expiry +
+//     anniversary + review). The ✕ dismiss button reuses the same
+//     `onclick="dncSnDismissBanner(this)"` handler (parity with 3
+//     existing banners at lines ~478, ~498, ~516). Refactoring to
+//     event delegation would require touching ALL 4 banner templates
+//     at once — deferred to Phase 9 a11y sweep when all banner UX
+//     can be migrated together. PARITY ADDITION: 1 new occurrence
+//     mirrors 3 pre-existing identical sites.
+const BASELINE_INLINE_HANDLER_COUNT = 988;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
