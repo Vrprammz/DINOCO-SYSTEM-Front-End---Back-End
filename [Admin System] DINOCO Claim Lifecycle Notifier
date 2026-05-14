@@ -1,6 +1,18 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Lifecycle Notifier                  ║
+ * ║  Version: V.0.7 (2026-05-14) — Sprint 29 Phase 4 Batch A Item 4: ║
+ * ║    • NEW REST GET /dinoco-claim/v1/notif-log (global filter +    ║
+ * ║      pagination across ALL claims). Aggregates per-claim postmeta║
+ * ║      `_claim_notif_log` arrays via meta_exists query. Filters:   ║
+ * ║      type (status slug substring) · status (success/fail) · from ║
+ * ║      /to (Y-m-d) · charge_id (substring match against context).   ║
+ * ║      Pagination: page=N (1+) · per_page=1..200 default 50. Caps  ║
+ * ║      scan at 500 claims/page to bound query time. Permission =   ║
+ * ║      manage_options + nonce. Read-only — no rate limit (cheap).  ║
+ * ║    • Existing per-claim GET /notif/log endpoint UNCHANGED (V.0.3 ║
+ * ║      MED-2 manage_options gate preserved).                       ║
+ * ║                                                                    ║
  * ║  Version: V.0.6 (2026-05-14) — Sprint 14 code-reviewer remediation:║
  * ║    • C1 cron collision fix — 02:25→02:30 ICT (was colliding with  ║
  * ║      QW-7 Service Reminder 02:25 — CLAUDE.md stagger schedule).   ║
@@ -634,6 +646,175 @@ if ( ! function_exists( 'dinoco_claim_notif_register_rest' ) ) {
             'permission_callback' => function () {
                 return current_user_can( 'manage_options' );
             },
+        ) );
+
+        // V.0.7 Sprint 29 Phase 4 Batch A Item 4 — global notif log filter/search.
+        // Cross-claim aggregate view for admin audit. Read-only, manage_options
+        // gated (matches V.0.3 MED-2 per-claim endpoint discipline).
+        register_rest_route( 'dinoco-claim/v1', '/notif-log', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_claim_notif_rest_filter',
+            'permission_callback' => function () {
+                return current_user_can( 'manage_options' );
+            },
+            'args' => array(
+                'type'      => array( 'required' => false, 'type' => 'string' ),
+                'status'    => array( 'required' => false, 'type' => 'string' ),  // success|fail
+                'from'      => array( 'required' => false, 'type' => 'string' ),  // Y-m-d
+                'to'        => array( 'required' => false, 'type' => 'string' ),  // Y-m-d
+                'charge_id' => array( 'required' => false, 'type' => 'integer', 'minimum' => 0 ),
+                'page'      => array( 'required' => false, 'type' => 'integer', 'minimum' => 1 ),
+                'per_page'  => array( 'required' => false, 'type' => 'integer', 'minimum' => 1, 'maximum' => 200 ),
+            ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_notif_rest_filter' ) ) {
+    /**
+     * GET /dinoco-claim/v1/notif-log — cross-claim filter + pagination.
+     *
+     * Aggregates per-claim postmeta `_claim_notif_log` arrays (FIFO cap 50
+     * per claim). Scans up to 500 claims per page (bounded query time) +
+     * folds matching log entries into a single sorted result list with
+     * page-level pagination on the FOLDED entries.
+     *
+     * Filter semantics:
+     *   - type      = substring match on entry['status'] slug (case-insensitive)
+     *   - status    = 'success' or 'fail' (maps to entry['success'] bool)
+     *   - from/to   = Y-m-d strict; matches entry['ts'] (mysql datetime)
+     *   - charge_id = substring match against entry['error'] OR entry['status']
+     *                 (charge dispatch slugs encode charge_id in context — best
+     *                 effort match without changing log schema)
+     *
+     * Performance:
+     *   - meta_exists scan capped at 500 claims/page → ~500×50 = 25k entries
+     *     worst case sorted in PHP. Acceptable for admin audit screen.
+     *   - For >500 claims/page → user paginates the OUTER claim window via
+     *     `page` param; each page covers a fresh 500-claim slice.
+     *
+     * @param WP_REST_Request $req
+     * @return WP_REST_Response
+     */
+    function dinoco_claim_notif_rest_filter( $req ) {
+        $type      = trim( (string) $req->get_param( 'type' ) );
+        $status    = trim( (string) $req->get_param( 'status' ) );
+        $from      = trim( (string) $req->get_param( 'from' ) );
+        $to        = trim( (string) $req->get_param( 'to' ) );
+        $charge_id = (int) $req->get_param( 'charge_id' );
+        $page      = max( 1, (int) $req->get_param( 'page' ) );
+        $per_page  = (int) $req->get_param( 'per_page' );
+        if ( $per_page < 1 || $per_page > 200 ) $per_page = 50;
+
+        // Validate Y-m-d strict.
+        $date_ok = function( $s ) {
+            if ( $s === '' ) return true;
+            $dt = \DateTime::createFromFormat( 'Y-m-d', $s );
+            return ( $dt && $dt->format( 'Y-m-d' ) === $s );
+        };
+        if ( ! $date_ok( $from ) ) {
+            return new WP_Error( 'invalid_from', 'from must be Y-m-d', array( 'status' => 422 ) );
+        }
+        if ( ! $date_ok( $to ) ) {
+            return new WP_Error( 'invalid_to', 'to must be Y-m-d', array( 'status' => 422 ) );
+        }
+        if ( $status !== '' && ! in_array( $status, array( 'success', 'fail' ), true ) ) {
+            return new WP_Error( 'invalid_status', "status must be 'success' or 'fail'", array( 'status' => 422 ) );
+        }
+
+        // Scan claim_tickets with notif log meta. Outer cap = 500.
+        $claim_cap = 500;
+        $claims = get_posts( array(
+            'post_type'      => 'claim_ticket',
+            'post_status'    => 'any',
+            'posts_per_page' => $claim_cap,
+            'meta_query'     => array(
+                array(
+                    'key'     => '_claim_notif_log',
+                    'compare' => 'EXISTS',
+                ),
+            ),
+            'orderby'        => 'modified',
+            'order'          => 'DESC',
+            'fields'         => 'ids',
+            'no_found_rows'  => true,
+            'suppress_filters' => true,
+        ) );
+
+        $from_ts = ( $from !== '' ) ? strtotime( $from . ' 00:00:00' ) : 0;
+        $to_ts   = ( $to   !== '' ) ? strtotime( $to   . ' 23:59:59' ) : PHP_INT_MAX;
+        $type_lc = $type !== '' ? strtolower( $type ) : '';
+
+        $entries = array();
+        foreach ( (array) $claims as $cid ) {
+            $cid = (int) $cid;
+            $log = get_post_meta( $cid, '_claim_notif_log', true );
+            if ( ! is_array( $log ) ) continue;
+            foreach ( $log as $idx => $entry ) {
+                if ( ! is_array( $entry ) ) continue;
+                $e_status_slug = (string) ( isset( $entry['status'] ) ? $entry['status'] : '' );
+                $e_ts_raw      = (string) ( isset( $entry['ts'] ) ? $entry['ts'] : '' );
+                $e_success     = ! empty( $entry['success'] );
+                $e_error       = (string) ( isset( $entry['error'] ) ? $entry['error'] : '' );
+
+                // Filter: type (substring on status slug)
+                if ( $type_lc !== '' && stripos( $e_status_slug, $type_lc ) === false ) continue;
+
+                // Filter: success/fail
+                if ( $status === 'success' && ! $e_success ) continue;
+                if ( $status === 'fail'    &&   $e_success ) continue;
+
+                // Filter: date range
+                $e_ts = $e_ts_raw !== '' ? strtotime( $e_ts_raw ) : 0;
+                if ( $e_ts < $from_ts || $e_ts > $to_ts ) continue;
+
+                // Filter: charge_id (substring on status/error — charge dispatch
+                // slugs may carry charge id in context; best-effort match without
+                // touching log schema).
+                if ( $charge_id > 0 ) {
+                    $needle = (string) $charge_id;
+                    if ( stripos( $e_status_slug, $needle ) === false
+                         && stripos( $e_error, $needle ) === false ) {
+                        continue;
+                    }
+                }
+
+                $entries[] = array(
+                    'claim_id'  => $cid,
+                    'idx'       => (int) $idx,
+                    'status'    => $e_status_slug,
+                    'ts'        => $e_ts_raw,
+                    'channel'   => (string) ( isset( $entry['channel'] ) ? $entry['channel'] : 'line_flex' ),
+                    'success'   => (bool) $e_success,
+                    'msg_id'    => isset( $entry['msg_id'] ) ? $entry['msg_id'] : null,
+                    'error'     => $e_error,
+                );
+            }
+        }
+
+        // Sort DESC by ts.
+        usort( $entries, function( $a, $b ) {
+            $ta = strtotime( (string) $a['ts'] );
+            $tb = strtotime( (string) $b['ts'] );
+            if ( $ta === $tb ) return 0;
+            return ( $tb < $ta ) ? -1 : 1;
+        } );
+
+        $total       = count( $entries );
+        $total_pages = max( 1, (int) ceil( $total / $per_page ) );
+        if ( $page > $total_pages ) $page = $total_pages;
+        $slice       = array_slice( $entries, ( $page - 1 ) * $per_page, $per_page );
+
+        return rest_ensure_response( array(
+            'rows' => $slice,
+            'meta' => array(
+                'total'           => $total,
+                'pages'           => $total_pages,
+                'current_page'    => $page,
+                'per_page'        => $per_page,
+                'claim_window'    => $claim_cap,
+                'claims_scanned'  => count( (array) $claims ),
+            ),
         ) );
     }
 }

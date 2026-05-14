@@ -44,8 +44,8 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
         expect(fs.existsSync(SNIPPET_PATH)).toBe(true);
     });
 
-    test('version stamped V.0.4 (Sprint 15)', () => {
-        expect(SRC).toMatch(/Version:\s*V\.0\.4\s*\(2026-05-14\)/);
+    test('version stamped V.0.6 (Sprint 29 Phase 4 Batch A Item 1 — CSV export)', () => {
+        expect(SRC).toMatch(/Version:\s*V\.0\.6\s*\(2026-05-14\)/);
     });
 
     test('Sprint 22 — boss assigned DB_ID 1214 (sync unlocked)', () => {
@@ -330,8 +330,13 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
     // do not false-positive on the snippet header's "NOT included" notes
     // listing the deferred Phase 2.2+ helpers as documentation.
 
-    test('snippet does NOT register any REST routes (Phase 2.2 owns those)', () => {
-        expect(SRC_CODE_ONLY).not.toMatch(/register_rest_route/);
+    test('V.0.6 — snippet registers ONLY /charges/export REST route (other charge REST = Payment LIFF)', () => {
+        // Sprint 29 Phase 4 Batch A Item 1 — CSV export is the SINGLE REST
+        // endpoint owned by Charges Schema. Phase 2.2 endpoints (POST /charges,
+        // GET /charges, etc.) remain in Claim Payment LIFF snippet.
+        const restRoutes = SRC_CODE_ONLY.match(/register_rest_route\s*\(\s*['"]dinoco-claim\/v1['"]\s*,\s*['"]([^'"]+)['"]/g) || [];
+        expect(restRoutes.length).toBe(1);
+        expect(restRoutes[0]).toMatch(/\/charges\/export/);
     });
 
     test('snippet does NOT register any shortcodes (Phase 2.4 owns admin UI)', () => {

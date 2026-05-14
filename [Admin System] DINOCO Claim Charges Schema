@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Charges Schema                      ║
+ * ║  Version: V.0.6 (2026-05-14) — Sprint 29 Phase 4 Batch A Item 1: ║
+ * ║    • NEW REST `GET /dinoco-claim/v1/charges/export` admin CSV    ║
+ * ║      export (UTF-8 BOM, 5000 row cap, manage_options + nonce,    ║
+ * ║      `b2b_rate_limit('claim_charge_export_'.uid, 5, 3600)`).     ║
+ * ║      Filters: claim_id (optional), from/to (Y-m-d). PII guard —  ║
+ * ║      payer_user_id (user_id col) masked via SEC-L3 first 3 +     ║
+ * ║      bullets + last 3 (Sprint 12 pattern). slip_url column is    ║
+ * ║      relative `/wp-json/dinoco-claim/v1/charges/{id}/slip-image` ║
+ * ║      (auth-gated proxy, never raw CDN). Cols: charge_id, claim_id║
+ * ║      charge_type (reason), amount_thb, status, payer_user_id,    ║
+ * ║      slip_url, paid_at (verified_at), refunded_at, created_at.   ║
+ * ║      Service Center "📥 Export CSV" header button wires here.     ║
+ * ║                                                                    ║
  * ║  Version: V.0.5 (2026-05-14) — Sprint 16 code-reviewer remediation:║
  * ║    • C1 CHECK constraint was `(amount_thb_at_create > 0)` — only   ║
  * ║      enforced positivity (redundant w/ chk_amount_positive), NOT   ║
@@ -610,3 +623,207 @@ if ( function_exists( 'dinoco_register_cron' ) && function_exists( 'dinoco_claim
 } else {
     add_action( 'dinoco_claim_charges_cleanup_cron', 'dinoco_claim_charges_cleanup_run' );
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. CSV EXPORT (V.0.6 — Sprint 29 Phase 4 Batch A Item 1)
+ *
+ * Admin-only finance export — surfaces charge history for accounting/audit.
+ * PII discipline (Sprint 12 SEC-L3): payer user_id masked first 3 + bullets
+ * + last 3. slip_url column emits relative auth-gated proxy path, NEVER raw
+ * Slip2Go / LINE CDN URL.
+ *
+ * Headers (esc_html-equiv unicode banner):
+ *   UTF-8 BOM (\xEF\xBB\xBF) so Excel opens Thai correctly.
+ *
+ * Rate limit: b2b_rate_limit('claim_charge_export_'.uid, 5, 3600) — 5/hr/user
+ * matches DINOCO destructive-export convention (cf. flag-audit/export +
+ * security-log CSV).
+ *
+ * 5000 row cap (DESC by created_at) — matches Flag Audit / BO Security Log
+ * conventions. Larger exports → Phase 6 streamed download.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_charges_mask_uid' ) ) {
+    /**
+     * Mask integer user_id as PII per Sprint 12 SEC-L3 (first 3 + bullets +
+     * last 3). Numeric inputs cast to string first. user_id 0 or empty →
+     * empty string (no false-positive privacy data in export).
+     *
+     * @param int|string $uid
+     * @return string e.g. "123••••789" or "1234" (short id passthrough)
+     */
+    function dinoco_claim_charges_mask_uid( $uid ) {
+        $val = (string) $uid;
+        if ( $val === '' || $val === '0' ) return '';
+        $len = strlen( $val );
+        if ( $len <= 6 ) return $val;
+        return substr( $val, 0, 3 ) . str_repeat( '•', max( 3, $len - 6 ) ) . substr( $val, -3 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_charges_rest_export_csv' ) ) {
+    /**
+     * GET /dinoco-claim/v1/charges/export
+     *
+     * Query params:
+     *   - claim_id (int, optional)
+     *   - from     (Y-m-d, optional)
+     *   - to       (Y-m-d, optional)
+     *
+     * Returns: text/csv attachment (UTF-8 BOM + 10 columns + ≤5000 rows).
+     *
+     * @param WP_REST_Request $req
+     * @return WP_Error|null  null when ob_clean+exit (output already sent).
+     */
+    function dinoco_claim_charges_rest_export_csv( $req ) {
+        global $wpdb;
+
+        // ─── Rate limit ─────────────────────────────────────────────────
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $uid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+            $rl  = b2b_rate_limit( 'claim_charge_export_' . $uid, 5, 3600 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error(
+                    'rate_limited',
+                    'Export ถี่เกินไป — กรุณารอ 1 ชั่วโมงแล้วลองใหม่ (5 ครั้ง/ชั่วโมง)',
+                    array( 'status' => 429, 'retry_after' => 3600 )
+                );
+            }
+        }
+
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            return new WP_Error( 'schema_missing', 'Charges schema not installed', array( 'status' => 500 ) );
+        }
+        $table = dinoco_claim_charges_table_name();
+
+        // ─── Filter parse ───────────────────────────────────────────────
+        $claim_id = (int) $req->get_param( 'claim_id' );
+        $from     = sanitize_text_field( (string) $req->get_param( 'from' ) );
+        $to       = sanitize_text_field( (string) $req->get_param( 'to' ) );
+
+        // Validate Y-m-d strictly (DateTime parses many forms; we want only date).
+        $date_ok = function( $s ) {
+            if ( $s === '' ) return true;
+            $dt = \DateTime::createFromFormat( 'Y-m-d', $s );
+            return ( $dt && $dt->format( 'Y-m-d' ) === $s );
+        };
+        if ( ! $date_ok( $from ) ) {
+            return new WP_Error( 'invalid_from', 'from must be Y-m-d', array( 'status' => 422 ) );
+        }
+        if ( ! $date_ok( $to ) ) {
+            return new WP_Error( 'invalid_to', 'to must be Y-m-d', array( 'status' => 422 ) );
+        }
+
+        // ─── Build SQL ──────────────────────────────────────────────────
+        $where  = "1=1";
+        $params = array();
+        if ( $claim_id > 0 ) {
+            $where   .= " AND claim_id = %d";
+            $params[] = $claim_id;
+        }
+        if ( $from !== '' ) {
+            $where   .= " AND created_at >= %s";
+            $params[] = $from . ' 00:00:00';
+        }
+        if ( $to !== '' ) {
+            $where   .= " AND created_at <= %s";
+            $params[] = $to . ' 23:59:59';
+        }
+
+        $cap     = 5000;
+        $params[] = $cap;
+        $sql     = "SELECT id, claim_id, user_id, amount_thb, reason, status,
+                           payment_ref, verified_at, refunded_at, created_at
+                      FROM {$table}
+                     WHERE {$where}
+                     ORDER BY created_at DESC
+                     LIMIT %d";
+
+        try {
+            $rows = $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_charge_export_query_threw', array(
+                    'message' => $e->getMessage(),
+                    'cap'     => $cap,
+                ) );
+            }
+            return new WP_Error( 'export_query_failed', 'Query failed', array( 'status' => 500 ) );
+        }
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        // ─── Emit CSV (text/csv + UTF-8 BOM) ────────────────────────────
+        $filename = 'claim-charges-' . date( 'Ymd-His' ) . '.csv';
+        nocache_headers();
+        header( 'Content-Type: text/csv; charset=UTF-8' );
+        header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
+
+        echo "\xEF\xBB\xBF"; // UTF-8 BOM
+
+        $out = fopen( 'php://output', 'w' );
+        if ( ! $out ) {
+            return new WP_Error( 'export_stream_failed', 'Cannot open output stream', array( 'status' => 500 ) );
+        }
+
+        // Canonical column order — Phase 4 Batch A Item 1 contract.
+        fputcsv( $out, array(
+            'charge_id',
+            'claim_id',
+            'charge_type',
+            'amount_thb',
+            'status',
+            'payer_user_id',  // masked
+            'slip_url',        // auth-gated proxy path
+            'paid_at',         // = verified_at
+            'refunded_at',
+            'created_at',
+        ) );
+
+        foreach ( $rows as $r ) {
+            $charge_id = (int) $r['id'];
+            $slip_url  = '/wp-json/dinoco-claim/v1/charges/' . $charge_id . '/slip-image';
+            fputcsv( $out, array(
+                $charge_id,
+                (int) $r['claim_id'],
+                (string) $r['reason'],
+                number_format( (float) $r['amount_thb'], 2, '.', '' ),
+                (string) $r['status'],
+                dinoco_claim_charges_mask_uid( $r['user_id'] ),
+                $slip_url,
+                (string) $r['verified_at'],
+                (string) $r['refunded_at'],
+                (string) $r['created_at'],
+            ) );
+        }
+
+        fclose( $out );
+
+        if ( function_exists( 'dinoco_obs_capture' ) ) {
+            dinoco_obs_capture( 'info', 'claim_charge_export_csv_emitted', array(
+                'claim_id' => $claim_id,
+                'from'     => $from,
+                'to'       => $to,
+                'rows'     => count( $rows ),
+                'cap'      => $cap,
+            ) );
+        }
+
+        // Output already streamed — bail to prevent REST JSON envelope.
+        exit;
+    }
+}
+
+add_action( 'rest_api_init', function() {
+    register_rest_route( 'dinoco-claim/v1', '/charges/export', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_claim_charges_rest_export_csv',
+        'permission_callback' => function() {
+            return current_user_can( 'manage_options' );
+        },
+        'args' => array(
+            'claim_id' => array( 'required' => false, 'type' => 'integer', 'minimum' => 0 ),
+            'from'     => array( 'required' => false, 'type' => 'string' ),
+            'to'       => array( 'required' => false, 'type' => 'string' ),
+        ),
+    ) );
+} );
