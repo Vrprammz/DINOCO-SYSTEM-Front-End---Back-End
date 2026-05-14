@@ -44,8 +44,8 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
         expect(fs.existsSync(SNIPPET_PATH)).toBe(true);
     });
 
-    test('version stamped V.0.1 (2026-05-14)', () => {
-        expect(SRC).toMatch(/Version:\s*V\.0\.1\s*\(2026-05-14\)/);
+    test('version stamped V.0.3 (Sprint 12)', () => {
+        expect(SRC).toMatch(/Version:\s*V\.0\.3\s*\(2026-05-14\)/);
     });
 
     test('DB_ID placeholder present until boss creates WP admin entry', () => {
@@ -73,8 +73,16 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
 
     // ─── Constants — whitelist + schema version ───────────────────────
 
-    test('DINOCO_CLAIM_CHARGES_SCHEMA_VERSION defined as 1.0', () => {
-        expect(SRC).toMatch(/define\(\s*'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION'\s*,\s*'1\.0'\s*\)/);
+    test('Sprint 12 — DINOCO_CLAIM_CHARGES_SCHEMA_VERSION bumped to 1.1 (forces dbDelta re-run)', () => {
+        expect(SRC).toMatch(/define\(\s*'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION'\s*,\s*'1\.1'\s*\)/);
+    });
+
+    test('Sprint 12 DB-C1 — NEW idx_status_created covering index for retention cron', () => {
+        expect(SRC).toMatch(/KEY idx_status_created \(status, created_at\)/);
+    });
+
+    test('Sprint 12 SEC-M3 — retention DELETE adds ORDER BY created_at ASC', () => {
+        expect(SRC).toMatch(/AND created_at < DATE_SUB\(NOW\(\), INTERVAL %d DAY\)[\s\S]*?ORDER BY created_at ASC[\s\S]*?LIMIT 1000/);
     });
 
     test('DINOCO_CLAIM_CHARGES_REASON_WHITELIST contains 4 canonical reasons', () => {
@@ -132,24 +140,28 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
         expect(SRC).toMatch(/\$sql\s*=\s*"CREATE TABLE\s+\{?\$?table\}?/);
     });
 
+    // Sprint 12 schema-audit fixes:
+    //   DB-H1: utf8mb4_bin overrides on slip_ref_hash/payment_ref/bank_code/bank_account
+    //   DB-H2: amount_thb DECIMAL(12,2) → DECIMAL(14,2) (B2B parity)
+    //   DB-M1: slip_verify_data LONGTEXT → MEDIUMTEXT
     const expectedColumns = [
         'id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT',
         'claim_id BIGINT(20) UNSIGNED NOT NULL',
         'user_id BIGINT(20) UNSIGNED NOT NULL',
-        'amount_thb DECIMAL(12,2) NOT NULL',
+        'amount_thb DECIMAL(14,2) NOT NULL',
         'reason VARCHAR(32) NOT NULL',
         'reason_note VARCHAR(500) DEFAULT NULL',
         "status VARCHAR(24) NOT NULL DEFAULT 'pending_payment'",
-        'bank_code VARCHAR(16) DEFAULT NULL',
-        'bank_account VARCHAR(32) DEFAULT NULL',
+        'bank_code VARCHAR(16) COLLATE utf8mb4_bin DEFAULT NULL',
+        'bank_account VARCHAR(32) COLLATE utf8mb4_bin DEFAULT NULL',
         'bank_holder VARCHAR(128) DEFAULT NULL',
         'bank_name VARCHAR(64) DEFAULT NULL',
         'bank_branch VARCHAR(64) DEFAULT NULL',
         "bank_context VARCHAR(16) DEFAULT 'claim'",
         'slip_image_url VARCHAR(500) DEFAULT NULL',
-        'slip_ref_hash CHAR(64) DEFAULT NULL',
-        'slip_verify_data LONGTEXT DEFAULT NULL',
-        'payment_ref VARCHAR(64) NOT NULL',
+        'slip_ref_hash CHAR(64) COLLATE utf8mb4_bin DEFAULT NULL',
+        'slip_verify_data MEDIUMTEXT DEFAULT NULL',
+        'payment_ref VARCHAR(64) COLLATE utf8mb4_bin NOT NULL',
         'verified_at DATETIME DEFAULT NULL',
         'verified_by BIGINT(20) UNSIGNED DEFAULT NULL',
         'refund_reason VARCHAR(500) DEFAULT NULL',

@@ -125,10 +125,12 @@ class ClaimChargesSchemaTest extends TestCase {
     // CONSTANTS — whitelists & schema version
     // ════════════════════════════════════════════════════════════════
 
-    public function test_schema_version_constant_defined_as_1_0(): void {
+    public function test_schema_version_constant_defined_as_1_1(): void {
+        // Sprint 12 — bumped 1.0 → 1.1 to force dbDelta re-run on existing installs
+        // (DB-C1 idx_status_created + DB-H1 collation overrides + DB-H2 DECIMAL bump).
         $src = SnippetFixture::load();
         $this->assertMatchesRegularExpression(
-            '/define\(\s*\'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION\'\s*,\s*\'1\.0\'\s*\)/',
+            '/define\(\s*\'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION\'\s*,\s*\'1\.1\'\s*\)/',
             $src
         );
     }
@@ -209,24 +211,24 @@ class ClaimChargesSchemaTest extends TestCase {
             'claim_id BIGINT(20) UNSIGNED NOT NULL',
             'user_id BIGINT(20) UNSIGNED NOT NULL',
             // amount + reason
-            'amount_thb DECIMAL(12,2) NOT NULL',
+            'amount_thb DECIMAL(14,2) NOT NULL',                              // Sprint 12 DB-H2
             'reason VARCHAR(32) NOT NULL',
             'reason_note VARCHAR(500) DEFAULT NULL',
             // status
             "status VARCHAR(24) NOT NULL DEFAULT 'pending_payment'",
             // 7 bank snapshot columns
-            'bank_code VARCHAR(16) DEFAULT NULL',
-            'bank_account VARCHAR(32) DEFAULT NULL',
+            'bank_code VARCHAR(16) COLLATE utf8mb4_bin DEFAULT NULL',           // Sprint 12 DB-H1
+            'bank_account VARCHAR(32) COLLATE utf8mb4_bin DEFAULT NULL',        // Sprint 12 DB-H1
             'bank_holder VARCHAR(128) DEFAULT NULL',
             'bank_name VARCHAR(64) DEFAULT NULL',
             'bank_branch VARCHAR(64) DEFAULT NULL',
             "bank_context VARCHAR(16) DEFAULT 'claim'",
             // slip
             'slip_image_url VARCHAR(500) DEFAULT NULL',
-            'slip_ref_hash CHAR(64) DEFAULT NULL',
-            'slip_verify_data LONGTEXT DEFAULT NULL',
+            'slip_ref_hash CHAR(64) COLLATE utf8mb4_bin DEFAULT NULL',          // Sprint 12 DB-H1
+            'slip_verify_data MEDIUMTEXT DEFAULT NULL',                        // Sprint 12 DB-M1
             // payment_ref + verify + refund
-            'payment_ref VARCHAR(64) NOT NULL',
+            'payment_ref VARCHAR(64) COLLATE utf8mb4_bin NOT NULL',             // Sprint 12 DB-H1
             'verified_at DATETIME DEFAULT NULL',
             'verified_by BIGINT(20) UNSIGNED DEFAULT NULL',
             'refund_reason VARCHAR(500) DEFAULT NULL',

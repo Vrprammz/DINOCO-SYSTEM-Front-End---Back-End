@@ -1,6 +1,13 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Lifecycle Notifier                  ║
+ * ║  Version: V.0.4 (2026-05-14) — Sprint 12 multi-agent audit:       ║
+ * ║    • SEC-M1: LINE error body truncate 200→80 chars + scrub UID/  ║
+ * ║      email/phone before persist to obs context (PDPA).            ║
+ * ║    • PERF-H2: /notif/resend adds 60s minute-bucket transient      ║
+ * ║      keyed on (admin_uid, claim_id, status_slug) — absorbs rapid  ║
+ * ║      double-tap, still allows legitimate retries after 60s.       ║
+ * ║                                                                   ║
  * ║  Version: V.0.3 (2026-05-13) — Sprint 7 code-reviewer remediation:║
  * ║    Closes 1 CRITICAL + 3 HIGH + 1 MEDIUM finding from review of   ║
  * ║    V.0.2 (Sprint 5B). Pre-flag-flip safety landed BEFORE any      ║
@@ -393,7 +400,19 @@ if ( ! function_exists( 'dinoco_claim_notif_dispatch' ) ) {
                         $msg_id = null;
                     } else {
                         // HTTP error (401/429/500) OR code=0 (network failure internally caught)
-                        $body_preview = isset( $resp['body'] ) ? substr( (string) $resp['body'], 0, 200 ) : '';
+                        // V.0.4 Sprint 12 SEC-M1 fix — truncate to 80 chars (was 200) and
+                        // scrub LINE UIDs (Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx, 32-hex) +
+                        // potential email/phone patterns before persisting. LINE error
+                        // bodies sometimes echo `to` UID — PII per PDPA. Observability
+                        // snippet relies on key-name match for redaction; this body is
+                        // a free-text value so we must scrub at the source.
+                        $raw_body = isset( $resp['body'] ) ? (string) $resp['body'] : '';
+                        if ( $raw_body !== '' ) {
+                            $raw_body = preg_replace( '/U[0-9a-fA-F]{32}/', 'U[REDACTED]', $raw_body );
+                            $raw_body = preg_replace( '/\b[\w.\-+]+@[\w\-]+\.[\w\-.]+\b/', '[EMAIL]', $raw_body );
+                            $raw_body = preg_replace( '/\b0\d{8,9}\b/', '[PHONE]', $raw_body );
+                        }
+                        $body_preview = substr( $raw_body, 0, 80 );
                         $push_err = 'http_' . $code . ( $body_preview !== '' ? ':' . $body_preview : '' );
                     }
                 } else {
@@ -622,6 +641,24 @@ if ( ! function_exists( 'dinoco_claim_notif_rest_resend' ) ) {
                 $status = (string) get_field( 'ticket_status', $cid );
             }
         }
+        // V.0.4 Sprint 12 PERF-H2 fix — minute-bucket dedup absorbs rapid
+        // double-tap on the "ส่งซ้ำ" button (same admin, same claim/status,
+        // within 60s) while still allowing legitimate retries 60s+ later.
+        // Pattern: 60s transient keyed on (admin_uid, claim_id, status_slug).
+        $actor_uid     = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+        $status_slug   = function_exists( 'dinoco_claim_notif_slug_for' )
+            ? dinoco_claim_notif_slug_for( $status )
+            : strtolower( preg_replace( '/[^a-z0-9_]/i', '_', $status ) );
+        $resend_lock_k = 'dnc_claim_notif_resend_' . md5( $actor_uid . ':' . $cid . ':' . $status_slug );
+        if ( get_transient( $resend_lock_k ) ) {
+            return new WP_Error(
+                'resend_too_soon',
+                'เพิ่งส่งซ้ำไปเมื่อสักครู่ — กรุณารอ 60 วินาทีแล้วลองใหม่',
+                array( 'status' => 429, 'retry_after' => 60 )
+            );
+        }
+        set_transient( $resend_lock_k, 1, 60 );
+
         // HR2 — resend BYPASSES idempotency cache + dedup transient
         // (explicit admin resend is a deliberate retry).
         delete_transient( dinoco_claim_notif_dedup_key( $cid, $status ) );

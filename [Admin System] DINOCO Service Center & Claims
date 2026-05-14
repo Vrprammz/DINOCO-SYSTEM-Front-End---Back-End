@@ -1,6 +1,12 @@
 /*
  * Plugin Name: [Module] DINOCO Service Center & Claims
  * Description: ระบบบริหารจัดการงานเคลม
+ * Version: V.33.3 (2026-05-14) — Sprint 12 multi-agent audit (1 HIGH + 1 HIGH + 1 LOW):
+ *   • SEC-H1: admin_init migration captures wp_get_current_user()->ID for forensics.
+ *   • SEC-H2: /bank-settings/test adds b2b_rate_limit('claim_bank_test', $uid, 10, 60).
+ *   • SEC-L3: bank_account masked in audit diff (first 3 + bullets + last 3) before
+ *     persist to dinoco_audit_log + dinoco_flag_audit_log channels.
+ *
  * Version: V.33.2 (2026-05-14) — Sprint 11 code-reviewer remediation (2 HIGH + 2 MED + 1 LOW).
  *   HIGH-2 — Walkin clear/save race: REST handler now wraps clear-or-save body in
  *     MySQL GET_LOCK('dnc_claim_bank_save', 5) + try/finally RELEASE. Mirrors
@@ -5328,11 +5334,25 @@ if ( ! function_exists( 'dinoco_claim_bank_maybe_migrate_constants' ) ) {
             if ( $touched > 0 ) {
                 update_option( 'dinoco_claim_bank_seeded_from_constants', '1', true );
                 if ( function_exists( 'dinoco_audit_log' ) ) {
+                    // V.33.3 Sprint 12 SEC-H1 fix — capture wp_get_current_user()->ID
+                    // for forensic traceability. admin_init fires under an authenticated
+                    // admin session — record who triggered the (one-shot) seed.
+                    $actor_uid = 0;
+                    if ( function_exists( 'wp_get_current_user' ) ) {
+                        $u = wp_get_current_user();
+                        $actor_uid = ( $u && isset( $u->ID ) ) ? (int) $u->ID : 0;
+                    }
                     dinoco_audit_log( array(
-                        'event_type'  => 'claim_bank_seeded_from_constants',
-                        'actor_type'  => 'system',
-                        'target_type' => 'wp_option',
-                        'context'     => array( 'fields_seeded' => $touched ),
+                        'event_type'    => 'claim_bank_seeded_from_constants',
+                        'actor_user_id' => $actor_uid,
+                        'actor_type'    => $actor_uid > 0 ? 'admin' : 'system',
+                        'target_type'   => 'wp_option',
+                        'context'       => array(
+                            'fields_seeded' => $touched,
+                            'trigger'       => 'admin_init',
+                            'ip'            => isset( $_SERVER['REMOTE_ADDR'] )
+                                ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '',
+                        ),
                     ) );
                 }
             }
@@ -5356,13 +5376,29 @@ if ( ! function_exists( 'dinoco_claim_bank_audit_save' ) ) {
     function dinoco_claim_bank_audit_save( $diff, $bucket = 'default' ) {
         if ( empty( $diff ) ) return;
 
+        // V.33.3 Sprint 12 SEC-L3 fix — mask middle digits of bank_account in
+        // audit diff before persisting. Audit table may be readable via Flag
+        // Audit Viewer by non-finance admins. Full PAN-style numbers should
+        // never sit in plaintext at rest. Keeps first 3 + last 3 digits +
+        // ellipsis for forensic identifiability without account-reuse risk.
+        $masked_diff = array();
+        foreach ( $diff as $opt_key => $delta ) {
+            $is_account = ( strpos( $opt_key, 'bank_account' ) !== false );
+            $masked_diff[ $opt_key ] = $is_account
+                ? array(
+                    'before' => dinoco_claim_bank_mask_account( isset( $delta['before'] ) ? $delta['before'] : '' ),
+                    'after'  => dinoco_claim_bank_mask_account( isset( $delta['after'] )  ? $delta['after']  : '' ),
+                )
+                : $delta;
+        }
+
         // Channel 1 — primary forensic row
         if ( function_exists( 'dinoco_audit_log' ) ) {
             dinoco_audit_log( array(
                 'event_type' => 'claim_bank_settings_changed',
                 'context'    => array(
                     'bucket' => $bucket,
-                    'diff'   => $diff,
+                    'diff'   => $masked_diff,
                     'source' => 'claim_bank_settings_admin_ui',
                 ),
             ) );
@@ -5370,9 +5406,10 @@ if ( ! function_exists( 'dinoco_claim_bank_audit_save' ) ) {
             error_log( '[ClaimBank] dinoco_audit_log unavailable — skipped Channel 1 forensic row' );
         }
 
-        // Channel 2 — per-key mirror (drives Flag Audit Viewer UI)
+        // Channel 2 — per-key mirror (drives Flag Audit Viewer UI). Same masking
+        // applied so Flag Audit Viewer cannot leak raw account numbers either.
         if ( function_exists( 'dinoco_flag_audit_log' ) ) {
-            foreach ( $diff as $opt_key => $delta ) {
+            foreach ( $masked_diff as $opt_key => $delta ) {
                 dinoco_flag_audit_log(
                     $opt_key,
                     isset( $delta['before'] ) ? $delta['before'] : '',
@@ -5382,6 +5419,22 @@ if ( ! function_exists( 'dinoco_claim_bank_audit_save' ) ) {
                 );
             }
         }
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_bank_mask_account' ) ) {
+    /**
+     * Mask bank account number for audit storage. Sprint 12 SEC-L3.
+     * Format: first 3 + ellipsis + last 3. Strings ≤6 chars left as-is
+     * (already low-value). Non-string falls back to ''.
+     */
+    function dinoco_claim_bank_mask_account( $val ) {
+        if ( ! is_string( $val ) ) return '';
+        $val = trim( $val );
+        if ( $val === '' ) return '';
+        $len = strlen( $val );
+        if ( $len <= 6 ) return $val;
+        return substr( $val, 0, 3 ) . str_repeat( '•', max( 3, $len - 6 ) ) . substr( $val, -3 );
     }
 }
 
@@ -5579,6 +5632,22 @@ if ( ! function_exists( '_dinoco_claim_bank_rest_save_inner' ) ) {
 
 if ( ! function_exists( 'dinoco_claim_bank_rest_test' ) ) {
     function dinoco_claim_bank_rest_test( $req ) {
+        // V.33.3 Sprint 12 SEC-H2 fix — rate limit. Admin-only endpoint but the
+        // preview returns full bank config; chained calls = log noise + small
+        // info-disclosure window if an admin session is compromised. 10/min cap
+        // matches b2b_rate_limit defensive pattern (e.g. claim_bank_test bucket).
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $uid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+            $rl  = b2b_rate_limit( 'claim_bank_test', $uid, 10, 60 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error(
+                    'rate_limited',
+                    'เรียกทดสอบบ่อยเกินไป — กรุณารอสักครู่',
+                    array( 'status' => 429, 'retry_after' => 60 )
+                );
+            }
+        }
+
         $body = $req->get_json_params();
         if ( ! is_array( $body ) ) $body = $req->get_params();
         $use_walkin = ! empty( $body['use_walkin'] );
