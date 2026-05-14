@@ -2,6 +2,9 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.47 (2026-05-14) — Phase 6 QW-5 finish: marketplace ║
+ * ║                                  checkout wires real referral   ║
+ * ║                                  redemption via Notifier helper ║
  * ║  Version: V.0.46 (2026-05-13) — Phase 7 P3 RD-2 CLV Cohort       ║
  * ║    Analysis NEW endpoint:                                        ║
  * ║    - GET /ltv/cohorts?months_back=12 — aggregate customers into  ║
@@ -9590,16 +9593,44 @@ if ( ! function_exists( 'dinoco_sn_handler_marketplace_checkout' ) ) {
                 array( 'status' => 422, 'sku' => $linked_sku, 'years' => $years ) );
         }
 
-        // Coupon resolution — defensive reuse of F#1 promo system if available
+        // Coupon resolution — V.0.47 (Phase 6 QW-5 finish): real redemption via Lifecycle Notifier
         $coupon_discount = 0.0;
         $coupon_applied = '';
+        $coupon_meta = array();
+        $quote = dinoco_sn_marketplace_compute_quote( $base_price, $years );
+
         if ( $coupon !== '' ) {
-            // Phase 5 W15.4: best-effort coupon lookup. Promo system may not be wired yet.
-            // For now: stash code in payment_ref for audit; admin can manually approve discount via Manager tab.
             $coupon_applied = mb_substr( $coupon, 0, 32 );
+            if ( function_exists( 'dinoco_sn_redeem_referral_code' ) ) {
+                // Note: redeem AFTER we know amount_total — but we need amount_total to know discount.
+                // Two-pass: compute discount preview first (no DB write), then commit on insert success below.
+                // Simpler approach: lookup template row only (read-only), apply discount, then redeem after insert.
+                // We do the actual redemption call below (after extension_id created) so used_order_id can be set.
+                global $wpdb;
+                $promo_tbl = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'promo_codes' ) : '';
+                if ( $promo_tbl ) {
+                    $tpl = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT discount_pct, discount_value FROM {$promo_tbl}
+                          WHERE code = %s AND used_at IS NULL
+                            AND ( expires_at IS NULL OR expires_at > NOW() )
+                          LIMIT 1",
+                        strtoupper( $coupon_applied )
+                    ) );
+                    if ( $tpl ) {
+                        if ( $tpl->discount_value !== null && (float) $tpl->discount_value > 0 ) {
+                            $coupon_discount = (float) $tpl->discount_value;
+                        } elseif ( (int) $tpl->discount_pct > 0 ) {
+                            $coupon_discount = round( $quote['total'] * ( (int) $tpl->discount_pct / 100 ), 2 );
+                        }
+                        $coupon_meta = array(
+                            'discount_pct'   => (int) $tpl->discount_pct,
+                            'discount_value' => $tpl->discount_value === null ? null : (float) $tpl->discount_value,
+                        );
+                    }
+                }
+            }
         }
 
-        $quote = dinoco_sn_marketplace_compute_quote( $base_price, $years );
         $amount_total = $quote['total'] - $coupon_discount;
         if ( $amount_total < 0 ) $amount_total = 0;
 
@@ -9636,6 +9667,33 @@ if ( ! function_exists( 'dinoco_sn_handler_marketplace_checkout' ) ) {
         }
         $extension_id = (int) $wpdb->insert_id;
 
+        // V.0.47 (Phase 6 QW-5 finish): commit referral redemption now that we have extension_id.
+        // Coupon was applied above (preview-only); now record the redemption + link to this order.
+        $coupon_redeem_result = null;
+        if ( $coupon_applied !== '' && $coupon_discount > 0 && function_exists( 'dinoco_sn_redeem_referral_code' ) ) {
+            try {
+                $coupon_redeem_result = dinoco_sn_redeem_referral_code(
+                    $coupon_applied, $user_id, $extension_id, $sn
+                );
+                if ( ! $coupon_redeem_result['success']
+                  && function_exists( 'dinoco_obs_capture' ) ) {
+                    // Soft failure — extension already created at discounted price.
+                    // Log so boss can investigate (e.g. someone bypassed preview check via race).
+                    dinoco_obs_capture( 'warning', 'sn_referral_redeem_post_insert_fail', array(
+                        'extension_id' => $extension_id,
+                        'code'         => $coupon_applied,
+                        'error'        => $coupon_redeem_result['error'] ?? 'unknown',
+                    ) );
+                }
+            } catch ( \Throwable $e ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'error', 'sn_referral_redeem_throw', array(
+                        'extension_id' => $extension_id, 'msg' => $e->getMessage(),
+                    ) );
+                }
+            }
+        }
+
         // Audit log
         if ( function_exists( 'dinoco_sn_audit_log' ) ) {
             dinoco_sn_audit_log( $sn, 'extension_created', null, 'pending_payment', array(
@@ -9643,6 +9701,9 @@ if ( ! function_exists( 'dinoco_sn_handler_marketplace_checkout' ) ) {
                 'years'          => $years,
                 'amount_total'   => $amount_total,
                 'coupon_applied' => $coupon_applied,
+                'coupon_discount' => $coupon_discount,
+                'coupon_meta'    => $coupon_meta,
+                'referral_redeemed' => $coupon_redeem_result ? (bool) $coupon_redeem_result['success'] : null,
                 'payment_ref'    => $payment_ref,
             ), $user_id, null, '', 'marketplace_checkout', false );
         }

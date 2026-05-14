@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Warranty Lifecycle Notifier               ║
+ * ║  Version: V.0.10 (2026-05-14) — Phase 6 QW-5 finish: redemption  ║
+ * ║                                  helper + lazy ALTER             ║
+ * ║                                  (referrer_user_id col) + stats  ║
+ * ║                                  count via referrer_user_id      ║
+ * ║                                  audit rows (template stays      ║
+ * ║                                  permanent; friends INSERT audit)║
  * ║  Version: V.0.8 (2026-05-13) — Phase 6 QW-7 Smart Service        ║
  * ║    Reminder (boss "ดี ทำ" 2026-05-13). NEW section 5.5:             ║
  * ║    `dinoco_sn_lifecycle_run_service_reminder_schedule()` — daily   ║
@@ -524,19 +530,230 @@ if ( ! function_exists( 'dinoco_sn_get_referral_stats' ) ) {
         }
         global $wpdb;
         $tbl = dinoco_sn_table( 'promo_codes' );
-        // Count redemptions: rows where used_at IS NOT NULL AND code = referrer's code.
-        // Note: this counts how many TIMES the code was used (in MVP we allow multiple
-        // friends to use same code). For per-friend tracking, future schema extension
-        // would add a `referrer_user_id` column.
-        $count = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT COUNT(*) FROM {$tbl} WHERE code = %s AND used_at IS NOT NULL",
-            $stats['code']
-        ) );
+        // V.0.10 (Phase 6 QW-5 finish): count via referrer_user_id audit rows when column exists.
+        // Legacy fallback: 1-time-use code matching (pre-redemption-helper era).
+        if ( function_exists( 'dinoco_sn_promo_codes_has_referrer_col' ) && dinoco_sn_promo_codes_has_referrer_col() ) {
+            $count = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$tbl}
+                   WHERE referrer_user_id = %d AND used_at IS NOT NULL",
+                $user_id
+            ) );
+        } else {
+            $count = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$tbl} WHERE code = %s AND used_at IS NOT NULL",
+                $stats['code']
+            ) );
+        }
         $stats['redeemed_count'] = $count;
         // ฿100 per redemption (configurable via wp_option)
         $reward_per = (float) get_option( 'dinoco_sn_referral_reward_thb', 100.0 );
         $stats['reward_pending'] = $count * $reward_per;
         return $stats;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2.6 REFER-A-FRIEND REDEMPTION (Phase 6 QW-5 finish, V.0.10)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_promo_codes_has_referrer_col' ) ) {
+    /**
+     * Lazy ALTER guard — returns true if promo_codes.referrer_user_id column exists.
+     * On false → triggers ALTER TABLE ADD COLUMN + ADD KEY idx_referrer.
+     * Cached per-request via static memo. Returns false if table missing or ALTER blocked.
+     */
+    function dinoco_sn_promo_codes_has_referrer_col() {
+        static $cached = null;
+        if ( $cached !== null ) return $cached;
+
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'promo_codes' ) ) {
+            return $cached = false;
+        }
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'promo_codes' );
+        $exists = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+              WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = %s
+                AND COLUMN_NAME = 'referrer_user_id'",
+            $tbl
+        ) );
+        if ( $exists > 0 ) return $cached = true;
+
+        // Try ALTER (idempotent — if another request already added, our ALTER fails harmlessly)
+        $wpdb->hide_errors();
+        $wpdb->query( "ALTER TABLE {$tbl} ADD COLUMN referrer_user_id BIGINT UNSIGNED DEFAULT NULL AFTER user_id" );
+        $wpdb->query( "ALTER TABLE {$tbl} ADD KEY idx_referrer (referrer_user_id)" );
+        // Also widen `code` for audit-row format `REF-{referrer}-{friend}-{ts}` (~30 chars).
+        $wpdb->query( "ALTER TABLE {$tbl} MODIFY COLUMN code VARCHAR(40) NOT NULL" );
+        $wpdb->show_errors();
+
+        // Re-check
+        $exists = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+              WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = %s
+                AND COLUMN_NAME = 'referrer_user_id'",
+            $tbl
+        ) );
+        return $cached = ( $exists > 0 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_redeem_referral_code' ) ) {
+    /**
+     * Redeem a referral code at marketplace checkout.
+     *
+     * Flow:
+     *   1. Lookup code in promo_codes WHERE used_at IS NULL → "template" row (referrer's permanent code)
+     *   2. Validate: not expired, not self-referral, friend's user_id valid
+     *   3. INSERT audit row: code='REF-{ref}-{friend}-{ts}', referrer_user_id=template.user_id,
+     *      used_at=NOW, used_order_id=$order_id → counted by dinoco_sn_get_referral_stats
+     *   4. Return discount info for caller to apply to checkout total
+     *
+     * Backward compat: if referrer_user_id column missing (pre-V.0.10 schema) → fallback to
+     * legacy 1-time-use mode (UPDATE template row used_at=NOW directly, no audit row).
+     *
+     * @param string $code Referral code (case-insensitive)
+     * @param int $friend_user_id User redeeming the code (friend, not referrer)
+     * @param int $order_id Extension/order ID for audit linkage
+     * @param string $sn Source plate S/N (optional audit annotation)
+     * @return array { success: bool, error?: string, message_thai?: string,
+     *                referrer_user_id?: int, discount_pct?: int, discount_value?: float }
+     */
+    function dinoco_sn_redeem_referral_code( $code, $friend_user_id, $order_id = 0, $sn = '' ) {
+        $code = strtoupper( trim( (string) $code ) );
+        $friend_user_id = (int) $friend_user_id;
+
+        if ( $code === '' || strlen( $code ) < 8 ) {
+            return array( 'success' => false, 'error' => 'invalid_code',
+                'message_thai' => 'รหัสไม่ถูกต้อง' );
+        }
+        if ( $friend_user_id <= 0 ) {
+            return array( 'success' => false, 'error' => 'not_logged_in',
+                'message_thai' => 'กรุณาเข้าสู่ระบบก่อนใช้รหัส' );
+        }
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'promo_codes' ) ) {
+            return array( 'success' => false, 'error' => 'schema_missing',
+                'message_thai' => 'ระบบยังไม่พร้อม' );
+        }
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'promo_codes' );
+
+        // Lookup template row (used_at IS NULL = active permanent code)
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT code, user_id, discount_pct, discount_value, scope, expires_at, used_at
+             FROM {$tbl} WHERE code = %s LIMIT 1",
+            $code
+        ) );
+        if ( ! $row ) {
+            return array( 'success' => false, 'error' => 'not_found',
+                'message_thai' => 'ไม่พบรหัสนี้ในระบบ' );
+        }
+        if ( $row->used_at && $row->used_at !== '0000-00-00 00:00:00' ) {
+            // Legacy 1-time-use code already redeemed — non-referral types
+            return array( 'success' => false, 'error' => 'already_used',
+                'message_thai' => 'รหัสนี้ถูกใช้ไปแล้ว' );
+        }
+        // Expiry check
+        $expires_ts = strtotime( (string) $row->expires_at );
+        if ( $expires_ts && $expires_ts < time() ) {
+            return array( 'success' => false, 'error' => 'expired',
+                'message_thai' => 'รหัสนี้หมดอายุแล้ว' );
+        }
+        // Self-referral block
+        if ( (int) $row->user_id === $friend_user_id ) {
+            return array( 'success' => false, 'error' => 'self_referral',
+                'message_thai' => 'ไม่สามารถใช้รหัสของตัวเองได้' );
+        }
+
+        $referrer_user_id = (int) $row->user_id;
+        $discount_pct     = (int) $row->discount_pct;
+        $discount_value   = $row->discount_value === null ? null : (float) $row->discount_value;
+
+        // Friend per-referrer dedup — block friend from using same referrer's code multiple times.
+        // (Use referrer_user_id column when available; fallback to source_sn-based scan for legacy.)
+        if ( dinoco_sn_promo_codes_has_referrer_col() ) {
+            $already = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$tbl}
+                   WHERE referrer_user_id = %d
+                     AND user_id = %d
+                     AND used_at IS NOT NULL",
+                $referrer_user_id, $friend_user_id
+            ) );
+            if ( $already > 0 ) {
+                return array( 'success' => false, 'error' => 'already_redeemed_by_friend',
+                    'message_thai' => 'คุณใช้รหัสนี้ไปแล้ว — รหัส 1 รหัส 1 คน' );
+            }
+        }
+
+        // INSERT audit row OR legacy fallback (UPDATE template row used_at)
+        $now = current_time( 'mysql' );
+        $sn_up = $sn ? strtoupper( trim( (string) $sn ) ) : null;
+
+        if ( dinoco_sn_promo_codes_has_referrer_col() ) {
+            // Modern path — audit row, template stays alive for next friend
+            $audit_code = 'REF-' . $referrer_user_id . '-' . $friend_user_id . '-' . substr( (string) time(), -8 );
+            // Cap at 40 chars (column width)
+            if ( strlen( $audit_code ) > 40 ) $audit_code = substr( $audit_code, 0, 40 );
+            $ok = $wpdb->insert( $tbl, array(
+                'code'              => $audit_code,
+                'user_id'           => $friend_user_id, // friend's id (who used it)
+                'referrer_user_id'  => $referrer_user_id,
+                'source_sn'         => $sn_up,
+                'discount_pct'      => $discount_pct,
+                'discount_value'    => $discount_value,
+                'scope'             => (string) $row->scope,
+                'expires_at'        => $now, // expired immediately (audit-only)
+                'used_at'           => $now,
+                'used_order_id'     => (int) $order_id ?: null,
+                'created_at'        => $now,
+            ), array( '%s', '%d', '%d', '%s', '%d', $discount_value === null ? null : '%f', '%s', '%s', '%s', '%d', '%s' ) );
+            if ( $ok === false ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'error', 'sn_referral_redeem_insert_failed', array(
+                        'code' => $code, 'friend' => $friend_user_id, 'referrer' => $referrer_user_id,
+                        'db_error' => $wpdb->last_error,
+                    ) );
+                }
+                return array( 'success' => false, 'error' => 'db_insert_failed',
+                    'message_thai' => 'ระบบขัดข้อง กรุณาลองใหม่' );
+            }
+        } else {
+            // Legacy fallback (pre-V.0.10 schema) — UPDATE template directly (1-time use only)
+            $wpdb->update( $tbl,
+                array( 'used_at' => $now, 'used_order_id' => (int) $order_id ?: null ),
+                array( 'code' => $code, 'used_at' => null ),
+                array( '%s', '%d' ),
+                array( '%s', '%s' )
+            );
+        }
+
+        // Audit log
+        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+            dinoco_sn_audit_log(
+                $sn_up ?: ( 'CODE:' . $code ),
+                'referral_redeemed', null, null,
+                array(
+                    'code'              => $code,
+                    'referrer_user_id'  => $referrer_user_id,
+                    'friend_user_id'    => $friend_user_id,
+                    'order_id'          => (int) $order_id,
+                    'discount_pct'      => $discount_pct,
+                    'discount_value'    => $discount_value,
+                ),
+                $friend_user_id, null, '', 'marketplace_referral', false
+            );
+        }
+
+        return array(
+            'success'           => true,
+            'referrer_user_id'  => $referrer_user_id,
+            'discount_pct'      => $discount_pct,
+            'discount_value'    => $discount_value,
+            'message_thai'      => 'ใช้รหัสสำเร็จ',
+        );
     }
 }
 

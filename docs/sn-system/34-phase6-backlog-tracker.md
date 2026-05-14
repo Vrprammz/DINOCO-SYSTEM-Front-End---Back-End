@@ -21,21 +21,26 @@ LT-1..LT-4 tracked separately in `docs/sn-system/33-phase6-strategic-foundations
 | ID | Feature | Status | Effort | Blocker | Owner |
 | --- | --- | --- | --- | --- | --- |
 | **QW-2** | Digital Wallet Card (Apple Wallet `.pkpass` + Google Pay JWT) | 🔴 BLOCKED | ~12h | Apple Developer account + Google Wallet partnership | บอส (vendor decision) |
-| **QW-5** | Refer-a-Friend Code | ✅ MVP + Member Dashboard UI LANDED 2026-05-13 (V.0.7 + Member Dashboard Main V.31.6) | 9/10h | Redemption hook at warranty extension checkout (final 1h) | Tech Lead |
+| **QW-5** | Refer-a-Friend Code | ✅ **COMPLETE 2026-05-14** — redemption wired (Notifier V.0.10 + SN REST V.0.47 + Manager V.0.60) | 10/10h | None — admin reward credit flow deferred (manual SQL review until volume justifies UI) | Tech Lead |
 | **QW-7** | Smart Service Reminder (1y check-up push) | 🟡 KB-BLOCKED | ~4h | Need product service interval data in KB | Tech Lead + KB team |
 
-**QW-5 implementation status** (commit pending this batch):
+**QW-5 implementation status** (final, COMPLETE 2026-05-14):
 
 - ✅ Schema reuse: existing `wp_dinoco_sn_promo_codes` table — `refer_a_friend` type added
 - ✅ Helper: `dinoco_sn_get_or_create_referral_code($user_id)` — idempotent per-user (stored in user meta `dinoco_sn_referral_code`)
-- ✅ Helper: `dinoco_sn_get_referral_stats($user_id)` — returns `{code, redeemed_count, reward_pending}`
+- ✅ Helper: `dinoco_sn_get_referral_stats($user_id)` — returns `{code, redeemed_count, reward_pending}` — V.0.10 counts via `referrer_user_id` column
 - ✅ Auto-trigger: listens to `dinoco_sn_pool_status_changed_for_user` (R3 cache invalidation chain) → fires on first registration
 - ✅ Defensive: try/catch + `dinoco_obs_capture_exception` (R11 signature)
-- ✅ Drift detector: `tests/jest/sn-qw5-refer-a-friend-drift.test.js` (11+10 assertions Phase 6+7)
 - ✅ Reward configurable via `wp_option dinoco_sn_referral_reward_thb` (default 100.0)
 - ✅ **Member Dashboard UI** (Phase 7 P2 2026-05-13, V.31.6): green gradient card with code + copy-to-clipboard btn + LINE share deep link + stats row (when redeemed > 0). Renders only if user has plates registered.
-- ⏳ TODO: Redemption hook (when friend uses code → mark referrer reward credit pending) — wire to Warranty Extension Marketplace checkout coupon flow
-- ⏳ TODO: Admin approval flow for crediting referrer reward (manual review prevents abuse)
+- ✅ **Redemption Hook** (Phase 6 finish 2026-05-14, Notifier V.0.10 + SN REST V.0.47):
+  - NEW `dinoco_sn_redeem_referral_code($code, $friend_uid, $order_id, $sn)` — validates expiry, self-referral block, per-friend dedup (1 referrer's code = 1 use per friend), INSERTs audit row with `referrer_user_id` pointer, fires `dinoco_sn_audit_log('referral_redeemed')`
+  - NEW `dinoco_sn_promo_codes_has_referrer_col()` — lazy ALTER guard (INFORMATION_SCHEMA precheck + idempotent ALTER ADD COLUMN + ADD KEY + MODIFY code VARCHAR(40)). Static memo cache per-request
+  - Marketplace `/marketplace/checkout` endpoint: 2-pass redemption — preview discount via template lookup (no DB write), then commit redemption post-INSERT with `extension_id` as `used_order_id`
+  - Defensive `function_exists` guard + `\Throwable` catch (R11 obs signature) + soft-fail logging (extension created at discounted price preserved even if audit row write fails)
+- ✅ Schema migration: Manager V.0.60 promo_codes table — `referrer_user_id BIGINT UNSIGNED DEFAULT NULL AFTER user_id` + `idx_referrer` + widen `code` to `VARCHAR(40)` for `REF-{ref}-{friend}-{ts}` audit row format. Backward-compat: helper detects pre-V.0.10 schema → fallback UPDATE template row (legacy 1-time-use)
+- ✅ Drift detector: `tests/jest/sn-qw5-refer-a-friend-drift.test.js` (Phase 6+7 21 assertions) + `tests/jest/sn-qw5-redemption-drift.test.js` (V.0.10 31 assertions)
+- ⚪ **Deferred**: Admin reward credit UI — manual SQL review for first 50 redemptions until volume justifies dedicated approval UI (anti-abuse posture). Boss can audit `SELECT * FROM wp_dinoco_sn_promo_codes WHERE referrer_user_id IS NOT NULL ORDER BY used_at DESC` directly.
 
 ### RD (Revenue Drivers) — Analytics + ML
 
