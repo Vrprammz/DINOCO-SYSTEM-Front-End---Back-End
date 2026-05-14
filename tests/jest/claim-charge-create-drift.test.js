@@ -128,10 +128,14 @@ describe('Sprint 17 Phase 2.6 — Claim Charge Create + Tiered Read drift', () =
 
     // ─── Bangkok-local date() (Sprint 16 C2 lesson) ──────────────────
 
-    test('expires_at uses date() not gmdate() for Bangkok-local semantics', () => {
-        // expires_at computed via date('Y-m-d H:i:s', ...) — gmdate would
-        // produce UTC, breaking comparisons with current_time('mysql').
-        expect(LIFF_CODE).toMatch(/\$expires_at\s*=\s*date\s*\(\s*['"]Y-m-d H:i:s['"]/);
+    test('Sprint 19 MED-1 — expires_at uses wp_date(wp_timezone()) for Bangkok-local semantics', () => {
+        // Sprint 17 used date() — Sprint 19 MED-1 upgraded to wp_date() with
+        // wp_timezone() because date() reads PHP default tz (UTC on most WP
+        // installs) while current_time('mysql') is Bangkok-local → 7hr drift.
+        // wp_date() honors wp_timezone() so DB read/write semantics match.
+        expect(LIFF_CODE).toMatch(/wp_date\s*\(\s*['"]Y-m-d H:i:s['"][\s\S]*?wp_timezone\(\)/);
+        // function_exists guard — date() retained as fallback for very old WP installs
+        expect(LIFF_CODE).toMatch(/function_exists\(\s*['"]wp_date['"]\s*\)/);
     });
 
     test('handler does NOT use gmdate() for expires_at', () => {

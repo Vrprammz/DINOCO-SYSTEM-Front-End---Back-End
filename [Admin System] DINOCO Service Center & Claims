@@ -1,6 +1,16 @@
 /*
  * Plugin Name: [Module] DINOCO Service Center & Claims
  * Description: ระบบบริหารจัดการงานเคลม
+ * Version: V.34.1 (2026-05-14) — Sprint 19 code-reviewer remediation:
+ *   • CRIT-1: modal form values captured via onConfirm callback BEFORE
+ *     modal teardown. Phase 6 pattern (Sprint 11 commit a8d3733 lesson).
+ *   • LOW-1: snapshot _ccCurrentTid at submit to prevent stale TID race.
+ *   • HIGH-4: debounce 500ms on _ccRefreshBankPreview + skip re-click on
+ *     active pill (Sprint 12 SEC-H2 rate limit 10/min burn defense).
+ *   • HIGH-5: MutationObserver replaces deprecated DOMNodeInserted.
+ *     One-shot data-loaded flag prevents N-fire on show/hide cycles.
+ *   • MED-4: remove dead `shown.modal` empty handler.
+ *
  * Version: V.34.0 (2026-05-14) — Sprint 17 Phase 2.6 backbone:
  *   • NEW "💰 ออกใบเรียกเก็บค่าเคลม" trigger button on claim detail view,
  *     gated client-side by ticket_status IN (completed, replaced). Opens
@@ -4418,47 +4428,66 @@ function dinoco_render_claims_ui() {
                 + '</div>'
                 + '</div>';
 
+            // V.34.1 Sprint 19 CRIT-1 fix — capture form values via onConfirm
+            // callback BEFORE modal teardown. Previously read $('#dnc-cc-*')
+            // AFTER `await ok` resolved → DOM destroyed → values undefined →
+            // parseFloat(undefined)=NaN → silent failure. Mirrors Phase 6
+            // HOTFIX commit a8d3733 modal contract pattern across 11 sites.
+            var captured = null;
             var ok = false;
             try {
                 ok = await window.dinocoModal.confirm({
                     title: '💰 ออกใบเรียกเก็บค่าเคลม #' + _ccCurrentTid,
                     message: html,
-                    content: html,           // some modal helper builds accept content; passing both is safe
+                    content: html,
                     confirmText: 'สร้างใบเรียกเก็บ',
                     cancelText: 'ยกเลิก',
-                    danger: false
+                    danger: false,
+                    onConfirm: function() {
+                        // Read DOM values while modal is still alive
+                        captured = {
+                            rawAmount: ($('#dnc-cc-amount').val() || '').toString().replace(/,/g, '').trim(),
+                            reason:    $('#dnc-cc-reason').val() || '',
+                            note:      $('#dnc-cc-note').val() || '',
+                            bank:      $('#dnc-cc-bank-pills .dnc-cc-pill-active').attr('data-bank') || 'default',
+                            days:      parseInt($('#dnc-cc-expires-days').val(), 10) || 7
+                        };
+                        return true;  // allow confirm to resolve
+                    }
                 });
             } catch (e) {
                 // Fallback — native confirm cannot render HTML form so abort
                 ok = confirm('สร้างใบเรียกเก็บค่าเคลม? (Modal Helpers ไม่พร้อม — ฟอร์มไม่แสดง)');
                 if (ok) { _scAlert('Modal Helpers snippet ยังไม่ sync — โปรดเปิดใช้งาน Modal Helpers เพื่อใช้ฟอร์มนี้', 'error'); return; }
             }
-            if (!ok) return;
+            if (!ok || !captured) return;
 
-            // Read form values
-            var rawAmount = ($('#dnc-cc-amount').val() || '').toString().replace(/,/g, '').trim();
-            var amount = parseFloat(rawAmount);
-            var reason = $('#dnc-cc-reason').val() || '';
-            var note   = $('#dnc-cc-note').val() || '';
-            var bank   = $('#dnc-cc-bank-pills .dnc-cc-pill-active').attr('data-bank') || 'default';
-            var days   = parseInt($('#dnc-cc-expires-days').val(), 10) || 7;
+            // V.34.1 Sprint 19 LOW-1 fix — snapshot _ccCurrentTid at submit
+            // time to prevent stale TID if admin switches claim mid-flow.
+            var submitTid = _ccCurrentTid;
+            if (!submitTid) {
+                _scAlert('ไม่พบหมายเลขเคลม', 'error');
+                return;
+            }
 
+            // Validate captured values
+            var amount = parseFloat(captured.rawAmount);
             if (!isFinite(amount) || amount <= 0 || amount > 9999999.99) {
                 _scAlert('จำนวนเงินไม่ถูกต้อง (0.01 - 9,999,999.99)', 'error');
                 return;
             }
-            if (!reason) {
+            if (!captured.reason) {
                 _scAlert('กรุณาเลือกเหตุผล', 'error');
                 return;
             }
 
             _ccSubmitCreate({
-                claim_id:        _ccCurrentTid,
+                claim_id:        submitTid,
                 amount_thb:      Math.round(amount * 100) / 100,
-                reason:          reason,
-                reason_note:     note,
-                bank_context:    bank,
-                expires_in_days: days
+                reason:          captured.reason,
+                reason_note:     captured.note,
+                bank_context:    captured.bank,
+                expires_in_days: captured.days
             });
         }
 
@@ -4518,11 +4547,25 @@ function dinoco_render_claims_ui() {
             if ($(this).prop('disabled')) return;
             scOpenCreateCharge();
         });
+        // V.34.1 Sprint 19 HIGH-4 fix — debounce bank preview refresh +
+        // skip re-click on already-active pill. Sprint 12 SEC-H2 set rate
+        // limit 10/min on /bank-settings/test; rapid toggle (4 clicks/2s)
+        // burned through quota → preview stuck on 429 for 60s.
+        var _ccBankPreviewTimer = null;
         $(document).on('click', '[data-action="dnc-cc-pick-bank"]', function() {
+            var $self = $(this);
+            // Skip if already active pill (no value change)
+            if ($self.hasClass('dnc-cc-pill-active')) return;
             var $pills = $('#dnc-cc-bank-pills .dnc-cc-pill');
             $pills.removeClass('dnc-cc-pill-active');
-            $(this).addClass('dnc-cc-pill-active');
-            _ccRefreshBankPreview($(this).attr('data-bank') || 'default');
+            $self.addClass('dnc-cc-pill-active');
+            var bucket = $self.attr('data-bank') || 'default';
+            // Debounce 500ms — coalesce rapid toggles
+            if (_ccBankPreviewTimer) clearTimeout(_ccBankPreviewTimer);
+            _ccBankPreviewTimer = setTimeout(function() {
+                _ccRefreshBankPreview(bucket);
+                _ccBankPreviewTimer = null;
+            }, 500);
         });
         $(document).on('input', '#dnc-cc-note', function() {
             $('#dnc-cc-note-count').text(($(this).val() || '').length);
@@ -4543,13 +4586,35 @@ function dinoco_render_claims_ui() {
             intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
             $(this).val(intPart + decPart);
         });
-        // When user picks initial bank pill (form just rendered), trigger preview load
-        $(document).on('shown.modal click', '[data-action="dnc-cc-pick-bank"]', function() {});
-        // The modal may render asynchronously — observe DOM for the form root
-        // and load initial bank preview when form appears.
-        $(document).on('DOMNodeInserted', '#dnc-cc-bank-pills', function() {
-            _ccRefreshBankPreview('default');
-        });
+        // V.34.1 Sprint 19 MED-4 fix — removed dead `shown.modal` empty
+        // handler (Bootstrap event NOT dinocoModal — never fired).
+        // V.34.1 Sprint 19 HIGH-5 fix — `DOMNodeInserted` deprecated in
+        // Chrome 127+ + fires N times on modal show/hide cycles → N bank
+        // preview fetches → rate-limit burn. Replaced with MutationObserver
+        // scoped to modal container. Falls back to lazy preview on first
+        // active pill if observer unavailable.
+        (function() {
+            if (typeof MutationObserver === 'undefined') return;
+            var observer = new MutationObserver(function(mutations) {
+                for (var i = 0; i < mutations.length; i++) {
+                    var added = mutations[i].addedNodes;
+                    for (var j = 0; j < added.length; j++) {
+                        var node = added[j];
+                        if (!node || node.nodeType !== 1) continue;
+                        // Detect newly-inserted #dnc-cc-bank-pills
+                        var $pills = (node.id === 'dnc-cc-bank-pills')
+                            ? $(node)
+                            : $(node).find('#dnc-cc-bank-pills');
+                        if ($pills.length && !$pills.data('dnc-cc-loaded')) {
+                            $pills.data('dnc-cc-loaded', '1');
+                            _ccRefreshBankPreview('default');
+                            return;  // one-shot per modal open
+                        }
+                    }
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        })();
         // View slip / detail (placeholder for future expansion)
         $(document).on('click', '[data-action="dnc-cc-view-slip"]', function() {
             var cid = parseInt($(this).attr('data-charge-id'), 10) || 0;

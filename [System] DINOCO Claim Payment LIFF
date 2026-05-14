@@ -19,6 +19,28 @@
  * ║      R3 HIGH-5 / Sprint 14 H3 pattern). 60s per-tier transient.   ║
  * ║    • NEW GET /dinoco-claim/v1/charges?claim_id=X (admin list) —   ║
  * ║      filter+paginate charge cards for Service Center panel.        ║
+ * ║  Version: V.0.7 (2026-05-14) — Sprint 19 code-reviewer remediation:║
+ * ║    • HIGH-1: charge_active_exists SELECT moved INSIDE transaction  ║
+ * ║      + FOR UPDATE row lock. Was TOCTOU window if sibling endpoint ║
+ * ║      mutated without acquiring same lock key.                     ║
+ * ║    • HIGH-3: legacy claim_user_id=0 fallback chain extended with  ║
+ * ║      warranty_registration→owner_user lookup (3-tier). Reject with ║
+ * ║      422 claim_owner_unresolved if all 3 tiers fail — customer    ║
+ * ║      would never be able to view their own charge otherwise.      ║
+ * ║    • MED-1: expires_at via wp_date() + wp_timezone() instead of   ║
+ * ║      date(). Sprint 16 C2 lesson applied — date() reads PHP       ║
+ * ║      default tz (UTC on most installs) vs current_time('mysql')   ║
+ * ║      Bangkok-local → 7hr drift would have resurfaced.             ║
+ * ║    • MED-2: $wpdb->update return strict check — was === false     ║
+ * ║      only, missed === 0 (no-rows-affected) + db_error string. Now ║
+ * ║      ROLLBACK on either condition. Prevents PENDING orphan rows.  ║
+ * ║                                                                    ║
+ * ║  Version: V.0.6 (2026-05-14) — Sprint 17 Phase 2.6 implementation: ║
+ * ║    3 NEW REST endpoints (POST /charges admin create + GET tiered  ║
+ * ║    read + GET admin list). amount_thb dual-set / Crockford ref /  ║
+ * ║    cents-int idempotency / 60s per-tier cache + invalidation     ║
+ * ║    listener / 404 anti-enumeration.                                ║
+ * ║                                                                    ║
  * ║  Version: V.0.5 (2026-05-14) — Sprint 16 code-reviewer remediation:║
  * ║    • C2 timezone bug — was `gmdate('Y-m-d H:i:s', strtotime($now)  ║
  * ║      + ttl*60)` which formatted as UTC while DB comparisons use    ║
@@ -1118,7 +1140,15 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_charge_create' ) ) {
         }
 
         // Determine claim owner user_id for customer column.
-        // Common pattern: ACF 'customer_id' or post_author. Defensive resolution.
+        // V.0.7 Sprint 19 HIGH-3 fix — legacy claim_ticket rows pre-V.30 had
+        // no `customer_id` ACF + post_author=0 (system-created). Owner-tier
+        // read on charge.user_id=0 → 404 anti-enum → customer can never view
+        // their own charge via /claim-pay/?cid=X. 3-tier fallback chain:
+        //   1. ACF customer_id (post-V.30 standard)
+        //   2. post_author (early claim records pre-customer_id ACF)
+        //   3. NEW: warranty_registration linked_warranty_id → its owner_user
+        //      (most pre-V.30 claims were created against a warranty so this
+        //       walks 1 hop to find the original registrant).
         $claim_user_id = 0;
         if ( function_exists( 'get_field' ) ) {
             $maybe = get_field( 'customer_id', $claim_id );
@@ -1126,6 +1156,24 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_charge_create' ) ) {
         }
         if ( $claim_user_id === 0 && (int) $claim_post->post_author > 0 ) {
             $claim_user_id = (int) $claim_post->post_author;
+        }
+        // Warranty fallback for legacy rows
+        if ( $claim_user_id === 0 && function_exists( 'get_field' ) ) {
+            $warr_id = (int) get_field( 'linked_warranty_id', $claim_id );
+            if ( $warr_id > 0 ) {
+                $warr_owner = (int) get_field( 'owner_user_id', $warr_id );
+                if ( $warr_owner > 0 ) $claim_user_id = $warr_owner;
+            }
+        }
+        // Reject create when owner cannot be resolved — admin must manually
+        // link customer to claim BEFORE issuing charge (else customer can
+        // never authenticate against this charge).
+        if ( $claim_user_id === 0 ) {
+            return new WP_Error(
+                'claim_owner_unresolved',
+                'ไม่พบเจ้าของเคลม — โปรดผูกลูกค้ากับเคลมก่อนออกใบเรียกเก็บ',
+                array( 'status' => 422, 'claim_id' => $claim_id )
+            );
         }
 
         // ── Idempotency body hash (cents int — no float drift) ──────
@@ -1164,23 +1212,35 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_charge_create' ) ) {
         $now_mysql  = current_time( 'mysql' );
 
         try {
-            // Reject if claim has an active charge already.
-            // Active = pending_payment / pending_review / verified (verified is
-            // "money received, awaiting refund or close").
+            // V.0.7 Sprint 19 HIGH-1 fix — move active-charge SELECT INSIDE
+            // transaction + FOR UPDATE row lock. Previously ran outside txn →
+            // TOCTOU window if a sibling endpoint mutated charges without
+            // acquiring the same `claim_charge_create_*` lock key. Per
+            // reviewer recommendation: read-then-write inside same txn closes
+            // the race even cross-endpoint.
+            $wpdb->query( 'START TRANSACTION' );
+
             $active_count = (int) $wpdb->get_var( $wpdb->prepare(
                 "SELECT COUNT(*) FROM {$table}
                   WHERE claim_id = %d
-                    AND status IN ('pending_payment','pending_review','verified')",
+                    AND status IN ('pending_payment','pending_review','verified')
+                  FOR UPDATE",
                 $claim_id
             ) );
             if ( $active_count > 0 ) {
+                $wpdb->query( 'ROLLBACK' );
                 return new WP_Error( 'charge_active_exists', 'เคลมนี้มี Charge ที่ยังไม่ปิดอยู่', array( 'status' => 409 ) );
             }
 
-            $wpdb->query( 'START TRANSACTION' );
-
-            // Compute expires_at — Bangkok-local via date() (Sprint 16 C2 lesson)
-            $expires_at = date( 'Y-m-d H:i:s', strtotime( $now_mysql ) + ( $expires_days * DAY_IN_SECONDS ) );
+            // V.0.7 Sprint 19 MED-1 fix — `date()` reads PHP default tz which
+            // is UTC on most WP installs; `current_time('mysql')` returns
+            // Bangkok-local → 7hr drift on production server. Use `wp_date()`
+            // with `wp_timezone()` to match DB write semantics regardless of
+            // PHP default tz setting. Sprint 16 C2 lesson applied correctly.
+            $expires_at = function_exists( 'wp_date' )
+                ? wp_date( 'Y-m-d H:i:s', strtotime( $now_mysql ) + ( $expires_days * DAY_IN_SECONDS ),
+                    function_exists( 'wp_timezone' ) ? wp_timezone() : null )
+                : date( 'Y-m-d H:i:s', strtotime( $now_mysql ) + ( $expires_days * DAY_IN_SECONDS ) );
 
             $insert_data = array(
                 'claim_id'              => $claim_id,
@@ -1219,11 +1279,19 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_charge_create' ) ) {
             $charge_id = (int) $wpdb->insert_id;
 
             // Generate payment_ref (CLM-CHG-NNNN-XXXX) + UPDATE row.
+            // V.0.7 Sprint 19 MED-2 fix — $wpdb->update returns 0 (falsy but
+            // === 0) when no rows affected (e.g. row deleted by parallel
+            // mutation). === false alone misses this path → COMMIT proceeds
+            // with payment_ref=PENDING orphan row. Strict check on both
+            // false AND 0 + db error string for fail-loud diagnostics.
             $payment_ref = dinoco_claim_payment_generate_payment_ref( $charge_id );
             $upd = $wpdb->update( $table, array( 'payment_ref' => $payment_ref ), array( 'id' => $charge_id ), array( '%s' ), array( '%d' ) );
-            if ( $upd === false ) {
+            if ( $upd === false || $upd === 0 || ! empty( $wpdb->last_error ) ) {
                 $wpdb->query( 'ROLLBACK' );
-                return new WP_Error( 'db_update_failed', 'Failed to populate payment_ref', array( 'status' => 500 ) );
+                return new WP_Error( 'db_update_failed',
+                    'Failed to populate payment_ref',
+                    array( 'status' => 500, 'rows_affected' => (int) $upd, 'db_error' => (string) $wpdb->last_error )
+                );
             }
 
             $wpdb->query( 'COMMIT' );
