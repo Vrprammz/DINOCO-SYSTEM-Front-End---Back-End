@@ -10,6 +10,55 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Added — B2B Canonical Sprint 3 + 4 closure (2026-05-14 → 2026-05-15)
+
+Closed remaining `B2B-CANONICAL-REFERENCE-2026-05-13.md` §9 roadmap items per
+boss directive 2026-05-13 "เอา B2B อิง". 11 commits, 13 new drift detectors.
+
+**Sprint 2 Foundation** (already done — H1 modal shortcuts / H2 status registry
+/ H3 dinoco_flex_header / H4 .dnc-filter-chip / H5 dinoco_format_date).
+
+**Sprint 3 Quick Wins (5/5 ✅)**:
+
+- `22d4a47` Claim Lifecycle V.2.3 B-4/B-5 PHPUnit + SF3 Modal drift detector +
+  Sprint 2D dinoco-modal-api-usage + status-badge-registry drift detectors.
+  Service Center V.34.6 → V.34.7 cleanup (4× dead `content: html`).
+- `de196fc` Sprint 4 #7 amber sweep `#d97706` → `#b45309` (23 files, 109 sites).
+- `f0bbf05` Sprint 3 #2 navy sweep `#1e3a8a` + `#1a237e` → 2-tier canonical
+  (#1A3A5C Flex / #1f2937 UI). 7 files, 30 sites.
+- `c54bfe8` Sprint 3 #1 native modal sweep (4 files, 77→26 native calls,
+  66% reduction).
+- `a90a227` Sprint 3 #4 CSS var rename `--dnc-space-*` → `--mdash-space-*`
+  (Assets List V.32.3, 57 occurrences).
+- `c1025c3` Sprint 3 #5 BO Snippet 16 V.4.3 — 8 Flex builders use
+  `dinoco_flex_header()` with severity (no raw hex).
+
+**Sprint 4 HIGH (8/8 ✅ — #6 BOSS-PENDING)**:
+
+- `976caff` Sprint 4 #8 Flex bubble size baseline drift (126 sites, per-file
+  pinned).
+- `d788b47` Sprint 4 #12 B2F Snippet 4 V.4.9 — `.dnc-filter-chip` composition.
+- `809f1e5` Sprint 4 #9 currency decimal rule drift (233 zero-decimal + 188
+  two-decimal + 10 one-decimal cap).
+- `40f5b5a` Sprint 4 #10 status_colors registry migration drift (delegation
+  pattern + B2F_COLOR_* canonical hex pinned).
+- `bc2d8c5` Sprint 4 #13 Service Center Tailwind baseline (328 sites, migration
+  deferred to dedicated sprint).
+- `c09560e` Sprint 4 #6 Buddhist year baseline (14 sites — 5 customer Thai
+  cultural KEEP + 9 admin BOSS-PENDING).
+- Sprint 4 #11 Manual Invoice ARIA pass — already shipped V.36.0 2026-05-13.
+
+**Test infrastructure delta**:
+- Jest 88 → 103 suites (+15)
+- Tests 3135 → 3378 (+243)
+- PHPUnit +24 cases (Claim B-4/B-5)
+- 13 new drift detectors guard all canonical migrations
+- 0 regressions throughout
+
+**Remaining work**: Boss-side operational items (QA staging Claim Lifecycle /
+Q15 Role UAT / F#8 legal workstream) + Phase 6 deferred items (QW-2 wallet /
+RD-4 ML / OP-4 multi-warehouse / RM-4 deferred Q22) — all gate-blocked.
+
 ### Added — Phase 6 backlog sprint (2026-05-14)
 
 Closed all remaining unblocked items in `docs/sn-system/34-phase6-backlog-tracker.md`. Boss-confirmed plan v2.13 work surface for SN system = COMPLETE pending operational steps (boss QA staging, Q15 role seeding, F#8 legal workstream).
