@@ -50,12 +50,16 @@ describe('Sprint 32 — Dashboard Claim Inline Integration drift', () => {
 
     // ─── Version headers (untouched, includes comments) ──────────────
 
-    test('Assets List V.32.0 + V.31.6 lineage preserved', () => {
+    test('Assets List V.32.1 + V.32.0 + V.31.6 lineage preserved', () => {
+        // V.32.1 Sprint 33 (UX dual-audit remediation) → V.32.0 Sprint 32 → V.31.6
+        expect(SRC.assets).toMatch(/Version:\s*V\.32\.1\s*\(2026-05-14\)\s*—\s*Sprint 33/);
         expect(SRC.assets).toMatch(/Version:\s*V\.32\.0\s*\(2026-05-14\)\s*—\s*Sprint 32/);
         expect(SRC.assets).toMatch(/Version:\s*V\.31\.6\s*\(2026-05-13\)/);
     });
 
-    test('Member Dashboard V.32.0 + V.31.8 lineage preserved', () => {
+    test('Member Dashboard V.32.1 + V.32.0 + V.31.8 lineage preserved', () => {
+        // V.32.1 Sprint 33 (UX dual-audit remediation) → V.32.0 Sprint 32 → V.31.8
+        expect(SRC.member).toMatch(/Version:\s*V\.32\.1\s*\(2026-05-14\)\s*—\s*Sprint 33/);
         expect(SRC.member).toMatch(/Version:\s*V\.32\.0\s*\(2026-05-14\)\s*—\s*Sprint 32/);
         expect(SRC.member).toMatch(/Version:\s*V\.31\.8\s*\(2026-05-13\)/);
     });
@@ -193,13 +197,18 @@ describe('Sprint 32 — Dashboard Claim Inline Integration drift', () => {
         expect(blockBefore).toMatch(/dinoco_claim_payment_enabled/);
     });
 
-    test('Member Dashboard V.32.0 — rotation array includes charge_pending FIRST', () => {
-        // Boss principle: financial urgency outranks expiry/anniversary/review.
+    test('Member Dashboard V.32.0 — rotation array includes charge_pending FIRST (default path)', () => {
+        // Boss principle: financial urgency outranks expiry/anniversary/review by default.
+        // V.32.1 Sprint 33 S4 — Priority becomes dynamic: when expiry has days_left < 7,
+        // expiry wins (irreversible warranty lapse). Default branch (non-critical expiry)
+        // still places charge_pending first.
         expect(CODE.member).toMatch(/'charge_pending'\s*=>\s*null[\s\S]{0,50}'expiry'\s*=>\s*null/);
-        // $ordered array — charge_pending must be FIRST entry
-        const orderedBlock = CODE.member.match(/\$ordered\s*=\s*array_filter\(\s*array\([\s\S]{0,300}/);
-        expect(orderedBlock).not.toBeNull();
-        expect(orderedBlock[0]).toMatch(/\$picked\['charge_pending'\][\s\S]{0,200}\$picked\['expiry'\]/);
+        // Find ALL $ordered = array_filter blocks (S4 introduces 2 branches)
+        const allOrderedBlocks = CODE.member.match(/\$ordered\s*=\s*array_filter\(\s*array\([\s\S]{0,600}\)\s*\)\s*;/g) || [];
+        expect(allOrderedBlocks.length).toBeGreaterThanOrEqual(1);
+        // AT LEAST ONE branch must place charge_pending before expiry (default Sprint 32 order).
+        const defaultBranch = allOrderedBlocks.find(b => /\$picked\['charge_pending'\][\s\S]{0,400}\$picked\['expiry'\]/.test(b));
+        expect(defaultBranch).toBeDefined();
     });
 
     test('Member Dashboard V.32.0 — banner render branch for charge_pending exists', () => {
@@ -319,5 +328,256 @@ describe('Sprint 32 — Dashboard Claim Inline Integration drift', () => {
         expect(CODE.liff).toMatch(/register_rest_route\(\s*\$base\s*,\s*'\/charge\/\(\?P<id>\\\\d\+\)\/upload-slip'/);
         expect(CODE.liff).toMatch(/register_rest_route\(\s*\$base\s*,\s*'\/charges\/\(\?P<id>\\\\d\+\)\/slip-image'/);
         expect(CODE.liff).toMatch(/register_rest_route\(\s*\$base\s*,\s*'\/my-charges'/);
+    });
+
+    // ─── Sprint 33 — UX dual-audit remediation (5 BLOCKERs + 7 SHOULD-FIX) ───
+
+    // B1 — .dnc-sn-banner-charge-pending CSS variant added (Member Dashboard)
+    test('B1 — charge-pending banner CSS variant exists with bg + border + color', () => {
+        const rule = CODE.member.match(/\.dnc-sn-banner-charge-pending\s*\{[\s\S]{0,300}\}/);
+        expect(rule).not.toBeNull();
+        expect(rule[0]).toMatch(/background:\s*var\(\s*--dnc-danger-red-bg/);
+        expect(rule[0]).toMatch(/border-color:\s*var\(\s*--dnc-danger-red/);
+        expect(rule[0]).toMatch(/color:\s*#7f1d1d/);
+    });
+
+    test('B1 — `.dnc-sn-banner-clickable` style supports anchor-wrap banner', () => {
+        expect(CODE.member).toMatch(/\.dnc-sn-banner-clickable\s*\{/);
+        const block = CODE.member.match(/\.dnc-sn-banner-clickable\s*\{[\s\S]{0,400}\}/);
+        expect(block).not.toBeNull();
+        expect(block[0]).toMatch(/text-decoration:\s*none/);
+        expect(block[0]).toMatch(/cursor:\s*pointer/);
+    });
+
+    // B2 — Modal renders bank info block + PromptPay QR + copy buttons
+    test('B2 — `_dncDashRenderBankBlock` helper renders bank info HTML', () => {
+        expect(CODE.assets).toMatch(/function\s+_dncDashRenderBankBlock\s*\(\s*bankCtxRaw\s*,\s*amount\s*\)/);
+    });
+
+    test('B2 — modal HTML includes bank account row + copy-text data-action', () => {
+        const block = CODE.assets.match(/function\s+_dncDashRenderBankBlock[\s\S]{0,3500}/);
+        expect(block).not.toBeNull();
+        expect(block[0]).toMatch(/dnc-dash-pay-bank-account-row/);
+        expect(block[0]).toMatch(/data-action="copy-text"/);
+        expect(block[0]).toMatch(/data-copy-value=/);
+        // PromptPay QR rendering branch
+        expect(block[0]).toMatch(/dnc-dash-pay-qr-wrap/);
+        expect(block[0]).toMatch(/promptpay_qr_url/);
+    });
+
+    test('B2 — empty bank_context fallback renders LINE deep-link notice', () => {
+        // _dncDashRenderBankBlock is large (~5000 chars in CODE.assets after comment strip).
+        const block = CODE.assets.match(/function\s+_dncDashRenderBankBlock[\s\S]{0,6000}/);
+        expect(block).not.toBeNull();
+        expect(block[0]).toMatch(/dnc-dash-pay-bank-fallback/);
+        expect(block[0]).toMatch(/ติดต่อแอดมินสำหรับข้อมูลการโอน/);
+        // NOTE: stripComments() chops `//line.me/...` from `'https://line.me/...'`
+        // (it treats `// ...` as a JS line comment regardless of string context).
+        // Assert against raw source instead — the literal exists in the live code.
+        expect(SRC.assets).toMatch(/line\.me\/R\/oaMessage\/@dinoco/);
+        // And confirm the fallback function builds a lineUrl variable
+        expect(block[0]).toMatch(/var\s+lineUrl/);
+        expect(block[0]).toMatch(/ขอข้อมูลการโอนเงินค่าซ่อม/);
+    });
+
+    test('B2 — server-side SELECT pulls resolved bank_name + bank_account columns', () => {
+        // Charge_pending render reads resolved columns (not just raw bank_context string).
+        const block = CODE.assets.match(/function\s+dinoco_dashboard_render_claim_charges_inline[\s\S]{0,3500}/);
+        expect(block).not.toBeNull();
+        expect(block[0]).toMatch(/bank_name,\s*bank_account,\s*bank_code/);
+    });
+
+    test('B2 — bank_context JSON includes promptpay_qr_url field (via b2b_thai_qr_image_url)', () => {
+        expect(CODE.assets).toMatch(/b2b_thai_qr_image_url\(\s*\$amount/);
+        expect(CODE.assets).toMatch(/'promptpay_qr_url'\s*=>/);
+        expect(CODE.assets).toMatch(/'bank_logo_url'\s*=>/);
+    });
+
+    test('B2 — copy-to-clipboard helper uses navigator.clipboard + execCommand fallback', () => {
+        expect(CODE.assets).toMatch(/function\s+_dncDashCopyText\s*\(/);
+        expect(CODE.assets).toMatch(/navigator\.clipboard\.writeText/);
+        expect(CODE.assets).toMatch(/document\.execCommand\(\s*'copy'\s*\)/);
+    });
+
+    // B3 — Primary CTA swaps to "ชำระ ฿X" when pending charge exists
+    test('B3 — dinoco_dashboard_get_pending_charge_for_claim helper defined', () => {
+        expect(CODE.assets).toMatch(/function\s+dinoco_dashboard_get_pending_charge_for_claim\s*\(\s*\$claim_id\s*\)/);
+    });
+
+    test('B3 — pending charge helper owner-scoped + status=pending_payment', () => {
+        const block = CODE.assets.match(/function\s+dinoco_dashboard_get_pending_charge_for_claim[\s\S]{0,2000}/);
+        expect(block).not.toBeNull();
+        expect(block[0]).toMatch(/user_id\s*=\s*%d/);
+        expect(block[0]).toMatch(/status\s*=\s*'pending_payment'/);
+    });
+
+    test('B3 — primary CTA has conditional branch `$is_claimed && $has_pending_charge`', () => {
+        expect(CODE.assets).toMatch(/\$has_pending_charge\s*=\s*false/);
+        expect(CODE.assets).toMatch(/\$is_claimed\s*&&\s*\$has_pending_charge/);
+    });
+
+    test('B3 — pending charge label uses "💳 ชำระค่าซ่อม ฿X" + green', () => {
+        expect(CODE.assets).toMatch(/'💳 ชำระค่าซ่อม ฿'/);
+        // Below the "💳 ชำระค่าซ่อม ฿" assignment, the same branch sets the green color.
+        const block = CODE.assets.match(/'💳 ชำระค่าซ่อม ฿'[\s\S]{0,500}/);
+        expect(block).not.toBeNull();
+        expect(block[0]).toMatch(/'#16a34a'/);
+    });
+
+    test('B3 — "📦 ติดตามเคลม" demoted to overflow when has_pending_charge', () => {
+        // Overflow menu has a new conditional branch rendering 📦 ติดตามเคลม when has_pending_charge.
+        const overflowBlock = CODE.assets.match(/data-action="claim-track"[\s\S]{0,500}/);
+        expect(overflowBlock).not.toBeNull();
+        expect(overflowBlock[0]).toMatch(/📦 ติดตามเคลม/);
+    });
+
+    // B4 — Triple redundancy eliminated
+    test('B4 — banner copy collapsed to single sentence "แตะเพื่อชำระ"', () => {
+        expect(CODE.member).toMatch(/แตะเพื่อชำระ/);
+    });
+
+    test('B4 — banner is whole-clickable anchor (NOT button + separate CTA)', () => {
+        // Anchor wrap pattern — banner-title inside anchor, no separate banner-actions.
+        const ch = CODE.member.match(/dnc-sn-banner-charge-pending dnc-sn-banner-clickable[\s\S]{0,800}/);
+        expect(ch).not.toBeNull();
+        // Should NOT have a "ดูรายละเอียด" CTA block (redundancy eliminated).
+        expect(ch[0]).not.toMatch(/dnc-sn-banner-cta/);
+        // Should NOT have a "dnc-sn-banner-actions" wrapper.
+        expect(ch[0]).not.toMatch(/dnc-sn-banner-actions/);
+    });
+
+    test('B4 — inline card section does NOT render "ค่าซ่อม/ส่วนต่างที่รอชำระ" header (redundancy eliminated)', () => {
+        // The literal redundant header text from V.32.0 is gone from production code.
+        // Header strings in version-comments are stripped — CODE.assets is comment-free.
+        expect(CODE.assets).not.toMatch(/ค่าซ่อม\/ส่วนต่างที่รอชำระ/);
+    });
+
+    test('B4 — inline card section does NOT render "รอชำระ" status pill', () => {
+        // The literal `dnc-sn-asset-card-charge-status` pill class is removed.
+        // (CODE.assets strips comments — any remaining ref would be live code drift.)
+        expect(CODE.assets).not.toMatch(/dnc-sn-asset-card-charge-status['"]/);
+    });
+
+    test('B4 — compact 1-row layout container `.dnc-sn-asset-card-charge-compact` exists', () => {
+        expect(CODE.assets).toMatch(/dnc-sn-asset-card-charge-compact/);
+        // Pay button is rendered INSIDE compact container (right-aligned).
+        const block = CODE.assets.match(/dnc-sn-asset-card-charge-compact[\s\S]{0,800}/);
+        expect(block).not.toBeNull();
+        expect(block[0]).toMatch(/dnc-sn-asset-card-charge-pay-btn/);
+    });
+
+    // B5 — Anchor scroll highlight + 600ms modal delay + prefers-reduced-motion
+    test('B5 — `@keyframes dnc-pay-arrive` defined (2s glow)', () => {
+        expect(CODE.assets).toMatch(/@keyframes\s+dnc-pay-arrive/);
+    });
+
+    test('B5 — `.is-target` class applied via JS for 2s then removed', () => {
+        expect(CODE.assets).toMatch(/row\.classList\.add\(\s*'is-target'\s*\)/);
+        expect(CODE.assets).toMatch(/setTimeout\(\s*function\(\)\s*\{\s*row\.classList\.remove\(\s*'is-target'\s*\)/);
+    });
+
+    test('B5 — modal opens AFTER 600ms delay (auto-scroll highlight visible first)', () => {
+        // 600ms setTimeout wrapping dncDashOpenChargeModal call
+        const block = CODE.assets.match(/dnc:claim-pay-open[\s\S]{0,1500}/);
+        expect(block).not.toBeNull();
+        expect(block[0]).toMatch(/setTimeout\([\s\S]{0,200}dncDashOpenChargeModal[\s\S]{0,200}\}\s*,\s*600\s*\)/);
+    });
+
+    test('B5 — prefers-reduced-motion fallback renders solid border (no animation)', () => {
+        const block = CODE.assets.match(/@media\s*\(\s*prefers-reduced-motion:\s*reduce\s*\)[\s\S]{0,500}/);
+        expect(block).not.toBeNull();
+        // First match must contain is-target fallback rule
+        const isTargetMq = CODE.assets.match(/@media\s*\(\s*prefers-reduced-motion:\s*reduce\s*\)\s*\{\s*\.dnc-sn-asset-card-charge-row\.is-target\s*\{[\s\S]{0,300}\}/);
+        expect(isTargetMq).not.toBeNull();
+        expect(isTargetMq[0]).toMatch(/animation:\s*none/);
+        expect(isTargetMq[0]).toMatch(/border:/);
+    });
+
+    // S1 — Design Tokens migration (>=10 var(--dnc-*) refs in new CSS)
+    test('S1 — Assets List new charge/modal CSS migrated to var(--dnc-*) tokens', () => {
+        // Count distinct var(--dnc-*) refs across both surfaces
+        const assetsMatches = (CODE.assets.match(/var\(\s*--dnc-[a-z0-9-]+/g) || []).length;
+        expect(assetsMatches).toBeGreaterThanOrEqual(10);
+    });
+
+    test('S1 — danger/warning/info/green Design Tokens referenced (not raw hex)', () => {
+        // Specific tokens that must appear in new CSS surface.
+        expect(CODE.assets).toMatch(/--dnc-warning-amber-bg/);
+        expect(CODE.assets).toMatch(/--dnc-warning-amber/);
+        expect(CODE.assets).toMatch(/--dnc-brand-green/);
+        expect(CODE.assets).toMatch(/--dnc-info-blue-bg/);
+    });
+
+    // S2 — Mobile < 360px stack
+    test('S2 — `@media (max-width: 360px)` block stacks charge row vertically', () => {
+        const block = CODE.assets.match(/@media\s*\(\s*max-width:\s*360px\s*\)[\s\S]{0,600}/);
+        expect(block).not.toBeNull();
+        expect(block[0]).toMatch(/dnc-sn-asset-card-charge-compact/);
+        expect(block[0]).toMatch(/flex-direction:\s*column/);
+    });
+
+    // S3 — Slip input min-height 44px (iOS HIG)
+    test('S3 — `.dnc-dash-pay-slip-input` has min-height: 44px', () => {
+        const block = CODE.assets.match(/\.dnc-dash-pay-slip-input\s*\{[\s\S]{0,500}\}/);
+        expect(block).not.toBeNull();
+        expect(block[0]).toMatch(/min-height:\s*44px/);
+    });
+
+    // S4 — Banner priority dynamic (expiry < 7d wins)
+    test('S4 — banner priority dynamic: expiry < 7d wins over charge_pending', () => {
+        // Helper variable + comment marker
+        expect(CODE.member).toMatch(/\$_expiry_critical\s*=\s*false/);
+        expect(CODE.member).toMatch(/_expiry_window_days\s*=\s*7/);
+        // Two branches of $ordered = array_filter(...) exist
+        const branches = (CODE.member.match(/\$ordered\s*=\s*array_filter\(\s*array\(/g) || []).length;
+        expect(branches).toBeGreaterThanOrEqual(2);
+    });
+
+    // S5 — Card density expander
+    test('S5 — expander button "ดูทั้งหมด N รายการ" when charges > 1', () => {
+        expect(CODE.assets).toMatch(/dnc-sn-asset-card-charges-expander/);
+        expect(CODE.assets).toMatch(/data-action="toggle-charge-expander"/);
+        expect(CODE.assets).toMatch(/ดูทั้งหมด/);
+    });
+
+    test('S5 — hidden rows class `.dnc-sn-asset-card-charge-row--hidden` toggled by expander', () => {
+        expect(CODE.assets).toMatch(/dnc-sn-asset-card-charge-row--hidden/);
+        // JS handler toggles hidden class on row + aria-expanded on button
+        const handler = CODE.assets.match(/toggle-charge-expander[\s\S]{0,800}/);
+        expect(handler).not.toBeNull();
+        expect(handler[0]).toMatch(/aria-expanded/);
+    });
+
+    // S6 — Banner role=alert + aria-live
+    test('S6 — charge_pending banner has role="alert" + aria-live="polite"', () => {
+        const ch = CODE.member.match(/dnc-sn-banner-charge-pending[\s\S]{0,500}/);
+        expect(ch).not.toBeNull();
+        expect(ch[0]).toMatch(/role="alert"/);
+        expect(ch[0]).toMatch(/aria-live="polite"/);
+    });
+
+    // S7 — Modal double-submit guard + spinner
+    test('S7 — submit button references by ID (not ev.target — fragile)', () => {
+        expect(CODE.assets).toMatch(/document\.getElementById\(\s*'dnc-dash-pay-submit-'\s*\+\s*chargeId\s*\)/);
+    });
+
+    test('S7 — submit button disabled + spinner during upload + re-enabled on error', () => {
+        // Disabled toggle in submit handler
+        expect(CODE.assets).toMatch(/submitBtn\.disabled\s*=\s*true/);
+        expect(CODE.assets).toMatch(/dnc-dash-pay-spinner/);
+        // Re-enable in error paths (xhr 4xx + onerror + JSON parse fail)
+        const reEnableCount = (CODE.assets.match(/submitBtn\.disabled\s*=\s*false/g) || []).length;
+        expect(reEnableCount).toBeGreaterThanOrEqual(2);
+    });
+
+    test('S7 — spinner element + @keyframes dnc-dash-spin defined', () => {
+        expect(CODE.assets).toMatch(/\.dnc-dash-pay-spinner\s*\{/);
+        expect(CODE.assets).toMatch(/@keyframes\s+dnc-dash-spin/);
+    });
+
+    // REG-029 — feature flag OFF preserves byte-identical V.32.0 behavior on backend.
+    test('REG-029 — both surfaces still gate on `dinoco_claim_payment_enabled` (flag OFF = byte-identical)', () => {
+        expect(CODE.assets).toMatch(/get_option\(\s*'dinoco_claim_payment_enabled'/);
+        expect(CODE.member).toMatch(/get_option\(\s*'dinoco_claim_payment_enabled'/);
     });
 });
