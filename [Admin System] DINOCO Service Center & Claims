@@ -1,6 +1,57 @@
 /*
  * Plugin Name: [Module] DINOCO Service Center & Claims
  * Description: ระบบบริหารจัดการงานเคลม
+ * Version: V.33.0 (2026-05-13) — Sprint 9 Phase 1 Task 1.9: Claim Bank Settings.
+ *   FOUNDATION for separated claim bank (boss directive 2026-05-13 — claim charges
+ *   use a different bank account from B2B orders). Self-contained additive module
+ *   appended at end of snippet (no edits to existing claim flow → REG-029 byte-
+ *   identical no-op when admin doesn't open the Settings UI).
+ *
+ *   What ships in V.33.0 (Phase 1 foundation only — Phase 2 wires charge handler):
+ *     • Helper `dinoco_claim_bank_resolve($use_walkin = false)` — 3-tier resolver
+ *       (wp_options → constants → sentinel error array).
+ *     • Helper `dinoco_claim_bank_code_whitelist()` — canonical Slip2Go codes
+ *       (mirrors B2F Snippet 1 line 3288 en_map).
+ *     • Helper `dinoco_claim_bank_validate($payload, $bucket)` — server-side
+ *       validation (regex bank_account / whitelist bank_code / https-only logo /
+ *       max-length bank_holder + bank_name).
+ *     • Helper `dinoco_claim_bank_field_keys($bucket)` — returns 7 wp_option keys
+ *       per bucket (default / walkin).
+ *     • Shortcode `[dinoco_claim_bank_settings]` — admin-only settings form
+ *       (manage_options gate). Mobile-first 1-col / 2-col @≥768px. Touch ≥44px.
+ *       Thai labels, scoped CSS `.dnc-cb-*`. Reuses Modal Helpers via `_scCfm` /
+ *       `_scAlert` defined above (UX-C2 pattern). Renders default bucket +
+ *       optional walk-in bucket (auto-collapsed when "ใช้บัญชีเดียวกับบัญชีหลัก"
+ *       checkbox stays checked — default behavior).
+ *     • 3 REST endpoints under `/wp-json/dinoco-claim/v1/`:
+ *         - GET  /bank-settings           — read current resolver state (no PII)
+ *         - POST /bank-settings           — save + dual-channel audit + idempotent
+ *         - POST /bank-settings/test      — Flex preview only (NO push, NO charge)
+ *       All gated `current_user_can('manage_options')` + `X-WP-Nonce` (wp_rest).
+ *     • One-time migration `admin_init` — if `DINOCO_CLAIM_BANK_*` constant defined
+ *       AND matching wp_option empty → seed wp_option (idempotent via flag
+ *       `dinoco_claim_bank_seeded_from_constants`).
+ *     • Dual-channel audit on every save:
+ *         Channel 1 — `dinoco_audit_log(['event_type'=>'claim_bank_settings_changed', …])`
+ *                     from Audit Log [#1187] — primary forensic row with full diff.
+ *         Channel 2 — `dinoco_flag_audit_log($key, $old, $new, $reason, $source)` per
+ *                     changed wp_option key from Flag Audit Log [#1193] — mirrors
+ *                     wp_options state for Flag Audit Viewer UI.
+ *       Both function_exists guarded — silent skip if helper snippet not synced.
+ *     • Module Registry self-registration (key=claim_bank, section=system).
+ *
+ *   What does NOT ship in V.33.0 (Phase 2 work — out of Sprint 9 scope per spec):
+ *     ✗ `wp_dinoco_claim_charges` table schema
+ *     ✗ Charge create handler / immutability snapshot at INSERT
+ *     ✗ `ClaimBankImmutabilityRaceTest` PHPUnit
+ *     ✗ Slip2Go `dinoco_verify_slip_for_claim()` wrapper
+ *     ✗ B2B Snippet 1 `b2b_get_bank_info($context='claim')` extension
+ *     ✗ Customer LIFF Payment shortcode
+ *
+ *   Phase 1 status after Sprint 9: ALL Phase 1 technical tasks done. Only the
+ *   master flag flip remains (`dinoco_claim_notif_enabled=1` + manual QA + boss
+ *   bank info data entry via this new Settings UI).
+ *
  * Version: V.32.0 (2026-05-13) — Sprint 8 Phase 1 Task 1.5: Claim Notifications Log UI.
  *   NEW section in claim manage modal (after Admin Internal Note card) — table showing
  *   LINE Flex delivery audit trail (timestamp / status slug / success badge / error /
@@ -4886,5 +4937,888 @@ add_action( 'init', function() {
         'capability'  => 'dinoco_sn_view_pii',
         'order'       => 10,
         'source'      => '[Admin System] DINOCO Service Center & Claims V.31.2',
+    ) );
+}, 30 );
+
+// ════════════════════════════════════════════════════════════════════════════
+// V.33.0 — CLAIM BANK SETTINGS (Sprint 9 Phase 1 Task 1.9 Foundation)
+//
+// Spec: FEATURE-SPEC-CLAIM-LIFECYCLE-2026-05-13.md §6.4 V.2.3
+//
+// PURPOSE
+//   Boss directive 2026-05-13: claim charges use a DIFFERENT bank account from
+//   B2B orders. Phase 1 = foundation only (admin can configure + resolver wired
+//   for Phase 2 charge creation to call). NO existing claim flow touched →
+//   REG-029-style byte-identical no-op when admin never opens [#dinoco_claim_bank_settings].
+//
+// CROSS-SNIPPET REFERENCES (all function_exists guarded)
+//   - dinoco_audit_log([])            from [Admin System] DINOCO Audit Log [#1187]
+//   - dinoco_flag_audit_log(...)      from [Admin System] DINOCO Flag Audit Log [#1193]
+//   - dinoco_register_admin_module()  from [Admin System] DINOCO Module Registry
+//   - dinoco_obs_capture(...)         from [Admin System] DINOCO Observability
+//
+// Section ownership: each helper has its own `if ( ! function_exists(...) )`
+// guard so duplicate sync from staging won't fatal-redeclare. Mirrors the
+// SC Quick Lookup section pattern above.
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Slip2Go canonical bank code whitelist.
+ *
+ * Mirrors B2F Snippet 1 line ~3288 `en_map` (single source of truth — when
+ * Slip2Go adds a bank code, update there first then sync here).
+ *
+ * @return array<string,string> code → English name (e.g. '004' => 'KBANK')
+ */
+if ( ! function_exists( 'dinoco_claim_bank_code_whitelist' ) ) {
+    function dinoco_claim_bank_code_whitelist() {
+        return array(
+            '002' => 'Bangkok Bank',
+            '004' => 'KBANK',
+            '006' => 'Krungthai Bank',
+            '011' => 'TMBThanachart',
+            '014' => 'SCB',
+            '025' => 'CIMB Thai',
+            '030' => 'Government Savings Bank',
+            '069' => 'Kiatnakin Phatra Bank',
+            '073' => 'LH Bank',
+        );
+    }
+}
+
+/**
+ * Return 7 wp_option keys + corresponding constant names for a bucket.
+ *
+ * @param string $bucket  'default' or 'walkin'
+ * @return array{options:array<string,string>, constants:array<string,string>}
+ */
+if ( ! function_exists( 'dinoco_claim_bank_field_keys' ) ) {
+    function dinoco_claim_bank_field_keys( $bucket = 'default' ) {
+        $bucket = ( $bucket === 'walkin' ) ? 'walkin' : 'default';
+        $opt_prefix   = ( $bucket === 'walkin' )
+            ? 'dinoco_claim_walkin_bank_'
+            : 'dinoco_claim_bank_';
+        $const_prefix = ( $bucket === 'walkin' )
+            ? 'DINOCO_CLAIM_WALKIN_BANK_'
+            : 'DINOCO_CLAIM_BANK_';
+
+        $fields = array( 'name', 'name_en', 'account', 'holder', 'code', 'branch', 'logo_url' );
+        $options = array();
+        $constants = array();
+        foreach ( $fields as $f ) {
+            $options[ $f ]   = $opt_prefix . $f;
+            $constants[ $f ] = $const_prefix . strtoupper( $f );
+        }
+        return array(
+            'options'   => $options,
+            'constants' => $constants,
+        );
+    }
+}
+
+/**
+ * 3-tier resolver per spec §6.4:
+ *   Tier 1: wp_options (admin-editable, highest priority)
+ *   Tier 2: WP constants (wp-config.php fallback)
+ *   Tier 3: Sentinel error array
+ *
+ * @param bool $use_walkin  When true, read walk-in bucket; falls back to default
+ *                          if walk-in not configured (per spec — checkbox UX).
+ * @return array {
+ *   bank_name, bank_name_en, bank_account, bank_holder, bank_code, bank_branch,
+ *   bank_logo_url, bucket, source, ?error
+ * }
+ */
+if ( ! function_exists( 'dinoco_claim_bank_resolve' ) ) {
+    function dinoco_claim_bank_resolve( $use_walkin = false ) {
+        $bucket   = $use_walkin ? 'walkin' : 'default';
+        $resolved = dinoco_claim_bank_read_bucket( $bucket );
+
+        // Walk-in fallback to default if walk-in bucket empty (admin opted to
+        // share default bank — checkbox in Settings UI leaves walkin opts empty).
+        if ( $use_walkin && ! empty( $resolved['error'] ) ) {
+            $fallback = dinoco_claim_bank_read_bucket( 'default' );
+            if ( empty( $fallback['error'] ) ) {
+                $fallback['bucket'] = 'walkin_via_default';
+                return $fallback;
+            }
+        }
+
+        return $resolved;
+    }
+}
+
+/**
+ * Internal — read a single bucket (default or walkin) using 3-tier priority.
+ * Public callers should use dinoco_claim_bank_resolve() which adds the
+ * walk-in-to-default fallback chain.
+ */
+if ( ! function_exists( 'dinoco_claim_bank_read_bucket' ) ) {
+    function dinoco_claim_bank_read_bucket( $bucket ) {
+        $keys = dinoco_claim_bank_field_keys( $bucket );
+        $out = array(
+            'bank_name'     => '',
+            'bank_name_en'  => '',
+            'bank_account'  => '',
+            'bank_holder'   => '',
+            'bank_code'     => '',
+            'bank_branch'   => '',
+            'bank_logo_url' => '',
+            'bucket'        => $bucket,
+            'source'        => 'sentinel',
+        );
+
+        // Tier 1 — wp_options
+        $opt_values = array();
+        $any_opt_set = false;
+        foreach ( $keys['options'] as $field => $opt_key ) {
+            $v = get_option( $opt_key, '' );
+            $opt_values[ $field ] = is_string( $v ) ? trim( $v ) : '';
+            if ( $opt_values[ $field ] !== '' ) $any_opt_set = true;
+        }
+
+        // Tier 2 — constants (only when wp_options entirely empty for this bucket)
+        $const_values = array();
+        $any_const_set = false;
+        if ( ! $any_opt_set ) {
+            foreach ( $keys['constants'] as $field => $const_name ) {
+                $v = defined( $const_name ) ? constant( $const_name ) : '';
+                $const_values[ $field ] = is_string( $v ) ? trim( $v ) : '';
+                if ( $const_values[ $field ] !== '' ) $any_const_set = true;
+            }
+        }
+
+        $required = array( 'name', 'account', 'holder', 'code' );
+
+        if ( $any_opt_set ) {
+            // Validate required fields present
+            $missing = array();
+            foreach ( $required as $f ) {
+                if ( $opt_values[ $f ] === '' ) $missing[] = $f;
+            }
+            $out['bank_name']     = $opt_values['name'];
+            $out['bank_name_en']  = $opt_values['name_en'];
+            $out['bank_account']  = $opt_values['account'];
+            $out['bank_holder']   = $opt_values['holder'];
+            $out['bank_code']     = $opt_values['code'];
+            $out['bank_branch']   = $opt_values['branch'];
+            $out['bank_logo_url'] = $opt_values['logo_url'];
+            $out['source']        = 'wp_options';
+            if ( ! empty( $missing ) ) {
+                $out['error']           = 'incomplete_bank_settings';
+                $out['missing_fields']  = $missing;
+            }
+            // Auto-fill bank_name_en from whitelist if empty
+            if ( $out['bank_name_en'] === '' ) {
+                $wl = dinoco_claim_bank_code_whitelist();
+                if ( isset( $wl[ $out['bank_code'] ] ) ) {
+                    $out['bank_name_en'] = $wl[ $out['bank_code'] ];
+                }
+            }
+            return $out;
+        }
+
+        if ( $any_const_set ) {
+            $missing = array();
+            foreach ( $required as $f ) {
+                if ( ! isset( $const_values[ $f ] ) || $const_values[ $f ] === '' ) {
+                    $missing[] = $f;
+                }
+            }
+            $out['bank_name']     = isset( $const_values['name'] ) ? $const_values['name'] : '';
+            $out['bank_name_en']  = isset( $const_values['name_en'] ) ? $const_values['name_en'] : '';
+            $out['bank_account']  = isset( $const_values['account'] ) ? $const_values['account'] : '';
+            $out['bank_holder']   = isset( $const_values['holder'] ) ? $const_values['holder'] : '';
+            $out['bank_code']     = isset( $const_values['code'] ) ? $const_values['code'] : '';
+            $out['bank_branch']   = isset( $const_values['branch'] ) ? $const_values['branch'] : '';
+            $out['bank_logo_url'] = isset( $const_values['logo_url'] ) ? $const_values['logo_url'] : '';
+            $out['source']        = 'constants';
+            if ( ! empty( $missing ) ) {
+                $out['error']          = 'incomplete_bank_settings';
+                $out['missing_fields'] = $missing;
+            }
+            if ( $out['bank_name_en'] === '' ) {
+                $wl = dinoco_claim_bank_code_whitelist();
+                if ( isset( $wl[ $out['bank_code'] ] ) ) {
+                    $out['bank_name_en'] = $wl[ $out['bank_code'] ];
+                }
+            }
+            return $out;
+        }
+
+        // Tier 3 — sentinel
+        $out['error']     = 'no_claim_bank_configured';
+        $out['bank_name'] = 'ไม่ได้ตั้งค่า';
+        return $out;
+    }
+}
+
+/**
+ * Server-side validation per spec §6.4 Validation Rules.
+ *
+ * @param array  $payload  Raw POST body (associative array)
+ * @param string $bucket   'default' or 'walkin' (logs which bucket the err refers to)
+ * @return array{ok:bool, errors:array<string,string>, sanitized:array}
+ */
+if ( ! function_exists( 'dinoco_claim_bank_validate' ) ) {
+    function dinoco_claim_bank_validate( $payload, $bucket = 'default' ) {
+        $errors = array();
+        $clean  = array();
+
+        $name = isset( $payload['bank_name'] ) ? trim( (string) $payload['bank_name'] ) : '';
+        if ( $name === '' ) {
+            $errors['bank_name'] = 'ต้องระบุชื่อธนาคาร';
+        } elseif ( mb_strlen( $name ) > 64 ) {
+            $errors['bank_name'] = 'ชื่อธนาคารเกิน 64 ตัวอักษร';
+        }
+        $clean['bank_name'] = sanitize_text_field( $name );
+
+        $name_en = isset( $payload['bank_name_en'] ) ? trim( (string) $payload['bank_name_en'] ) : '';
+        if ( mb_strlen( $name_en ) > 64 ) {
+            $errors['bank_name_en'] = 'ชื่อภาษาอังกฤษเกิน 64 ตัวอักษร';
+        }
+        $clean['bank_name_en'] = sanitize_text_field( $name_en );
+
+        $account = isset( $payload['bank_account'] ) ? trim( (string) $payload['bank_account'] ) : '';
+        if ( $account === '' ) {
+            $errors['bank_account'] = 'ต้องระบุเลขบัญชี';
+        } elseif ( ! preg_match( '/^[0-9-]{8,20}$/', $account ) ) {
+            $errors['bank_account'] = 'รูปแบบเลขบัญชีไม่ถูกต้อง (ต้องเป็นตัวเลข/ขีดกลาง 8-20 ตัว)';
+        }
+        $clean['bank_account'] = sanitize_text_field( $account );
+
+        $holder = isset( $payload['bank_holder'] ) ? trim( (string) $payload['bank_holder'] ) : '';
+        if ( $holder === '' ) {
+            $errors['bank_holder'] = 'ต้องระบุชื่อบัญชี';
+        } elseif ( mb_strlen( $holder ) > 128 ) {
+            $errors['bank_holder'] = 'ชื่อบัญชีเกิน 128 ตัวอักษร';
+        }
+        $clean['bank_holder'] = sanitize_text_field( $holder );
+
+        $code = isset( $payload['bank_code'] ) ? trim( (string) $payload['bank_code'] ) : '';
+        $wl   = dinoco_claim_bank_code_whitelist();
+        if ( $code === '' ) {
+            $errors['bank_code'] = 'ต้องระบุรหัสธนาคาร';
+        } elseif ( ! isset( $wl[ $code ] ) ) {
+            $errors['bank_code'] = 'รหัสธนาคารไม่ถูกต้อง (ต้องเป็น Slip2Go canonical code)';
+        }
+        $clean['bank_code'] = sanitize_text_field( $code );
+
+        $branch = isset( $payload['bank_branch'] ) ? trim( (string) $payload['bank_branch'] ) : '';
+        if ( mb_strlen( $branch ) > 128 ) {
+            $errors['bank_branch'] = 'ชื่อสาขาเกิน 128 ตัวอักษร';
+        }
+        $clean['bank_branch'] = sanitize_text_field( $branch );
+
+        $logo = isset( $payload['bank_logo_url'] ) ? trim( (string) $payload['bank_logo_url'] ) : '';
+        if ( $logo !== '' ) {
+            // Must be https:// only (no http, no other schemes)
+            if ( ! preg_match( '#^https://#i', $logo ) ) {
+                $errors['bank_logo_url'] = 'URL โลโก้ต้องขึ้นต้นด้วย https:// เท่านั้น';
+            } elseif ( ! filter_var( $logo, FILTER_VALIDATE_URL ) ) {
+                $errors['bank_logo_url'] = 'URL โลโก้ไม่ถูกต้อง';
+            } elseif ( mb_strlen( $logo ) > 500 ) {
+                $errors['bank_logo_url'] = 'URL โลโก้ยาวเกิน 500 ตัวอักษร';
+            }
+        }
+        $clean['bank_logo_url'] = esc_url_raw( $logo );
+
+        return array(
+            'ok'        => empty( $errors ),
+            'errors'    => $errors,
+            'sanitized' => $clean,
+            'bucket'    => $bucket,
+        );
+    }
+}
+
+/**
+ * One-time migration: seed wp_options from constants if defined and wp_options
+ * empty. Idempotent via flag `dinoco_claim_bank_seeded_from_constants` — won't
+ * re-seed on subsequent admin_init runs.
+ */
+if ( ! function_exists( 'dinoco_claim_bank_maybe_migrate_constants' ) ) {
+    function dinoco_claim_bank_maybe_migrate_constants() {
+        if ( get_option( 'dinoco_claim_bank_seeded_from_constants', '' ) === '1' ) {
+            return; // already ran
+        }
+        $touched = 0;
+        foreach ( array( 'default', 'walkin' ) as $bucket ) {
+            $keys = dinoco_claim_bank_field_keys( $bucket );
+            foreach ( $keys['options'] as $field => $opt_key ) {
+                $const_name = $keys['constants'][ $field ];
+                if ( ! defined( $const_name ) ) continue;
+                $current = get_option( $opt_key, '' );
+                if ( $current !== '' && $current !== false ) continue;
+                $val = constant( $const_name );
+                if ( ! is_string( $val ) || trim( $val ) === '' ) continue;
+                update_option( $opt_key, sanitize_text_field( $val ), false );
+                $touched++;
+            }
+        }
+        update_option( 'dinoco_claim_bank_seeded_from_constants', '1', true );
+        if ( $touched > 0 && function_exists( 'dinoco_audit_log' ) ) {
+            dinoco_audit_log( array(
+                'event_type'  => 'claim_bank_seeded_from_constants',
+                'actor_type'  => 'system',
+                'target_type' => 'wp_option',
+                'context'     => array( 'fields_seeded' => $touched ),
+            ) );
+        }
+    }
+}
+add_action( 'admin_init', 'dinoco_claim_bank_maybe_migrate_constants' );
+
+/**
+ * Dual-channel audit log for save events.
+ *
+ * Channel 1 = dinoco_audit_log() — primary forensic row with full diff (1 row)
+ * Channel 2 = dinoco_flag_audit_log() — per-key state transition (1 row per changed field)
+ *
+ * @param array $diff   array<wp_option_key, ['before'=>x, 'after'=>y]>
+ * @param string $bucket 'default' or 'walkin'
+ */
+if ( ! function_exists( 'dinoco_claim_bank_audit_save' ) ) {
+    function dinoco_claim_bank_audit_save( $diff, $bucket = 'default' ) {
+        if ( empty( $diff ) ) return;
+
+        // Channel 1 — primary forensic row
+        if ( function_exists( 'dinoco_audit_log' ) ) {
+            dinoco_audit_log( array(
+                'event_type' => 'claim_bank_settings_changed',
+                'context'    => array(
+                    'bucket' => $bucket,
+                    'diff'   => $diff,
+                    'source' => 'claim_bank_settings_admin_ui',
+                ),
+            ) );
+        } else {
+            error_log( '[ClaimBank] dinoco_audit_log unavailable — skipped Channel 1 forensic row' );
+        }
+
+        // Channel 2 — per-key mirror (drives Flag Audit Viewer UI)
+        if ( function_exists( 'dinoco_flag_audit_log' ) ) {
+            foreach ( $diff as $opt_key => $delta ) {
+                dinoco_flag_audit_log(
+                    $opt_key,
+                    isset( $delta['before'] ) ? $delta['before'] : '',
+                    isset( $delta['after'] )  ? $delta['after']  : '',
+                    'claim_bank_settings_save',
+                    'admin_ui'
+                );
+            }
+        }
+    }
+}
+
+/**
+ * Build the Flex preview payload (no LINE push — sandbox preview only).
+ * Used by `/bank-settings/test` endpoint so admin can verify the bank info
+ * renders correctly before going live.
+ *
+ * @param array $bank Resolver output
+ * @return array Flex bubble JSON
+ */
+if ( ! function_exists( 'dinoco_claim_bank_build_preview_flex' ) ) {
+    function dinoco_claim_bank_build_preview_flex( $bank ) {
+        return array(
+            'type' => 'bubble',
+            'header' => array(
+                'type' => 'box', 'layout' => 'vertical',
+                'backgroundColor' => '#1f2937', 'paddingAll' => '12px',
+                'contents' => array(
+                    array( 'type' => 'text', 'text' => '💰 ตัวอย่างใบเรียกเก็บค่าเคลม',
+                           'color' => '#ffffff', 'weight' => 'bold', 'size' => 'md' ),
+                ),
+            ),
+            'body' => array(
+                'type' => 'box', 'layout' => 'vertical', 'spacing' => 'sm',
+                'contents' => array(
+                    array( 'type' => 'text', 'text' => 'โอนเข้าบัญชี:', 'size' => 'xs', 'color' => '#6b7280' ),
+                    array( 'type' => 'text', 'text' => isset( $bank['bank_name'] ) ? $bank['bank_name'] : '—',
+                           'weight' => 'bold', 'size' => 'sm', 'wrap' => true ),
+                    array( 'type' => 'text', 'text' => isset( $bank['bank_account'] ) ? $bank['bank_account'] : '—',
+                           'size' => 'lg', 'weight' => 'bold', 'color' => '#1f2937' ),
+                    array( 'type' => 'text', 'text' => 'ชื่อบัญชี: ' . ( isset( $bank['bank_holder'] ) ? $bank['bank_holder'] : '—' ),
+                           'size' => 'xs', 'color' => '#374151', 'wrap' => true ),
+                    array( 'type' => 'text', 'text' => 'รหัส Slip2Go: ' . ( isset( $bank['bank_code'] ) ? $bank['bank_code'] : '—' ),
+                           'size' => 'xxs', 'color' => '#6b7280' ),
+                ),
+            ),
+            'footer' => array(
+                'type' => 'box', 'layout' => 'vertical',
+                'contents' => array(
+                    array( 'type' => 'text', 'text' => '⚠️ Preview — ไม่ได้ส่งจริง', 'size' => 'xxs',
+                           'color' => '#dc2626', 'align' => 'center' ),
+                ),
+            ),
+        );
+    }
+}
+
+// ─── REST API endpoints ──────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_claim_bank_register_rest' ) ) {
+    function dinoco_claim_bank_register_rest() {
+        $perm = function() {
+            return current_user_can( 'manage_options' );
+        };
+
+        register_rest_route( 'dinoco-claim/v1', '/bank-settings', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_claim_bank_rest_get',
+            'permission_callback' => $perm,
+        ) );
+
+        register_rest_route( 'dinoco-claim/v1', '/bank-settings', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_claim_bank_rest_save',
+            'permission_callback' => $perm,
+        ) );
+
+        register_rest_route( 'dinoco-claim/v1', '/bank-settings/test', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_claim_bank_rest_test',
+            'permission_callback' => $perm,
+        ) );
+    }
+}
+add_action( 'rest_api_init', 'dinoco_claim_bank_register_rest' );
+
+if ( ! function_exists( 'dinoco_claim_bank_rest_get' ) ) {
+    function dinoco_claim_bank_rest_get( $req ) {
+        $default = dinoco_claim_bank_resolve( false );
+        $walkin  = dinoco_claim_bank_resolve( true );
+        // Strip walkin_via_default fallback indicator for raw GET — admin wants to
+        // see whether walk-in is explicitly configured or empty.
+        $walkin_raw = dinoco_claim_bank_read_bucket( 'walkin' );
+
+        return rest_ensure_response( array(
+            'default'         => $default,
+            'walkin'          => $walkin_raw,
+            'walkin_effective' => $walkin, // walk-in with default-fallback applied
+            'whitelist'       => dinoco_claim_bank_code_whitelist(),
+            'seeded_flag'     => get_option( 'dinoco_claim_bank_seeded_from_constants', '0' ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_bank_rest_save' ) ) {
+    function dinoco_claim_bank_rest_save( $req ) {
+        $body = $req->get_json_params();
+        if ( ! is_array( $body ) ) $body = $req->get_params();
+
+        $bucket = isset( $body['bucket'] ) && $body['bucket'] === 'walkin'
+            ? 'walkin' : 'default';
+        $payload = isset( $body['payload'] ) && is_array( $body['payload'] )
+            ? $body['payload'] : array();
+
+        $validation = dinoco_claim_bank_validate( $payload, $bucket );
+        if ( ! $validation['ok'] ) {
+            return new WP_Error(
+                'claim_bank_validation_failed',
+                'ข้อมูลธนาคารไม่ถูกต้อง',
+                array( 'status' => 422, 'errors' => $validation['errors'] )
+            );
+        }
+
+        $keys = dinoco_claim_bank_field_keys( $bucket );
+        $diff = array();
+        foreach ( array( 'name', 'name_en', 'account', 'holder', 'code', 'branch', 'logo_url' ) as $field ) {
+            $opt_key  = $keys['options'][ $field ];
+            $before   = (string) get_option( $opt_key, '' );
+            $after_k  = ( $field === 'logo_url' ) ? 'bank_logo_url' : 'bank_' . $field;
+            $after    = isset( $validation['sanitized'][ $after_k ] )
+                ? (string) $validation['sanitized'][ $after_k ] : '';
+            if ( $before !== $after ) {
+                update_option( $opt_key, $after, false );
+                $diff[ $opt_key ] = array( 'before' => $before, 'after' => $after );
+            }
+        }
+
+        if ( ! empty( $diff ) ) {
+            dinoco_claim_bank_audit_save( $diff, $bucket );
+        }
+
+        return rest_ensure_response( array(
+            'saved'        => true,
+            'bucket'       => $bucket,
+            'changed_keys' => array_keys( $diff ),
+            'change_count' => count( $diff ),
+            'resolver'     => dinoco_claim_bank_resolve( $bucket === 'walkin' ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_bank_rest_test' ) ) {
+    function dinoco_claim_bank_rest_test( $req ) {
+        $body = $req->get_json_params();
+        if ( ! is_array( $body ) ) $body = $req->get_params();
+        $use_walkin = ! empty( $body['use_walkin'] );
+
+        $bank = dinoco_claim_bank_resolve( $use_walkin );
+        if ( ! empty( $bank['error'] ) ) {
+            return new WP_Error(
+                'no_claim_bank_configured',
+                'ยังไม่ได้ตั้งค่าบัญชีรับเงินสำหรับเคลม — กรุณาตั้งค่าก่อนทดสอบ',
+                array( 'status' => 422 )
+            );
+        }
+
+        // PREVIEW ONLY — no LINE push, no DB row, no charge created.
+        // Phase 2 will add real test charge with amount=1 THB via separate endpoint.
+        $flex = dinoco_claim_bank_build_preview_flex( $bank );
+
+        return rest_ensure_response( array(
+            'preview_only' => true,
+            'note'         => 'Phase 1 foundation — Flex rendered but NOT pushed. Phase 2 will add sandbox charge.',
+            'bank'         => $bank,
+            'flex'         => $flex,
+        ) );
+    }
+}
+
+// ─── Admin Settings shortcode ────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_claim_bank_settings_render' ) ) {
+    /**
+     * [dinoco_claim_bank_settings] shortcode — admin-only Settings form.
+     * Permission gate: manage_options. Renders fail-safe div for non-admin.
+     */
+    function dinoco_claim_bank_settings_render( $atts = array() ) {
+        if ( ! is_user_logged_in() ) {
+            $login_url = wp_login_url( get_permalink() ?: home_url( $_SERVER['REQUEST_URI'] ?? '/' ) );
+            return '<div class="dnc-cb-gate"><p>กรุณา <a href="' . esc_url( $login_url )
+                . '">เข้าสู่ระบบ</a> เพื่อตั้งค่าบัญชีรับเงิน</p></div>';
+        }
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<div class="dnc-cb-gate dnc-cb-denied"><p>⛔ คุณไม่มีสิทธิ์เข้าถึง '
+                . '(ต้องมี <code>manage_options</code>)</p></div>';
+        }
+
+        $default = dinoco_claim_bank_read_bucket( 'default' );
+        $walkin  = dinoco_claim_bank_read_bucket( 'walkin' );
+        $walkin_configured = empty( $walkin['error'] ) || (
+            isset( $walkin['bank_account'] ) && $walkin['bank_account'] !== ''
+        );
+        $whitelist = dinoco_claim_bank_code_whitelist();
+        $rest_url = rest_url( 'dinoco-claim/v1/bank-settings' );
+        $nonce    = wp_create_nonce( 'wp_rest' );
+
+        ob_start();
+        ?>
+        <div class="dnc-cb-root" data-rest="<?php echo esc_attr( $rest_url ); ?>" data-nonce="<?php echo esc_attr( $nonce ); ?>">
+            <header class="dnc-cb-header">
+                <h2>💰 ตั้งค่าบัญชีรับเงินสำหรับเคลม</h2>
+                <p class="dnc-cb-sub">(แยกจากบัญชี B2B ตามนโยบาย — boss directive 2026-05-13)</p>
+            </header>
+
+            <?php if ( ! empty( $default['error'] ) && $default['error'] === 'no_claim_bank_configured' ) : ?>
+                <div class="dnc-cb-banner dnc-cb-banner-warn" role="status">
+                    ⚠️ ยังไม่ได้ตั้งค่าบัญชีหลัก — กรุณากรอกข้อมูลด้านล่าง
+                </div>
+            <?php endif; ?>
+
+            <!-- Default bucket -->
+            <section class="dnc-cb-card" data-bucket="default" aria-labelledby="dnc-cb-default-title">
+                <h3 id="dnc-cb-default-title">🏦 บัญชีหลัก (Default)</h3>
+                <div class="dnc-cb-grid">
+                    <div class="dnc-cb-field">
+                        <label for="dnc-cb-d-name">ธนาคาร *</label>
+                        <input type="text" id="dnc-cb-d-name" name="bank_name" maxlength="64"
+                               value="<?php echo esc_attr( $default['bank_name'] ); ?>"
+                               placeholder="ธนาคารกสิกรไทย">
+                    </div>
+                    <div class="dnc-cb-field">
+                        <label for="dnc-cb-d-code">รหัสธนาคาร (Slip2Go) *</label>
+                        <select id="dnc-cb-d-code" name="bank_code">
+                            <option value="">— เลือก —</option>
+                            <?php foreach ( $whitelist as $code => $en ) : ?>
+                                <option value="<?php echo esc_attr( $code ); ?>"
+                                    <?php selected( $default['bank_code'], $code ); ?>>
+                                    <?php echo esc_html( $code . ' (' . $en . ')' ); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="dnc-cb-field">
+                        <label for="dnc-cb-d-account">เลขบัญชี *</label>
+                        <input type="text" id="dnc-cb-d-account" name="bank_account" maxlength="20"
+                               value="<?php echo esc_attr( $default['bank_account'] ); ?>"
+                               placeholder="123-4-56789-0" pattern="[0-9\-]{8,20}">
+                    </div>
+                    <div class="dnc-cb-field">
+                        <label for="dnc-cb-d-holder">ชื่อบัญชี *</label>
+                        <input type="text" id="dnc-cb-d-holder" name="bank_holder" maxlength="128"
+                               value="<?php echo esc_attr( $default['bank_holder'] ); ?>"
+                               placeholder="บริษัท DINOCO จำกัด">
+                    </div>
+                    <div class="dnc-cb-field">
+                        <label for="dnc-cb-d-name_en">ชื่อภาษาอังกฤษ (optional)</label>
+                        <input type="text" id="dnc-cb-d-name_en" name="bank_name_en" maxlength="64"
+                               value="<?php echo esc_attr( $default['bank_name_en'] ); ?>"
+                               placeholder="KASIKORNBANK">
+                    </div>
+                    <div class="dnc-cb-field">
+                        <label for="dnc-cb-d-branch">สาขา (optional)</label>
+                        <input type="text" id="dnc-cb-d-branch" name="bank_branch" maxlength="128"
+                               value="<?php echo esc_attr( $default['bank_branch'] ); ?>"
+                               placeholder="รามอินทรา 14">
+                    </div>
+                    <div class="dnc-cb-field dnc-cb-field-wide">
+                        <label for="dnc-cb-d-logo">Logo URL (optional — https only)</label>
+                        <input type="url" id="dnc-cb-d-logo" name="bank_logo_url" maxlength="500"
+                               value="<?php echo esc_attr( $default['bank_logo_url'] ); ?>"
+                               placeholder="https://...">
+                    </div>
+                </div>
+                <div class="dnc-cb-actions">
+                    <button type="button" class="dnc-cb-btn dnc-cb-btn-primary js-dnc-cb-save" data-bucket="default">
+                        💾 บันทึกบัญชีหลัก
+                    </button>
+                    <button type="button" class="dnc-cb-btn dnc-cb-btn-secondary js-dnc-cb-test" data-bucket="default">
+                        🧪 ทดสอบ Flex Preview
+                    </button>
+                </div>
+            </section>
+
+            <!-- Walkin bucket -->
+            <section class="dnc-cb-card" data-bucket="walkin" aria-labelledby="dnc-cb-walkin-title">
+                <h3 id="dnc-cb-walkin-title">🏪 บัญชี Walk-in (Optional)</h3>
+                <label class="dnc-cb-walkin-toggle">
+                    <input type="checkbox" id="dnc-cb-walkin-share" <?php checked( ! $walkin_configured ); ?>>
+                    <span>ใช้บัญชีเดียวกับบัญชีหลัก (default)</span>
+                </label>
+                <div class="dnc-cb-walkin-form" <?php echo $walkin_configured ? '' : 'hidden'; ?>>
+                    <div class="dnc-cb-grid">
+                        <div class="dnc-cb-field">
+                            <label for="dnc-cb-w-name">ธนาคาร *</label>
+                            <input type="text" id="dnc-cb-w-name" name="bank_name" maxlength="64"
+                                   value="<?php echo esc_attr( $walkin['bank_name'] ); ?>">
+                        </div>
+                        <div class="dnc-cb-field">
+                            <label for="dnc-cb-w-code">รหัสธนาคาร *</label>
+                            <select id="dnc-cb-w-code" name="bank_code">
+                                <option value="">— เลือก —</option>
+                                <?php foreach ( $whitelist as $code => $en ) : ?>
+                                    <option value="<?php echo esc_attr( $code ); ?>"
+                                        <?php selected( $walkin['bank_code'], $code ); ?>>
+                                        <?php echo esc_html( $code . ' (' . $en . ')' ); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div class="dnc-cb-field">
+                            <label for="dnc-cb-w-account">เลขบัญชี *</label>
+                            <input type="text" id="dnc-cb-w-account" name="bank_account" maxlength="20"
+                                   value="<?php echo esc_attr( $walkin['bank_account'] ); ?>" pattern="[0-9\-]{8,20}">
+                        </div>
+                        <div class="dnc-cb-field">
+                            <label for="dnc-cb-w-holder">ชื่อบัญชี *</label>
+                            <input type="text" id="dnc-cb-w-holder" name="bank_holder" maxlength="128"
+                                   value="<?php echo esc_attr( $walkin['bank_holder'] ); ?>">
+                        </div>
+                        <div class="dnc-cb-field">
+                            <label for="dnc-cb-w-name_en">ชื่อภาษาอังกฤษ</label>
+                            <input type="text" id="dnc-cb-w-name_en" name="bank_name_en" maxlength="64"
+                                   value="<?php echo esc_attr( $walkin['bank_name_en'] ); ?>">
+                        </div>
+                        <div class="dnc-cb-field">
+                            <label for="dnc-cb-w-branch">สาขา</label>
+                            <input type="text" id="dnc-cb-w-branch" name="bank_branch" maxlength="128"
+                                   value="<?php echo esc_attr( $walkin['bank_branch'] ); ?>">
+                        </div>
+                        <div class="dnc-cb-field dnc-cb-field-wide">
+                            <label for="dnc-cb-w-logo">Logo URL</label>
+                            <input type="url" id="dnc-cb-w-logo" name="bank_logo_url" maxlength="500"
+                                   value="<?php echo esc_attr( $walkin['bank_logo_url'] ); ?>">
+                        </div>
+                    </div>
+                    <div class="dnc-cb-actions">
+                        <button type="button" class="dnc-cb-btn dnc-cb-btn-primary js-dnc-cb-save" data-bucket="walkin">
+                            💾 บันทึกบัญชี Walk-in
+                        </button>
+                        <button type="button" class="dnc-cb-btn dnc-cb-btn-secondary js-dnc-cb-test" data-bucket="walkin">
+                            🧪 ทดสอบ Flex Preview
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <div id="dnc-cb-result" class="dnc-cb-result" aria-live="polite"></div>
+        </div>
+
+        <style>
+        .dnc-cb-root{max-width:920px;margin:20px auto;padding:0 12px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#1f2937}
+        .dnc-cb-header h2{font-size:22px;margin:0 0 4px;font-weight:700}
+        .dnc-cb-sub{color:#6b7280;font-size:13px;margin:0 0 16px}
+        .dnc-cb-gate{padding:24px;text-align:center;color:#6b7280;background:#f9fafb;border-radius:12px}
+        .dnc-cb-denied{color:#dc2626;background:#fef2f2}
+        .dnc-cb-banner{padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;font-weight:500}
+        .dnc-cb-banner-warn{background:#fef3c7;color:#92400e;border-left:4px solid #f59e0b}
+        .dnc-cb-card{background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+        .dnc-cb-card h3{margin:0 0 16px;font-size:17px;font-weight:600;color:#111827}
+        .dnc-cb-grid{display:grid;grid-template-columns:1fr;gap:14px}
+        @media (min-width:768px){.dnc-cb-grid{grid-template-columns:1fr 1fr}}
+        .dnc-cb-field-wide{grid-column:1/-1}
+        .dnc-cb-field label{display:block;font-size:13px;font-weight:600;color:#374151;margin-bottom:6px}
+        .dnc-cb-field input,.dnc-cb-field select{width:100%;min-height:44px;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;background:#fff;color:#1f2937;box-sizing:border-box}
+        .dnc-cb-field input:focus,.dnc-cb-field select:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+        .dnc-cb-walkin-toggle{display:flex;align-items:center;gap:8px;padding:8px 0;font-size:14px;color:#374151;cursor:pointer;min-height:44px}
+        .dnc-cb-walkin-toggle input{width:18px;height:18px;cursor:pointer}
+        .dnc-cb-walkin-form[hidden]{display:none}
+        .dnc-cb-actions{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap}
+        .dnc-cb-btn{min-height:44px;padding:10px 18px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:all .15s}
+        .dnc-cb-btn-primary{background:#10b981;color:#fff}
+        .dnc-cb-btn-primary:hover{background:#059669}
+        .dnc-cb-btn-secondary{background:#e5e7eb;color:#1f2937}
+        .dnc-cb-btn-secondary:hover{background:#d1d5db}
+        .dnc-cb-btn:disabled{opacity:.5;cursor:not-allowed}
+        .dnc-cb-result{margin-top:16px;font-size:13px}
+        .dnc-cb-result-ok{padding:10px 14px;background:#d1fae5;color:#065f46;border-radius:8px;margin-bottom:8px}
+        .dnc-cb-result-err{padding:10px 14px;background:#fee2e2;color:#991b1b;border-radius:8px;margin-bottom:8px}
+        .dnc-cb-result pre{background:#1f2937;color:#10b981;padding:12px;border-radius:8px;font-size:11px;max-height:300px;overflow:auto;margin:0}
+        </style>
+
+        <script>
+        (function(){
+            var root = document.querySelector('.dnc-cb-root');
+            if (!root) return;
+            var restUrl = root.getAttribute('data-rest');
+            var nonce = root.getAttribute('data-nonce');
+            var resultBox = root.querySelector('#dnc-cb-result');
+
+            // Modal helpers — reuse Service Center _scCfm/_scAlert pattern (UX-C2)
+            async function cbCfm(msg, opts){
+                opts = opts || {};
+                try { return await window.dinocoModal.confirm({
+                    title: opts.title || 'ยืนยัน', message: msg,
+                    confirmText: opts.confirmText || 'ตกลง', cancelText: 'ยกเลิก',
+                    danger: !!opts.danger
+                }); } catch(e){ return confirm(msg); }
+            }
+            async function cbAlert(msg, type){
+                try { await window.dinocoModal.alert({
+                    title: type==='error'?'เกิดข้อผิดพลาด':'แจ้งเตือน',
+                    message: msg, type: type||'info'
+                }); } catch(e){ alert(msg); }
+            }
+
+            function showResult(html, ok){
+                resultBox.innerHTML = '<div class="' + (ok ? 'dnc-cb-result-ok' : 'dnc-cb-result-err') + '">' + html + '</div>';
+            }
+
+            function collectPayload(bucket){
+                var prefix = bucket === 'walkin' ? '#dnc-cb-w-' : '#dnc-cb-d-';
+                return {
+                    bank_name:     (root.querySelector(prefix + 'name') || {}).value || '',
+                    bank_name_en:  (root.querySelector(prefix + 'name_en') || {}).value || '',
+                    bank_account:  (root.querySelector(prefix + 'account') || {}).value || '',
+                    bank_holder:   (root.querySelector(prefix + 'holder') || {}).value || '',
+                    bank_code:     (root.querySelector(prefix + 'code') || {}).value || '',
+                    bank_branch:   (root.querySelector(prefix + 'branch') || {}).value || '',
+                    bank_logo_url: (root.querySelector(prefix + 'logo') || {}).value || ''
+                };
+            }
+
+            async function saveBucket(bucket){
+                var ok = await cbCfm('ยืนยันการบันทึกบัญชี' + (bucket === 'walkin' ? ' Walk-in' : 'หลัก') + '?', {
+                    title: 'บันทึกบัญชี', confirmText: 'บันทึก'
+                });
+                if (!ok) return;
+
+                var payload = collectPayload(bucket);
+                try {
+                    var resp = await fetch(restUrl, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json', 'X-WP-Nonce': nonce},
+                        body: JSON.stringify({bucket: bucket, payload: payload})
+                    });
+                    var data = await resp.json();
+                    if (!resp.ok) {
+                        var errMsgs = [];
+                        if (data && data.data && data.data.errors) {
+                            for (var k in data.data.errors) errMsgs.push(k + ': ' + data.data.errors[k]);
+                        }
+                        showResult('บันทึกล้มเหลว — ' + (errMsgs.join(', ') || (data && data.message) || 'unknown'), false);
+                        return;
+                    }
+                    showResult('✅ บันทึกเรียบร้อย — เปลี่ยน ' + (data.change_count || 0) + ' ฟิลด์', true);
+                } catch (e) {
+                    showResult('Network error: ' + e.message, false);
+                }
+            }
+
+            async function testBucket(bucket){
+                try {
+                    var resp = await fetch(restUrl + '/test', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json', 'X-WP-Nonce': nonce},
+                        body: JSON.stringify({use_walkin: bucket === 'walkin'})
+                    });
+                    var data = await resp.json();
+                    if (!resp.ok) {
+                        showResult('ทดสอบล้มเหลว — ' + ((data && data.message) || 'unknown'), false);
+                        return;
+                    }
+                    showResult('🧪 Flex Preview (Phase 1 — ไม่ได้ส่งจริง):<br><pre>' +
+                        JSON.stringify(data.flex, null, 2).replace(/</g,'&lt;') + '</pre>', true);
+                } catch (e) {
+                    showResult('Network error: ' + e.message, false);
+                }
+            }
+
+            // Walk-in toggle — show/hide form
+            var walkinToggle = root.querySelector('#dnc-cb-walkin-share');
+            var walkinForm = root.querySelector('.dnc-cb-walkin-form');
+            if (walkinToggle && walkinForm) {
+                walkinToggle.addEventListener('change', function(){
+                    if (walkinToggle.checked) {
+                        walkinForm.setAttribute('hidden', '');
+                    } else {
+                        walkinForm.removeAttribute('hidden');
+                    }
+                });
+            }
+
+            // Event delegation — save + test buttons (covers both buckets)
+            root.addEventListener('click', function(ev){
+                var saveBtn = ev.target.closest('.js-dnc-cb-save');
+                var testBtn = ev.target.closest('.js-dnc-cb-test');
+                if (saveBtn) {
+                    ev.preventDefault();
+                    saveBucket(saveBtn.getAttribute('data-bucket') || 'default');
+                }
+                if (testBtn) {
+                    ev.preventDefault();
+                    testBucket(testBtn.getAttribute('data-bucket') || 'default');
+                }
+            });
+        })();
+        </script>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+if ( ! shortcode_exists( 'dinoco_claim_bank_settings' ) ) {
+    add_shortcode( 'dinoco_claim_bank_settings', 'dinoco_claim_bank_settings_render' );
+}
+
+// Module Registry self-registration (Pillar 1)
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_admin_module' ) ) return;
+    dinoco_register_admin_module( array(
+        'key'         => 'claim_bank',
+        'shortcode'   => 'dinoco_claim_bank_settings',
+        'label'       => '💰 บัญชีรับเงินเคลม',
+        'description' => 'ตั้งค่าบัญชีธนาคารสำหรับเรียกเก็บค่าเคลม (แยกจาก B2B)',
+        'section'     => 'system',
+        'icon'        => 'fa-university',
+        'color'       => '#10b981',
+        'cache_ttl'   => 0,           // settings page — always fresh
+        'capability'  => 'manage_options',
+        'order'       => 25,          // after งานเคลม (order=20), before SC Quick Lookup (order=10 — earlier order = higher priority)
+        'source'      => '[Admin System] DINOCO Service Center & Claims V.33.0',
     ) );
 }, 30 );

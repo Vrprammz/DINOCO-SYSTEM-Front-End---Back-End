@@ -3216,7 +3216,13 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
 
         test('Read-only — no POST endpoints called from this UI', () => {
             const code = readSc();
-            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            // Scope strictly to the render function body — bound to the next
+            // function-or-shortcode-registration boundary so unrelated sections
+            // appended below (e.g. V.33.0 Claim Bank Settings) don't pollute the
+            // POST-detection scan.
+            const after = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            const endIdx = after.search(/if\s*\(\s*!\s*shortcode_exists\(\s*'dinoco_sc_quick_lookup'/);
+            const renderBody = endIdx > 0 ? after.slice(0, endIdx) : after;
             const fetchBlocks = renderBody.match(/fetch\s*\([^)]+\)/g) || [];
             // Every fetch must be a GET (no method:'POST' inside fetch options)
             fetchBlocks.forEach((block) => {
@@ -3224,12 +3230,11 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             });
             // No mutation REST endpoints called via fetch (whole-word match,
             // ignores docs/footer hint text like "claim/swap/void/recall")
-            const sliceForRender = renderBody.split(/^if\s*\(\s*!\s*shortcode_exists/m)[0] || '';
             // Match REST_BASE + '/void' style fetch URL composition
-            expect(sliceForRender).not.toMatch(/REST_BASE\s*\+\s*['"]\/void/);
-            expect(sliceForRender).not.toMatch(/REST_BASE\s*\+\s*['"]\/swap/);
-            expect(sliceForRender).not.toMatch(/REST_BASE\s*\+\s*['"]\/recall/);
-            expect(sliceForRender).not.toMatch(/REST_BASE\s*\+\s*['"]\/activate/);
+            expect(renderBody).not.toMatch(/REST_BASE\s*\+\s*['"]\/void/);
+            expect(renderBody).not.toMatch(/REST_BASE\s*\+\s*['"]\/swap/);
+            expect(renderBody).not.toMatch(/REST_BASE\s*\+\s*['"]\/recall/);
+            expect(renderBody).not.toMatch(/REST_BASE\s*\+\s*['"]\/activate/);
         });
 
         test('Module Registry self-registration (key=sc_lookup, section=system)', () => {
