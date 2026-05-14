@@ -73,8 +73,16 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
 
     // ─── Constants — whitelist + schema version ───────────────────────
 
-    test('Sprint 15 — DINOCO_CLAIM_CHARGES_SCHEMA_VERSION bumped to 1.2 (forces dbDelta re-run)', () => {
-        expect(SRC).toMatch(/define\(\s*'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION'\s*,\s*'1\.2'\s*\)/);
+    test('Sprint 16 — DINOCO_CLAIM_CHARGES_SCHEMA_VERSION bumped to 1.3 (CHECK constraint fix)', () => {
+        expect(SRC).toMatch(/define\(\s*'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION'\s*,\s*'1\.3'\s*\)/);
+    });
+
+    test('Sprint 16 C1 — chk_amount_snapshot enforces equality (was wrongly > 0)', () => {
+        expect(SRC).toMatch(/'chk_amount_snapshot'\s*=>\s*"\(amount_thb\s*=\s*amount_thb_at_create\)"/);
+    });
+
+    test('Sprint 16 H1 — refund_approvals cleanup purges consumed tokens too', () => {
+        expect(SRC).toMatch(/expires_at\s*<\s*DATE_SUB\(NOW\(\),\s*INTERVAL 7 DAY\)[\s\S]*?OR consumed_at\s*<\s*DATE_SUB\(NOW\(\),\s*INTERVAL 7 DAY\)/);
     });
 
     test('Sprint 12 DB-C1 — NEW idx_status_created covering index for retention cron', () => {

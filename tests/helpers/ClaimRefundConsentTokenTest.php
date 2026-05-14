@@ -84,19 +84,27 @@ class ClaimRefundConsentTokenTest extends TestCase {
         );
     }
 
-    public function test_schema_version_bumped_to_1_2(): void {
+    public function test_schema_version_bumped_to_1_3(): void {
+        // Sprint 16 C1 fix forces dbDelta re-run for corrected CHECK clause.
         $src = SnippetFixture::schema();
         $this->assertMatchesRegularExpression(
-            '/define\(\s*\'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION\'\s*,\s*\'1\.2\'\s*\)/',
+            '/define\(\s*\'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION\'\s*,\s*\'1\.3\'\s*\)/',
             $src
         );
     }
 
-    public function test_schema_amount_snapshot_check_constraint_declared(): void {
-        // Defense-in-depth on MySQL 8.0.16+/MariaDB 10.2.1+
+    public function test_schema_amount_snapshot_check_constraint_enforces_equality(): void {
+        // Sprint 16 C1 — was `(amount_thb_at_create > 0)` (positivity only,
+        // already covered by chk_amount_positive). Now enforces the actual
+        // immutability invariant via equality.
         $src = SnippetFixture::schema();
         $this->assertStringContainsString( 'chk_amount_snapshot', $src );
         $this->assertMatchesRegularExpression(
+            "/'chk_amount_snapshot'\s*=>\s*\"\(amount_thb\s*=\s*amount_thb_at_create\)\"/",
+            $src
+        );
+        // Negative-path: ensure old wrong clause is gone
+        $this->assertDoesNotMatchRegularExpression(
             "/'chk_amount_snapshot'\s*=>\s*\"\(amount_thb_at_create\s*>\s*0\)\"/",
             $src
         );

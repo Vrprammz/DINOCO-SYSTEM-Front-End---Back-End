@@ -125,12 +125,12 @@ class ClaimChargesSchemaTest extends TestCase {
     // CONSTANTS — whitelists & schema version
     // ════════════════════════════════════════════════════════════════
 
-    public function test_schema_version_constant_defined_as_1_2(): void {
-        // Sprint 15 — bumped 1.1 → 1.2 to force dbDelta re-run on existing installs
-        // (H2 amount_thb_at_create snapshot + M4 refund_approvals table).
+    public function test_schema_version_constant_defined_as_1_3(): void {
+        // Sprint 16 — bumped 1.2 → 1.3 to force dbDelta re-run for corrected
+        // chk_amount_snapshot CHECK clause (Sprint 15 had wrong invariant).
         $src = SnippetFixture::load();
         $this->assertMatchesRegularExpression(
-            '/define\(\s*\'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION\'\s*,\s*\'1\.2\'\s*\)/',
+            '/define\(\s*\'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION\'\s*,\s*\'1\.3\'\s*\)/',
             $src
         );
     }

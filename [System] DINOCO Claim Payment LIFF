@@ -1,6 +1,21 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO Claim Payment LIFF                              ║
+ * ║  Version: V.0.5 (2026-05-14) — Sprint 16 code-reviewer remediation:║
+ * ║    • C2 timezone bug — was `gmdate('Y-m-d H:i:s', strtotime($now)  ║
+ * ║      + ttl*60)` which formatted as UTC while DB comparisons use    ║
+ * ║      `current_time('mysql')` Bangkok-local. Net effect on prod     ║
+ * ║      Asia/Bangkok server: expires_at written 7h behind created_at  ║
+ * ║      → every refund returned 410 consent_token_expired Day 1.      ║
+ * ║      Fixed: `date(...)` (PHP default tz matches WP write semantics).║
+ * ║    • H2 double-issuance scope creep — approver double-tap or rate- ║
+ * ║      limit-burst produced multiple simultaneously valid tokens.    ║
+ * ║      Fixed: soft-revoke prior open tokens (consumed_by_user_id=0   ║
+ * ║      system marker) BEFORE issuing new token for same charge.      ║
+ * ║    • H3 REST args schema declares consent_token + refund_approver_ ║
+ * ║      id + refund_reason — WP short-circuits malformed payload with ║
+ * ║      400 before handler runs. Handler regex defense-in-depth.      ║
+ * ║                                                                    ║
  * ║  Version: V.0.4 (2026-05-14) — Sprint 15 audit deferred close:     ║
  * ║    • H2 4-eyes amount mutation bypass — transition handler now    ║
  * ║      reads `amount_thb_at_create` (immutable snapshot) for the     ║
@@ -466,7 +481,16 @@ if ( ! function_exists( 'dinoco_claim_payment_register_rest' ) ) {
             'methods'             => 'POST',
             'callback'            => 'dinoco_claim_payment_rest_refund',
             'permission_callback' => 'dinoco_claim_payment_perm_admin',
-            'args' => array( 'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ) ),
+            // V.0.5 Sprint 16 H3 fix — declare consent_token + approver_id in
+            // REST args schema so WP short-circuits malformed payloads with 400
+            // BEFORE the handler runs (handler regex still validates as
+            // defense-in-depth). Also surfaces in OpenAPI auto-doc.
+            'args' => array(
+                'id'                 => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),
+                'consent_token'      => array( 'required' => false, 'type' => 'string', 'pattern' => '^[A-Za-z0-9]{1,64}$' ),
+                'refund_approver_id' => array( 'required' => false, 'type' => 'integer', 'minimum' => 1 ),
+                'refund_reason'      => array( 'required' => false, 'type' => 'string', 'maxLength' => 500 ),
+            ),
         ) );
 
         register_rest_route( $base, '/charge/(?P<id>\\d+)/cancel', array(
@@ -816,8 +840,31 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_approve_refund' ) ) {
         // = ~380 bits entropy, well above brute-force.
         $token = wp_generate_password( 64, false, false );
 
+        // V.0.5 Sprint 16 C2 fix — was `gmdate('Y-m-d H:i:s', strtotime($now) + ...)`
+        // which formatted as UTC while DB comparisons use Bangkok-local
+        // `current_time('mysql')`. Net effect on production Asia/Bangkok server:
+        // expires_at written 7h behind created_at → token expires-on-arrival →
+        // every refund returned 410 consent_token_expired Day 1. Use date() —
+        // formats with PHP default tz (WP sets to UTC then current_time
+        // adjusts to gmt_offset/timezone_string → matches DB write semantics).
         $now      = current_time( 'mysql' );
-        $expires  = gmdate( 'Y-m-d H:i:s', strtotime( $now ) + ( $ttl_minutes * 60 ) );
+        $expires  = date( 'Y-m-d H:i:s', strtotime( $now ) + ( $ttl_minutes * 60 ) );
+
+        // V.0.5 Sprint 16 H2 fix — invalidate prior open consent tokens for
+        // this charge BEFORE issuing a new one. Approver double-tap or rate-
+        // limit-burst would otherwise produce 2+ simultaneously valid tokens →
+        // both consumable for separate refund races. Soft-revoke preserves
+        // audit trail (consumed_at + consumed_by_user_id=0 marker for system
+        // revoke). Run inside same wrapper (no extra GET_LOCK — INSERT path
+        // already serialized via approver rate limit + uq_consent_token UNIQUE
+        // catch-22 on extreme race).
+        $wpdb->query( $wpdb->prepare(
+            "UPDATE {$atable}
+                SET consumed_at = %s, consumed_by_user_id = 0
+              WHERE charge_id = %d AND consumed_at IS NULL",
+            $now, $chid
+        ) );
+
         $inserted = $wpdb->insert( $atable, array(
             'charge_id'        => $chid,
             'approver_user_id' => $uid,

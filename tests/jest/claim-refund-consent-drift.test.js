@@ -42,12 +42,12 @@ describe('Sprint 15 Claim Refund Consent — H2 + M4 drift detector', () => {
 
     describe('Schema V.0.4', () => {
         test('schema version stamped V.0.4 (Sprint 15)', () => {
-            expect(SCHEMA).toMatch(/Version:\s*V\.0\.4\s*\(2026-05-14\)/);
+            expect(SCHEMA).toMatch(/Version:\s*V\.0\.5\s*\(2026-05-14\)/);
         });
 
-        test('schema version constant bumped to 1.2', () => {
+        test('Sprint 16 — schema version constant bumped to 1.3 (CHECK constraint fix)', () => {
             expect(SCHEMA).toMatch(
-                /define\(\s*'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION'\s*,\s*'1\.2'\s*\)/
+                /define\(\s*'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION'\s*,\s*'1\.3'\s*\)/
             );
         });
 
@@ -58,7 +58,7 @@ describe('Sprint 15 Claim Refund Consent — H2 + M4 drift detector', () => {
 
         test('H2 — declares chk_amount_snapshot CHECK constraint', () => {
             expect(SCHEMA).toMatch(
-                /'chk_amount_snapshot'\s*=>\s*"\(amount_thb_at_create\s*>\s*0\)"/
+                /'chk_amount_snapshot'\s*=>\s*"\(amount_thb\s*=\s*amount_thb_at_create\)"/
             );
         });
 
