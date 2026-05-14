@@ -27,9 +27,16 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 - `b59e649` V.32.2 — legacy plastic-card migration card redesign (amber via Design Tokens V.1.3)
 - `89fc55e` V.31.10+V.31.11 — remove 3-button row + logo shrink #2 (absolute cap)
 - `ec3da53` V.31.12 — restore claim+transfer cards (boss "เมนูสำคัญหายไป") + logo shrink #3
-- (pending) Sprint 35 A1 V.31.13 — 3-col action row + logo wordmark pivot + notif accordion removed
-- (pending) Sprint 35 A2 Edit Profile V.35.0 — NEW "🔔 การแจ้งเตือน" section relocation
-- (this commit) Sprint 35 A3 — Documentation sync: SYSTEM-REFERENCE + WORKFLOW-REFERENCE + FEATURE-SPECS + log.md + CHANGELOG
+- `483f296` Sprint 35 A1 V.31.13 — 3-col action row + logo wordmark pivot + notif accordion removed
+- `f50e79c` Sprint 35 A2 Edit Profile V.35.0 — NEW "🔔 การแจ้งเตือน" section relocation
+- `fbd0c4f` Sprint 36 V.31.14 — Direction A consolidation (ux-ui-expert audit)
+- `d4401e6` Sprint 36 V.31.15 — boss revert: restore 3-card menu + Royal always-show + logo 50%
+- `e11a1f1` V.31.16 — logo `!important` cascade fix + notif fully removed from Home
+- `a8bcb22` V.32.0 FULL REDESIGN (rolled back next commit)
+- `ac2b0da` Revert V.32.0 — over-deletion 241+/362- lost primary affordances
+- `008dfb5` V.31.17 — logo enlarge to match "PASSPORT" subtitle
+- `da736f6` V.31.18 — logo 2x scale ("ยาวขึ้นอีก 1 เท่า สูงตามไซล์") — **current shipped**
+- (this commit) Sprint 35 A3 — Documentation sync: SYSTEM-REFERENCE + WORKFLOW-REFERENCE + CLAUDE + log.md + CHANGELOG
 
 **Files affected**:
 

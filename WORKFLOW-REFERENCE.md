@@ -3965,3 +3965,63 @@ Audit log `wp_dinoco_claim_charge_audit` records all transitions with `actor_use
 - **Batch A (Sprint 29)**: CSV export `/charges/export` + notif-log filter dashboard + Health Monitor claim cards
 - **Batch B (Sprint 30)**: Refund audit dashboard + multi-shipment grouping (Flash dispatcher) + pickup-at-warehouse opt-in
 - **Batch C (Sprint 31)**: Customer LIFF history `/my-charges` + `/my-flash` (inline rendering in Assets List)
+
+## 17. Member Dashboard Simplified Surface (Sprint 34-36, 2026-05-14)
+
+Final layout after 11-round logo iteration + V.32.0 rollback + V.31.18 stabilization. Single canonical hub for all member journeys per "no duplication" boss directive.
+
+### 17.1 Above-the-fold component order
+
+```text
+1. Member Card hero        [Dashboard - Header & Forms V.31.18]
+   ├─ Small PNG logo (inline style + !important cascade win)
+   ├─ Customer journey badge (active years)
+   ├─ Member ID
+   └─ Tier badge (B2B rank_system pattern: bronze→silver→gold→platinum→diamond)
+
+2. Royal Warranty Upgrade card  (always-visible per V.31.15)
+   └─ CTA → upgrade flow
+
+3. 3-card action row            (V.31.13 finalized layout)
+   ├─ 📝 ลงทะเบียน  → registration
+   ├─ 🔧 แจ้งเคลม   → claim form
+   └─ 🔄 โอนสิทธิ์   → transfer flow
+
+4. Assets list                  [Dashboard - Assets List V.32.2]
+   ├─ Status-driven CTA per card (active/near_expiry/expired/claimed/stolen)
+   ├─ Inline claim payment modal (Sprint 32 — replaces /claim-pay/ LIFF)
+   └─ Inline claim history (Phase 4 Batch C — replaces /claim-history/ LIFF)
+
+5. Bottom nav (4 tabs + center SCAN)
+   ├─ Home / Claim / [SCAN] / Transfer / Profile
+   └─ Notification settings live ONLY at Profile → Edit Profile #sec-notif
+```
+
+### 17.2 Notification settings — single source of truth
+
+Pre-V.31.13: notification controls duplicated on Home (accordion) + Edit Profile.
+
+Post-V.31.13 (current): Home notif accordion **removed**. Edit Profile V.35.0 NEW "🔔 การแจ้งเตือน" section is the **sole** notification preference surface. Boss UX directive 2026-05-14 — "no duplication".
+
+### 17.3 11-round iteration arc (lessons)
+
+Member Card logo went through 11 commits in one session (V.31.7 → V.31.18) including a full V.32.0 redesign that was rolled back. Trajectory:
+
+| Round | Version | Change |
+|---|---|---|
+| 1 | V.31.8 | Replace "DINOCO THAILAND" text with PNG logo |
+| 2-4 | V.31.9-V.31.12 | 3 shrink iterations + 3-button row removed → 2 cards restored |
+| 5 | V.31.13 | 3-col action row + logo wordmark pivot + notif accordion removed |
+| 6 | V.31.14 | Direction A consolidation (ux-ui-expert audit — over-deletion) |
+| 7 | V.31.15 | Boss revert: restore 3-card menu + Royal always-show + logo 50% |
+| 8 | V.31.16 | Logo `!important` cascade fix |
+| 9 | V.32.0 | **FULL REDESIGN — ROLLED BACK** (241+/362- lines, lost primary affordances) |
+| 10 | V.31.17 | Re-enlarge logo to match "PASSPORT" subtitle |
+| 11 | V.31.18 | Logo 2x scale ("ยาวขึ้นอีก 1 เท่า สูงตามไซล์") — **current** |
+
+**Lessons captured in CLAUDE.md + .second-brain/log.md**:
+
+1. Boss screenshot feedback is highest-fidelity UX signal — 3-4 iteration cycles are normal; past 8 rounds means a fundamental issue (cache / asset / cascade), not pixel tuning.
+2. Over-deletion is worse than over-design — V.31.14 Direction A killed primary affordances based on agent audit; boss reverted. Validate WITH boss before removing primary CTAs.
+3. PNG raster logos in WP under Elementor cascade need inline `style` + `!important` + scoped specificity OR pivot to inline SVG / text wordmark.
+4. Big refactors (V.32.0 6-file 241+/362- delta) need boss preview before push — small commits roll back trivially, large refactors do not.
