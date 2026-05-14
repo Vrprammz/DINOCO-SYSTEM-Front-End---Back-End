@@ -2808,10 +2808,11 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(stripped).toMatch(/dnc-dash-quick-card--claim/);
             expect(stripped).toMatch(/dnc-dash-quick-card--transfer/);
             expect(stripped).not.toMatch(/<div class="dnc-sn-notif-settings"/);
-            expect(stripped).toMatch(/href="\/edit-profile\/#sec-notif"/);
+            // V.31.16 — notif link removed (settings ONLY in Profile)
+            expect(stripped).not.toMatch(/href="\/edit-profile\/#sec-notif"/);
         });
 
-        test('W7.1 V.31.15 — logo PNG 50% smaller (boss "เล็กกว่านี้ 50%")', () => {
+        test('W7.1 V.31.16 — logo CSS specificity boost + !important (10+ rounds bug fix)', () => {
             const code = readByPath(HEADER_PATH);
             const stripped = code
                 .replace(/<!--[\s\S]*?-->/g, '')
@@ -2822,7 +2823,7 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(stripped).toMatch(/class="card-title-mark"/);
             expect(stripped).not.toMatch(/<span class="card-title-wordmark">/);
             // V.31.15: 7px / 40px (half of V.31.14)
-            expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*7px/);
+            expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*10px/);
         });
 
         test('W7 SnTierBadgeTest helper test file exists with required cases', () => {

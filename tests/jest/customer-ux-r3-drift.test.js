@@ -105,8 +105,8 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         // Search-box-wrap + notif accordion stay DELETED
         expect(stripped).not.toMatch(/<div class="search-box-wrap">/);
         expect(stripped).not.toMatch(/<div class="dnc-sn-notif-settings"/);
-        // Notif link to Profile present
-        expect(stripped).toMatch(/<a[^>]*href="\/edit-profile\/#sec-notif"/);
+        // V.31.16 — notif link REMOVED (settings ONLY in Profile via bottom nav)
+        expect(stripped).not.toMatch(/<a[^>]*href="\/edit-profile\/#sec-notif"/);
         expect(code).toContain('dinocoScanFirstQr');
     });
 
@@ -120,10 +120,11 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         expect(stripped).toMatch(/<img[^>]*src="https:\/\/www\.dinoco\.in\.th\/wp-content\/uploads\/2026\/01\/sss\.png"[^>]*class="card-title-mark"/);
         expect(stripped).not.toMatch(/<span class="card-title-wordmark">/);
         // V.31.15 — half of V.31.14: height 7px / max-width 40px
-        expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*7px/);
-        expect(code).toMatch(/\.card-title-mark[\s\S]*?max-width:\s*40px/);
-        // <360px: 6px / 34px
-        expect(code).toMatch(/\.card-title-mark\s*\{\s*height:\s*6px;?\s*max-width:\s*34px/);
+        expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*10px/);
+        expect(code).toMatch(/\.card-title-mark[\s\S]*?max-width:\s*50px/);
+        // <360px mobile responsive (V.31.16 selector chain — comma-separated)
+        expect(code).toMatch(/@media \(max-width: 360px\)[\s\S]{0,500}?height:\s*8px/);
+        expect(code).toMatch(/@media \(max-width: 360px\)[\s\S]{0,500}?max-width:\s*40px/);
     });
 
     test('V.31.14 — Scan delegation handler retained (FAB modal future surfaces)', () => {

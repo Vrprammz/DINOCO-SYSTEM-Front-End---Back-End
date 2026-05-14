@@ -33,18 +33,20 @@ describe('Customer-facing UX Phase 8 Bundle A — 5 SHOULD-FIX closed', () => {
         expect(code).toMatch(/<div class="dinoco-wrapper"\s+lang="th">/);
     });
 
-    test('S6 — V.31.14 SUPERSEDED: notif accordion relocated to Edit Profile #sec-notif', () => {
-        // Sprint 36 V.31.14 — boss directive 2026-05-14 + ux-ui-expert Direction A:
-        // notification settings moved from Home Dashboard accordion → Edit Profile
-        // V.35.0 #sec-notif. Old S6 collapse CSS no longer applies (accordion gone).
-        // New canonical surface: thin link row .dnc-notif-link-row.
+    test('S6 — V.31.16: notif settings ONLY at Edit Profile (no home reference)', () => {
+        // V.31.16 (boss "เสือกเอามาโชว์ โง่จริง" 2026-05-14):
+        // notification settings live ONLY at Edit Profile V.35.0 #sec-notif
+        // accessed via Profile bottom nav. NO link/anchor on home dashboard.
         const code = read('header');
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
             .replace(/<\?php[\s\S]*?\?>/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '');
+        // Accordion gone (V.31.14)
         expect(stripped).not.toMatch(/<div class="dnc-sn-notif-settings"/);
-        expect(stripped).toMatch(/<a[^>]*href="\/edit-profile\/#sec-notif"[^>]*dnc-notif-link-row/);
+        // Link row also gone (V.31.16)
+        expect(stripped).not.toMatch(/dnc-notif-link-row/);
+        expect(stripped).not.toMatch(/href="\/edit-profile\/#sec-notif"/);
     });
 
     test('S4 — Already-registered state has masked owner + anti-fraud panel', () => {
