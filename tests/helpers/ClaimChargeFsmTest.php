@@ -229,4 +229,47 @@ final class ClaimChargeFsmTest extends TestCase
         $r = dinoco_claim_charge_fsm_allowed( 'pending_review', 'pending_payment', 'admin' );
         $this->assertTrue( $r['allowed'] );
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // Sprint 15 — H2 + M4 source-fingerprint guards
+    // ════════════════════════════════════════════════════════════════
+
+    /** H2 — transition handler reads amount_thb_at_create for 4-eyes gate. */
+    public function testTransitionReadsAmountSnapshotForFourEyesGate(): void
+    {
+        $path = __DIR__ . '/../../[System] DINOCO Claim Payment LIFF';
+        $this->assertFileExists( $path );
+        $src = file_get_contents( $path );
+        // 4-eyes gate must NOT compare to $amount_now (mutable column)
+        $this->assertMatchesRegularExpression(
+            '/if\s*\(\s*\$amount_create\s*>=\s*5000\.0\s*\)/',
+            $src,
+            'H2 — 4-eyes gate must use amount_thb_at_create (immutable snapshot)'
+        );
+        // Drift check at transition layer (defense-in-depth vs pre-lock check)
+        $this->assertMatchesRegularExpression(
+            '/abs\(\s*\$amount_now\s*-\s*\$amount_create\s*\)\s*>\s*0\.01/',
+            $src,
+            'H2 — transition must assert amount_thb has not drifted'
+        );
+    }
+
+    /** M4 — consent token consumed atomically inside refund transition transaction. */
+    public function testTransitionConsumesConsentTokenInsideTransaction(): void
+    {
+        $path = __DIR__ . '/../../[System] DINOCO Claim Payment LIFF';
+        $src  = file_get_contents( $path );
+        // 1. Atomic UPDATE with WHERE consumed_at IS NULL invariant
+        $this->assertMatchesRegularExpression(
+            '/UPDATE\s+\{\$atable\}\s+SET\s+consumed_at\s*=\s*%s,\s*consumed_by_user_id\s*=\s*%d\s+WHERE\s+id\s*=\s*%d\s+AND\s+charge_id\s*=\s*%d\s+AND\s+consumed_at\s+IS\s+NULL/',
+            $src,
+            'M4 — token consume UPDATE must enforce consumed_at IS NULL invariant'
+        );
+        // 2. affected_rows must == 1; ROLLBACK otherwise
+        $this->assertMatchesRegularExpression(
+            '/\(int\)\s*\$consume_affected\s*!==\s*1[\s\S]{0,200}?ROLLBACK[\s\S]{0,200}?consent_already_consumed/',
+            $src,
+            'M4 — affected_rows != 1 must ROLLBACK + return consent_already_consumed'
+        );
+    }
 }

@@ -1,6 +1,23 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO Claim Payment LIFF                              ║
+ * ║  Version: V.0.4 (2026-05-14) — Sprint 15 audit deferred close:     ║
+ * ║    • H2 4-eyes amount mutation bypass — transition handler now    ║
+ * ║      reads `amount_thb_at_create` (immutable snapshot) for the     ║
+ * ║      ≥฿5K threshold, plus asserts `amount_thb === amount_thb_at_   ║
+ * ║      create` post-SELECT (else WP_Error 422 amount_drift_detected).║
+ * ║      Compromised admin who lowers amount_thb 50,000 → 4,999 to     ║
+ * ║      sneak under the gate now triggers explicit ROLLBACK + audit.  ║
+ * ║    • M4 forgeable refund_approver_id — NEW endpoint                ║
+ * ║      POST /dinoco-claim/v1/charges/{id}/approve-refund (authed AS  ║
+ * ║      the approver). Returns single-use 64-char alphanumeric token. ║
+ * ║      Refund handler now requires `consent_token` body param for    ║
+ * ║      charges with amount_thb_at_create ≥ ฿5K. Token validated      ║
+ * ║      pre-lock (charge match + not expired + not consumed + approver║
+ * ║      differs from actor) + consumed INSIDE the transition          ║
+ * ║      transaction (UPDATE affected_rows=1 invariant; else ROLLBACK  ║
+ * ║      + WP_Error 409 consent_already_consumed). Rate limit 20/hr.   ║
+ * ║                                                                    ║
  * ║  Version: V.0.3 (2026-05-14) — Sprint 14 code-reviewer remediation:║
  * ║    • H1 idempotency hash adds `from_state` + caller-supplied      ║
  * ║      `discriminator` (R42 binary-fingerprint). Customer re-upload  ║
@@ -120,7 +137,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 $dinoco_claim_payment_enabled = (bool) get_option( 'dinoco_claim_payment_enabled', false );
 
 if ( ! defined( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED' ) ) {
-    define( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED', '0.2' );
+    define( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED', '0.4' );
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -253,8 +270,11 @@ if ( ! function_exists( 'dinoco_claim_charge_transition' ) ) {
         try {
             $wpdb->query( 'START TRANSACTION' );
 
+            // Sprint 15 H2 — read amount_thb_at_create immutable snapshot.
+            // Refund handler uses this column (not amount_thb) for 4-eyes
+            // threshold; equality assertion catches mid-flow mutation attack.
             $row = $wpdb->get_row( $wpdb->prepare(
-                "SELECT id, claim_id, user_id, amount_thb, status, verified_by FROM {$table} WHERE id = %d FOR UPDATE",
+                "SELECT id, claim_id, user_id, amount_thb, amount_thb_at_create, status, verified_by FROM {$table} WHERE id = %d FOR UPDATE",
                 $chid
             ), ARRAY_A );
 
@@ -288,11 +308,35 @@ if ( ! function_exists( 'dinoco_claim_charge_transition' ) ) {
                 $set['verified_by'] = $actor_uid;
                 $set_fmt[] = '%s'; $set_fmt[] = '%d';
             } elseif ( $to_state === 'refunded' ) {
-                // 4-eyes: refund_approver_id must differ from verified_by ≥฿5K
-                $amount       = (float) $row['amount_thb'];
-                $verified_by  = (int) $row['verified_by'];
-                $approver     = isset( $context['refund_approver_id'] ) ? (int) $context['refund_approver_id'] : 0;
-                if ( $amount >= 5000.0 ) {
+                // Sprint 15 H2 — read amount_thb_at_create (immutable snapshot)
+                // for 4-eyes threshold. Assert amount_thb has NOT been mutated
+                // post-INSERT — attacker who lowers amount to sneak under ฿5K
+                // is now caught and refund refused.
+                $amount_now    = (float) $row['amount_thb'];
+                $amount_create = isset( $row['amount_thb_at_create'] ) ? (float) $row['amount_thb_at_create'] : 0.0;
+                $verified_by   = (int) $row['verified_by'];
+                $approver      = isset( $context['refund_approver_id'] ) ? (int) $context['refund_approver_id'] : 0;
+
+                if ( $amount_create <= 0.0 ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'amount_snapshot_missing', 'amount_thb_at_create not populated — schema migration required', array( 'status' => 500 ) );
+                }
+                // Drift check (defense-in-depth): compare with 1 satang tolerance for float fuzz.
+                if ( abs( $amount_now - $amount_create ) > 0.01 ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( 'error', 'claim_charge_amount_drift_detected', array(
+                            'charge_id'        => $chid,
+                            'amount_now'       => $amount_now,
+                            'amount_at_create' => $amount_create,
+                            'actor_user_id'    => $actor_uid,
+                        ) );
+                    }
+                    return new WP_Error( 'amount_drift_detected', 'amount_thb has been mutated since charge creation — refund refused', array( 'status' => 422 ) );
+                }
+
+                // 4-eyes gate uses IMMUTABLE snapshot, not current amount.
+                if ( $amount_create >= 5000.0 ) {
                     if ( $approver <= 0 ) {
                         $wpdb->query( 'ROLLBACK' );
                         return new WP_Error( 'four_eyes_required', 'Refund ≥฿5,000 requires refund_approver_id', array( 'status' => 422 ) );
@@ -300,6 +344,38 @@ if ( ! function_exists( 'dinoco_claim_charge_transition' ) ) {
                     if ( $approver === $verified_by ) {
                         $wpdb->query( 'ROLLBACK' );
                         return new WP_Error( 'four_eyes_self_approval', 'Approver must differ from original verifier', array( 'status' => 409 ) );
+                    }
+                    if ( $approver === $actor_uid ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'four_eyes_actor_is_approver', 'Approver must differ from the refund actor', array( 'status' => 409 ) );
+                    }
+
+                    // Sprint 15 M4 — consume consent token atomically.
+                    // Pre-lock validation happened in REST handler; here we
+                    // CONSUME inside transaction so concurrent refund attempts
+                    // with the same token race-fail at this exact line.
+                    $consent_token_row_id = isset( $context['consent_token_row_id'] ) ? (int) $context['consent_token_row_id'] : 0;
+                    if ( $consent_token_row_id <= 0 ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'consent_token_required', 'Refund ≥฿5,000 requires valid consent_token', array( 'status' => 422 ) );
+                    }
+                    if ( function_exists( 'dinoco_claim_refund_approvals_table_name' ) ) {
+                        $atable = dinoco_claim_refund_approvals_table_name();
+                        $consume_affected = $wpdb->query( $wpdb->prepare(
+                            "UPDATE {$atable}
+                                SET consumed_at = %s, consumed_by_user_id = %d
+                              WHERE id = %d
+                                AND charge_id = %d
+                                AND consumed_at IS NULL
+                                AND expires_at >= %s",
+                            $now_mysql, $actor_uid,
+                            $consent_token_row_id, $chid,
+                            $now_mysql
+                        ) );
+                        if ( (int) $consume_affected !== 1 ) {
+                            $wpdb->query( 'ROLLBACK' );
+                            return new WP_Error( 'consent_already_consumed', 'Consent token already consumed, expired, or invalid', array( 'status' => 409 ) );
+                        }
                     }
                 }
                 $set['refund_reason']      = isset( $context['reason'] ) ? mb_substr( (string) $context['reason'], 0, 500 ) : '';
@@ -398,6 +474,20 @@ if ( ! function_exists( 'dinoco_claim_payment_register_rest' ) ) {
             'callback'            => 'dinoco_claim_payment_rest_cancel',
             'permission_callback' => 'dinoco_claim_payment_perm_admin',
             'args' => array( 'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ) ),
+        ) );
+
+        // Sprint 15 M4 — refund consent. Approver self-creates a single-use
+        // consent token via their OWN authenticated session, then hands the
+        // token to the refund actor who passes it in the refund body. Closes
+        // the forgeable refund_approver_id gap.
+        register_rest_route( $base, '/charges/(?P<id>\\d+)/approve-refund', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_claim_payment_rest_approve_refund',
+            'permission_callback' => 'dinoco_claim_payment_perm_admin',
+            'args' => array(
+                'id'          => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),
+                'ttl_minutes' => array( 'required' => false, 'type' => 'integer', 'minimum' => 5, 'maximum' => 60, 'default' => 15 ),
+            ),
         ) );
     }
 }
@@ -573,11 +663,184 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_refund' ) ) {
         $chid       = (int) $req->get_param( 'id' );
         $reason     = sanitize_text_field( (string) $req->get_param( 'reason' ) );
         $approver   = (int) $req->get_param( 'refund_approver_id' );
+        // Sprint 15 M4 — consent_token closes the forgeable refund_approver_id
+        // gap. Token validated pre-lock here (cheap reads) — full atomic
+        // consume happens inside transition() under FOR UPDATE.
+        $consent_token = sanitize_text_field( (string) $req->get_param( 'consent_token' ) );
+        // Strict char policy mirrors wp_generate_password(64, false, false)
+        // output — alphanumeric only. Reject anything else early.
+        if ( $consent_token !== '' && ! preg_match( '/^[A-Za-z0-9]{1,64}$/', $consent_token ) ) {
+            return new WP_Error( 'consent_token_invalid_format', 'consent_token must be 1-64 alphanumeric chars', array( 'status' => 422 ) );
+        }
+
+        $consent_token_row_id = 0;
+        $effective_approver   = $approver;
+
+        if ( function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            global $wpdb;
+            $table = dinoco_claim_charges_table_name();
+            // Read amount_thb_at_create (immutable snapshot) to decide if
+            // 4-eyes consent flow applies. Use the snapshot — not amount_thb —
+            // so attacker who lowered amount_thb cannot skip this branch.
+            $amount_create = (float) $wpdb->get_var( $wpdb->prepare(
+                "SELECT amount_thb_at_create FROM {$table} WHERE id = %d", $chid
+            ) );
+
+            if ( $amount_create >= 5000.0 ) {
+                if ( $consent_token === '' ) {
+                    return new WP_Error( 'consent_token_required', 'Refund ≥฿5,000 requires consent_token from POST /charges/{id}/approve-refund', array( 'status' => 422 ) );
+                }
+                if ( function_exists( 'dinoco_claim_refund_approvals_table_name' ) ) {
+                    $atable = dinoco_claim_refund_approvals_table_name();
+                    // Pre-lock validate (cheap reads): token exists + matches
+                    // charge + not expired + not yet consumed. Atomic consume
+                    // happens inside transition() under transaction.
+                    $row = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT id, approver_user_id, expires_at, consumed_at
+                           FROM {$atable}
+                          WHERE consent_token = %s
+                            AND charge_id = %d
+                          LIMIT 1",
+                        $consent_token, $chid
+                    ), ARRAY_A );
+                    if ( ! $row ) {
+                        return new WP_Error( 'consent_token_not_found', 'consent_token does not match charge', array( 'status' => 403 ) );
+                    }
+                    if ( ! empty( $row['consumed_at'] ) ) {
+                        return new WP_Error( 'consent_token_already_consumed', 'consent_token was already consumed', array( 'status' => 409 ) );
+                    }
+                    if ( strtotime( (string) $row['expires_at'] ) < strtotime( current_time( 'mysql' ) ) ) {
+                        return new WP_Error( 'consent_token_expired', 'consent_token expired — request a new one', array( 'status' => 410 ) );
+                    }
+                    $row_approver = (int) $row['approver_user_id'];
+                    $uid          = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+                    if ( $row_approver === $uid ) {
+                        return new WP_Error( 'consent_self_approval', 'Approver cannot be the refund actor', array( 'status' => 409 ) );
+                    }
+                    // If caller also passed refund_approver_id explicitly,
+                    // it MUST match the token's approver to prevent the
+                    // forge-by-body attack (the whole point of M4).
+                    if ( $approver > 0 && $approver !== $row_approver ) {
+                        return new WP_Error( 'consent_approver_mismatch', 'refund_approver_id body param must match token.approver_user_id', array( 'status' => 422 ) );
+                    }
+                    $consent_token_row_id = (int) $row['id'];
+                    $effective_approver   = $row_approver;
+                }
+            }
+        }
+
         return dinoco_claim_payment_wrapped_transition(
             'claim_charge_refund', 'claim-charge-refund',
             $chid, 'refunded', 'admin',
-            array( 'reason' => $reason, 'refund_approver_id' => $approver ),
+            array(
+                'reason'                => $reason,
+                'refund_approver_id'    => $effective_approver,
+                'consent_token_row_id'  => $consent_token_row_id,
+                // Sprint 15 binary-fingerprint pattern (R42) — consent token
+                // discriminates retry of the SAME refund from retry of a
+                // DIFFERENT refund attempt (e.g. token rotated).
+                'idem_discriminator'    => $consent_token,
+            ),
             20  // tight — refunds are rare + high-risk
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_approve_refund' ) ) {
+    /**
+     * Sprint 15 M4 — Approver self-creates single-use consent token.
+     * Permission: manage_options (admin) + must NOT match charge.verified_by
+     * (4-eyes invariant defended at refund time too, but reject early here).
+     *
+     * Body params:
+     *   ttl_minutes  optional (default 15, range 5-60)
+     *
+     * Returns { token, expires_at, approver_user_id, charge_id }.
+     */
+    function dinoco_claim_payment_rest_approve_refund( $req ) {
+        $chid        = (int) $req->get_param( 'id' );
+        $ttl_minutes = (int) $req->get_param( 'ttl_minutes' );
+        if ( $ttl_minutes < 5 )  $ttl_minutes = 5;
+        if ( $ttl_minutes > 60 ) $ttl_minutes = 60;
+
+        $uid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+        if ( $uid <= 0 ) {
+            return new WP_Error( 'unauthenticated', 'Approver must be authenticated', array( 'status' => 401 ) );
+        }
+
+        // Rate limit — 20/hr per approver. Refund consent issuance should be
+        // rare; flood implies someone scripting against the endpoint.
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'claim_refund_approve_' . $uid, 20, 3600 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) || ! function_exists( 'dinoco_claim_refund_approvals_table_name' ) ) {
+            return new WP_Error( 'schema_missing', 'Charges schema not installed', array( 'status' => 500 ) );
+        }
+        global $wpdb;
+        $table  = dinoco_claim_charges_table_name();
+        $atable = dinoco_claim_refund_approvals_table_name();
+
+        // Verify charge exists + state = verified (only verified charges can
+        // be refunded — anything else is irrelevant). Also fetch verified_by
+        // to enforce 4-eyes "approver != verifier" at issuance time.
+        $charge = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, status, verified_by, amount_thb_at_create FROM {$table} WHERE id = %d",
+            $chid
+        ), ARRAY_A );
+        if ( ! $charge ) {
+            return new WP_Error( 'charge_not_found', 'Charge not found', array( 'status' => 404 ) );
+        }
+        if ( (string) $charge['status'] !== 'verified' ) {
+            return new WP_Error( 'charge_not_verified', 'Consent token only issuable for verified charges', array( 'status' => 409, 'current_state' => (string) $charge['status'] ) );
+        }
+        if ( (int) $charge['verified_by'] === $uid ) {
+            return new WP_Error( 'four_eyes_self_approval', 'Approver must differ from original verifier', array( 'status' => 409 ) );
+        }
+        $amount_create = (float) $charge['amount_thb_at_create'];
+        if ( $amount_create < 5000.0 ) {
+            // <฿5K refunds skip consent entirely — but allow issuance for
+            // future-proofing (admin may pre-issue before knowing exact amount).
+            // Audit only.
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'info', 'claim_refund_approve_below_threshold', array(
+                    'charge_id'        => $chid,
+                    'amount_at_create' => $amount_create,
+                    'approver'         => $uid,
+                ) );
+            }
+        }
+
+        // Generate alphanumeric token (matches refund handler regex). 64 chars
+        // = ~380 bits entropy, well above brute-force.
+        $token = wp_generate_password( 64, false, false );
+
+        $now      = current_time( 'mysql' );
+        $expires  = gmdate( 'Y-m-d H:i:s', strtotime( $now ) + ( $ttl_minutes * 60 ) );
+        $inserted = $wpdb->insert( $atable, array(
+            'charge_id'        => $chid,
+            'approver_user_id' => $uid,
+            'consent_token'    => $token,
+            'created_at'       => $now,
+            'expires_at'       => $expires,
+        ), array( '%d', '%d', '%s', '%s', '%s' ) );
+        if ( $inserted === false ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_refund_consent_insert_failed', array(
+                    'charge_id' => $chid, 'approver' => $uid,
+                    'db_error'  => isset( $wpdb->last_error ) ? (string) $wpdb->last_error : '',
+                ) );
+            }
+            return new WP_Error( 'consent_insert_failed', 'Failed to issue consent token', array( 'status' => 500 ) );
+        }
+
+        return array(
+            'token'            => $token,
+            'expires_at'       => $expires,
+            'approver_user_id' => $uid,
+            'charge_id'        => $chid,
+            'ttl_minutes'      => $ttl_minutes,
         );
     }
 }

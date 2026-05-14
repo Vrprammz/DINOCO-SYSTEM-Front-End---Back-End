@@ -44,8 +44,8 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
         expect(fs.existsSync(SNIPPET_PATH)).toBe(true);
     });
 
-    test('version stamped V.0.3 (Sprint 12)', () => {
-        expect(SRC).toMatch(/Version:\s*V\.0\.3\s*\(2026-05-14\)/);
+    test('version stamped V.0.4 (Sprint 15)', () => {
+        expect(SRC).toMatch(/Version:\s*V\.0\.4\s*\(2026-05-14\)/);
     });
 
     test('DB_ID placeholder present until boss creates WP admin entry', () => {
@@ -73,8 +73,8 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
 
     // ─── Constants — whitelist + schema version ───────────────────────
 
-    test('Sprint 12 — DINOCO_CLAIM_CHARGES_SCHEMA_VERSION bumped to 1.1 (forces dbDelta re-run)', () => {
-        expect(SRC).toMatch(/define\(\s*'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION'\s*,\s*'1\.1'\s*\)/);
+    test('Sprint 15 — DINOCO_CLAIM_CHARGES_SCHEMA_VERSION bumped to 1.2 (forces dbDelta re-run)', () => {
+        expect(SRC).toMatch(/define\(\s*'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION'\s*,\s*'1\.2'\s*\)/);
     });
 
     test('Sprint 12 DB-C1 — NEW idx_status_created covering index for retention cron', () => {
@@ -149,6 +149,7 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
         'claim_id BIGINT(20) UNSIGNED NOT NULL',
         'user_id BIGINT(20) UNSIGNED NOT NULL',
         'amount_thb DECIMAL(14,2) NOT NULL',
+        'amount_thb_at_create DECIMAL(14,2) NOT NULL',
         'reason VARCHAR(32) NOT NULL',
         'reason_note VARCHAR(500) DEFAULT NULL',
         "status VARCHAR(24) NOT NULL DEFAULT 'pending_payment'",

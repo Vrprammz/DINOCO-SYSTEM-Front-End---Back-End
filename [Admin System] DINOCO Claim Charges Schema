@@ -1,6 +1,29 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Charges Schema                      ║
+ * ║  Version: V.0.4 (2026-05-14) — Sprint 15 audit deferred close:     ║
+ * ║    • H2 4-eyes amount bypass — NEW column amount_thb_at_create     ║
+ * ║      DECIMAL(14,2) NOT NULL — immutable snapshot at INSERT. FSM    ║
+ * ║      transition handler reads this column (not amount_thb) for the ║
+ * ║      ≥฿5K threshold gate. Compromised admin who lowers amount_thb  ║
+ * ║      pre-refund → refund handler now asserts                       ║
+ * ║      amount_thb === amount_thb_at_create (else 422                 ║
+ * ║      amount_drift_detected). PHP charge-create handler (Phase 2.6) ║
+ * ║      MUST populate amount_thb_at_create = amount_thb at INSERT.    ║
+ * ║    • M4 forgeable refund_approver_id — NEW table                   ║
+ * ║      wp_dinoco_claim_refund_approvals (consent_token CHAR(64)      ║
+ * ║      UNIQUE, 15min TTL default, range 5-60min). Refund handler now ║
+ * ║      requires consent_token param — token is single-use, must be   ║
+ * ║      created by the actual approver via POST /charges/{id}/approve-║
+ * ║      refund (authenticated AS the approver), token consumed inside ║
+ * ║      transition transaction (UPDATE affected_rows = 1 invariant).  ║
+ * ║      Defense in depth — schema-level guarantees + REST-layer auth. ║
+ * ║    • Retention cron extended — 03:45 sweep also DELETEs            ║
+ * ║      refund_approvals rows older than 7 days (chunked, ORDER BY id ║
+ * ║      ASC, R12 finally heartbeat). 90d would be too long for ephemeral║
+ * ║      consent tokens; 7d is enough audit trail before purge.        ║
+ * ║    • Schema version 1.1 → 1.2 (forces dbDelta re-run on existing). ║
+ * ║                                                                    ║
  * ║  Version: V.0.3 (2026-05-14) — Sprint 12 multi-agent audit:        ║
  * ║    • DB-C1: NEW idx_status_created (status, created_at) covers     ║
  * ║      retention cron sweep (was full-scan + filesort).              ║
@@ -104,7 +127,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 if ( ! defined( 'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION' ) ) {
-    define( 'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION', '1.1' );
+    define( 'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION', '1.2' );
 }
 
 if ( ! defined( 'DINOCO_CLAIM_CHARGES_REASON_WHITELIST' ) ) {
@@ -145,6 +168,20 @@ if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) {
     function dinoco_claim_charges_table_name() {
         global $wpdb;
         return $wpdb->prefix . 'dinoco_claim_charges';
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_refund_approvals_table_name' ) ) {
+    /**
+     * Sprint 15 M4 — Resolve fully-prefixed refund approvals table.
+     * Single-use consent tokens (15min TTL default, range 5-60min)
+     * proving the named approver actually consented (not forged in body).
+     *
+     * @return string e.g. "wp_dinoco_claim_refund_approvals"
+     */
+    function dinoco_claim_refund_approvals_table_name() {
+        global $wpdb;
+        return $wpdb->prefix . 'dinoco_claim_refund_approvals';
     }
 }
 
@@ -231,11 +268,18 @@ if ( ! function_exists( 'dinoco_claim_charges_schema_install' ) ) {
         //   DB-C2: uq_slip_replay_claim explicitly NULL-tolerant — MySQL treats
         //          multiple NULLs as distinct, so replay defense activates only
         //          AFTER slip submission. Comment annotates the intentional gap.
+        // Sprint 15 H2 — amount_thb_at_create immutable snapshot at INSERT.
+        // 4-eyes threshold reads this column (not amount_thb) so attacker who
+        // mutates amount_thb (via direct DB or future admin-edit endpoint)
+        // cannot bypass the ≥฿5K consent flow. PHP handler (Phase 2.6) MUST
+        // mirror amount_thb = amount_thb_at_create at INSERT time; refund
+        // handler asserts equality (else 422 amount_drift_detected).
         $sql = "CREATE TABLE {$table} (
             id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             claim_id BIGINT(20) UNSIGNED NOT NULL,
             user_id BIGINT(20) UNSIGNED NOT NULL,
             amount_thb DECIMAL(14,2) NOT NULL,
+            amount_thb_at_create DECIMAL(14,2) NOT NULL,
             reason VARCHAR(32) NOT NULL,
             reason_note VARCHAR(500) DEFAULT NULL,
             status VARCHAR(24) NOT NULL DEFAULT 'pending_payment',
@@ -267,10 +311,33 @@ if ( ! function_exists( 'dinoco_claim_charges_schema_install' ) ) {
             UNIQUE KEY uq_slip_replay_claim (slip_ref_hash)
         ) {$charset};";
 
+        // Sprint 15 M4 — refund consent tokens table. Forgeable refund_approver_id
+        // closed: actor admin A cannot fabricate approver B's consent. Each refund
+        // ≥฿5K requires a SINGLE-USE token created by the actual approver via
+        // their own authenticated POST /charges/{id}/approve-refund call. Token
+        // consumed atomically inside the FSM transition transaction (UPDATE
+        // affected_rows=1 invariant); on consume failure → ROLLBACK + 409.
+        $approvals_table = dinoco_claim_refund_approvals_table_name();
+        $sql_approvals = "CREATE TABLE {$approvals_table} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            charge_id BIGINT(20) UNSIGNED NOT NULL,
+            approver_user_id BIGINT(20) UNSIGNED NOT NULL,
+            consent_token CHAR(64) COLLATE utf8mb4_bin NOT NULL,
+            created_at DATETIME NOT NULL,
+            expires_at DATETIME NOT NULL,
+            consumed_at DATETIME DEFAULT NULL,
+            consumed_by_user_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            PRIMARY KEY  (id),
+            UNIQUE KEY uq_consent_token (consent_token),
+            KEY idx_charge_approver (charge_id, approver_user_id),
+            KEY idx_expires (expires_at)
+        ) {$charset};";
+
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
         try {
             dbDelta( $sql );
+            dbDelta( $sql_approvals );
         } catch ( \Throwable $e ) {
             // Non-throwing — log + bail. Future install attempt will retry.
             error_log( '[DINOCO_CLAIM_CHARGES] dbDelta exception: ' . $e->getMessage() );
@@ -346,6 +413,11 @@ if ( ! function_exists( 'dinoco_claim_charges_maybe_add_check_constraints' ) ) {
             'chk_amount_positive'  => "(amount_thb > 0)",
             'chk_reason_whitelist' => "(reason IN ({$reason_list}))",
             'chk_status_whitelist' => "(status IN ({$status_list}))",
+            // Sprint 15 H2 — immutable snapshot invariant. If app-level drift
+            // detection fails (compromised admin mutates amount_thb), this
+            // CHECK still blocks the write on MySQL 8.0.16+ / MariaDB 10.2.1+.
+            // Defense-in-depth only; charge create handler is primary writer.
+            'chk_amount_snapshot'  => "(amount_thb_at_create > 0)",
         );
 
         foreach ( $constraints as $name => $clause ) {
@@ -447,15 +519,43 @@ if ( ! function_exists( 'dinoco_claim_charges_cleanup_run' ) ) {
             update_option( 'dinoco_cron_claim_charges_cleanup_last_run', current_time( 'mysql' ), false );
         }
 
-        if ( $total_deleted > 0 ) {
+        // Sprint 15 M4 — also purge expired refund_approvals rows.
+        // Consent tokens are short-lived audit trail (default 15min TTL);
+        // 7-day retention is plenty for forensics. Chunked + ORDER BY id ASC
+        // for replication safety.
+        $approvals_deleted = 0;
+        if ( function_exists( 'dinoco_claim_refund_approvals_table_name' ) ) {
+            $atable = dinoco_claim_refund_approvals_table_name();
+            if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $atable ) ) ) === $atable ) {
+                try {
+                    for ( $i = 0; $i < 20; $i++ ) {
+                        $deleted = $wpdb->query(
+                            "DELETE FROM {$atable}
+                              WHERE expires_at < DATE_SUB(NOW(), INTERVAL 7 DAY)
+                              ORDER BY id ASC
+                              LIMIT 1000"
+                        );
+                        if ( ! $deleted || $deleted === false ) break;
+                        $approvals_deleted += (int) $deleted;
+                        if ( $deleted < 1000 ) break;
+                        usleep( 50000 );
+                    }
+                } catch ( \Throwable $e ) {
+                    error_log( '[DINOCO_CLAIM_CHARGES] refund_approvals cleanup exception: ' . $e->getMessage() );
+                }
+            }
+        }
+
+        if ( $total_deleted > 0 || $approvals_deleted > 0 ) {
             update_option( 'dinoco_claim_charges_cleanup_last_run', array(
-                'ran_at'  => current_time( 'mysql' ),
-                'deleted' => $total_deleted,
-                'days'    => $days,
+                'ran_at'             => current_time( 'mysql' ),
+                'deleted'            => $total_deleted,
+                'approvals_deleted'  => $approvals_deleted,
+                'days'               => $days,
             ), false );
         }
 
-        return $total_deleted;
+        return $total_deleted + $approvals_deleted;
     }
 }
 

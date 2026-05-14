@@ -125,12 +125,12 @@ class ClaimChargesSchemaTest extends TestCase {
     // CONSTANTS — whitelists & schema version
     // ════════════════════════════════════════════════════════════════
 
-    public function test_schema_version_constant_defined_as_1_1(): void {
-        // Sprint 12 — bumped 1.0 → 1.1 to force dbDelta re-run on existing installs
-        // (DB-C1 idx_status_created + DB-H1 collation overrides + DB-H2 DECIMAL bump).
+    public function test_schema_version_constant_defined_as_1_2(): void {
+        // Sprint 15 — bumped 1.1 → 1.2 to force dbDelta re-run on existing installs
+        // (H2 amount_thb_at_create snapshot + M4 refund_approvals table).
         $src = SnippetFixture::load();
         $this->assertMatchesRegularExpression(
-            '/define\(\s*\'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION\'\s*,\s*\'1\.1\'\s*\)/',
+            '/define\(\s*\'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION\'\s*,\s*\'1\.2\'\s*\)/',
             $src
         );
     }
@@ -212,6 +212,7 @@ class ClaimChargesSchemaTest extends TestCase {
             'user_id BIGINT(20) UNSIGNED NOT NULL',
             // amount + reason
             'amount_thb DECIMAL(14,2) NOT NULL',                              // Sprint 12 DB-H2
+            'amount_thb_at_create DECIMAL(14,2) NOT NULL',                    // Sprint 15 H2
             'reason VARCHAR(32) NOT NULL',
             'reason_note VARCHAR(500) DEFAULT NULL',
             // status
