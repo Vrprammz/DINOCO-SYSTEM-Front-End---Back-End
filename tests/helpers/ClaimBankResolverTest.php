@@ -400,6 +400,99 @@ final class ClaimBankResolverTest extends TestCase {
         $this->assertNotSame( $default['bank_account'], $walkin['bank_account'] );
     }
 
+    /**
+     * V.33.1 MED-6 — partial walkin (incomplete required fields) FALLS BACK
+     * to default per current resolver contract.
+     *
+     * Resolver source-of-truth: read_bucket() returns `error='incomplete_bank_settings'`
+     * when any required field (name/account/holder/code) is empty. Resolver
+     * §6.4 fallback chain treats ANY error as fallback trigger, not just
+     * "fully empty". This pins the SAFETY behavior: Phase 2 charge handler
+     * never resolves a partial walkin into a customer Flex (would expose
+     * empty bank_account or bank_holder strings → broken UX).
+     *
+     * Trade-off: admin who intends a partial walkin (mid-edit save) will
+     * silently see default bank used at charge create time. Documented
+     * trade-off — admin should complete walkin OR use explicit "clear"
+     * (V.33.1 CRIT-1 fix) to remove walkin entirely.
+     *
+     * This test pins the boundary so future refactors don't silently flip
+     * to "use partial walkin even with empty required fields".
+     */
+    public function test_walkin_partial_falls_back_to_default(): void {
+        // Default fully configured
+        FakeStore::$options['dinoco_claim_bank_name']    = 'ธนาคารกสิกรไทย';
+        FakeStore::$options['dinoco_claim_bank_account'] = '111-1-11111-1';
+        FakeStore::$options['dinoco_claim_bank_holder']  = 'DINOCO';
+        FakeStore::$options['dinoco_claim_bank_code']    = '004';
+
+        // Walk-in PARTIALLY configured (only name + code, missing required
+        // account + holder). CRIT-1 V.33.0 bug scenario: admin set walkin
+        // briefly, then unchecked "use same as default" via UI-only hide.
+        FakeStore::$options['dinoco_claim_walkin_bank_name'] = 'ธนาคารกรุงเทพ';
+        FakeStore::$options['dinoco_claim_walkin_bank_code'] = '002';
+
+        $walkin = dinoco_claim_bank_resolve( true );
+
+        // Partial walkin → resolver falls back to default (safety semantics).
+        $this->assertSame( 'walkin_via_default', $walkin['bucket'],
+            'Partial walkin (incomplete required fields) must fall back to default' );
+        // Returned values are DEFAULT bank's, not partial walkin's.
+        $this->assertSame( '004', $walkin['bank_code'] );
+        $this->assertSame( 'ธนาคารกสิกรไทย', $walkin['bank_name'] );
+        $this->assertSame( '111-1-11111-1', $walkin['bank_account'] );
+        $this->assertSame( 'DINOCO', $walkin['bank_holder'] );
+    }
+
+    /**
+     * V.33.1 MED-6 companion — walkin with ALL required fields set returns
+     * walkin (no fallback). Pins the boundary on the other side.
+     */
+    public function test_walkin_complete_does_not_fall_back(): void {
+        FakeStore::$options['dinoco_claim_bank_name']    = 'ธนาคารกสิกรไทย';
+        FakeStore::$options['dinoco_claim_bank_account'] = '111-1-11111-1';
+        FakeStore::$options['dinoco_claim_bank_holder']  = 'DINOCO';
+        FakeStore::$options['dinoco_claim_bank_code']    = '004';
+
+        // Walk-in fully configured (all 4 required fields)
+        FakeStore::$options['dinoco_claim_walkin_bank_name']    = 'ธนาคารกรุงเทพ';
+        FakeStore::$options['dinoco_claim_walkin_bank_account'] = '222-2-22222-2';
+        FakeStore::$options['dinoco_claim_walkin_bank_holder']  = 'DINOCO Walk-in';
+        FakeStore::$options['dinoco_claim_walkin_bank_code']    = '002';
+
+        $walkin = dinoco_claim_bank_resolve( true );
+        $this->assertSame( 'walkin', $walkin['bucket'] );
+        $this->assertSame( '002', $walkin['bank_code'] );
+        $this->assertArrayNotHasKey( 'error', $walkin );
+    }
+
+    /**
+     * V.33.1 HIGH-3 — migration flag is NOT set when zero fields seeded.
+     *
+     * V.33.0 bug: flag always set after first admin_init regardless of
+     * $touched count. Admin who later defines DINOCO_CLAIM_BANK_* constants
+     * (e.g. wp-config.php edit) would never see them seeded. V.33.1 only
+     * sets the flag when $touched > 0 so subsequent admin_init re-tries
+     * the migration when constants appear.
+     *
+     * Note: we test the EXPECTED BEHAVIOR via state inspection — actual
+     * migration runner uses constant() lookups which can't be mocked here,
+     * so we verify the contract by reading the migrator source for the
+     * touched > 0 conditional. This pairs with the Jest drift detector
+     * that pins the exact source string.
+     */
+    public function test_migration_flag_only_set_when_touched_positive(): void {
+        $repo = dirname( __DIR__, 2 );
+        $src  = file_get_contents( $repo . '/[Admin System] DINOCO Service Center & Claims' );
+
+        // The migrator MUST guard the flag update behind `$touched > 0`.
+        $this->assertMatchesRegularExpression(
+            '/if\s*\(\s*\$touched\s*>\s*0\s*\)\s*\{[\s\S]{1,300}?update_option\(\s*\'dinoco_claim_bank_seeded_from_constants\'/',
+            $src,
+            'V.33.1 HIGH-3: flag update must be inside `if ($touched > 0)` guard'
+        );
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // Validation: bank_account regex
     // ════════════════════════════════════════════════════════════════════

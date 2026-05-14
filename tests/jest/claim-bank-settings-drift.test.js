@@ -27,8 +27,47 @@ describe('Claim Bank Settings — Sprint 9 Phase 1 Task 1.9 drift detector', () 
 
     // ─── Version + DB_ID integrity ────────────────────────────────────
 
-    test('Service Center version bumped to V.33.0', () => {
+    test('Service Center version bumped to V.33.1 (Sprint 10 remediation)', () => {
+        expect(SC).toMatch(/Version: V\.33\.1 \(2026-05-14\)/);
+    });
+
+    test('V.33.0 baseline pin retained in header chain', () => {
         expect(SC).toMatch(/Version: V\.33\.0 \(2026-05-13\)/);
+    });
+
+    // ─── Sprint 10 remediation pins (V.33.1) ─────────────────────────
+
+    test('Sprint 10 CRIT-1 — walkin clear semantic implemented server-side', () => {
+        // POST /bank-settings with {bucket:'walkin', clear:true} must wipe walkin wp_options
+        expect(SC).toMatch(/\$clear\s*=\s*!\s*empty\(\s*\$body\['clear'\]\s*\)\s*&&\s*\$bucket\s*===\s*'walkin'/);
+        // delete_option called for cleared wp_options
+        expect(SC).toMatch(/if\s*\(\s*\$clear\s*\)\s*\{[\s\S]*?delete_option\(/);
+        // Audit row labelled walkin_clear (distinct from regular save)
+        expect(SC).toMatch(/dinoco_claim_bank_audit_save\(\s*\$diff\s*,\s*\$bucket\s*\.\s*'_clear'\s*\)/);
+    });
+
+    test('Sprint 10 CRIT-1 — JS detects walkin toggle and sends clear:true', () => {
+        expect(SC).toMatch(/var clearWalkin\s*=\s*\(bucket\s*===\s*'walkin'\s*&&\s*walkinToggle\s*&&\s*walkinToggle\.checked\)/);
+        expect(SC).toMatch(/bodyObj\s*=\s*clearWalkin/);
+        expect(SC).toMatch(/bucket:\s*'walkin'\s*,\s*clear:\s*true/);
+    });
+
+    test('Sprint 10 HIGH-2 — stale nonce auto-reload (mirrors Manual Invoice V.34.9)', () => {
+        expect(SC).toMatch(/_claimBankHandleAuthError/);
+        expect(SC).toMatch(/'rest_cookie_invalid_nonce'\s*:\s*'nonce'/);
+        expect(SC).toMatch(/_claimBankNonceReloadShown/);
+        expect(SC).toMatch(/wp-login\.php\?redirect_to=/);
+    });
+
+    test('Sprint 10 HIGH-3 — migration flag idempotency: flag inside if ($touched > 0)', () => {
+        expect(SC).toMatch(/if\s*\(\s*\$touched\s*>\s*0\s*\)\s*\{[\s\S]{1,300}?update_option\(\s*'dinoco_claim_bank_seeded_from_constants'/);
+    });
+
+    test('Sprint 10 MED-5 — Flex preview escFull() helper escapes all 5 HTML metachars', () => {
+        expect(SC).toMatch(/function escFull\(s\)\s*\{/);
+        expect(SC).toMatch(/replace\(\/&\/g,\s*'&amp;'\)/);
+        expect(SC).toMatch(/replace\(\/"\/g,\s*'&quot;'\)/);
+        expect(SC).toMatch(/replace\(\/'\/g,\s*'&#39;'\)/);
     });
 
     test('Service Center DB_ID still 27 (unchanged)', () => {

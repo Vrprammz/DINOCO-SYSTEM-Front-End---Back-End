@@ -1,6 +1,28 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.36 (2026-05-13) — Sprint 9 Phase 2.3 B-3: Claim bank bridge.            ║
+ * ║    EXTEND b2b_get_bank_info($order_or_claim_id = 0, $context = 'order') — adds 2 NEW   ║
+ * ║    contexts 'claim' + 'claim_walkin' that route to dinoco_claim_bank_resolve() (Service ║
+ * ║    Center [#27] V.33.0 3-tier resolver). Default $context='order' preserves V.34.35    ║
+ * ║    byte-identical contract — all 16 existing callsites (verified by grep 2026-05-13    ║
+ * ║    + Jest drift detector b2b-get-bank-info-callsites.test.js) pass single-arg form     ║
+ * ║    and continue returning B2B bank. NEW behaviour:                                     ║
+ * ║      • 'claim'        → dinoco_claim_bank_resolve(false) remapped to 5-key B2B shape   ║
+ * ║      • 'claim_walkin' → dinoco_claim_bank_resolve(true)  remapped to 5-key B2B shape   ║
+ * ║      • Unknown $context (defensive) → treated as 'order' (forward-compat).             ║
+ * ║      • dinoco_claim_bank_resolve missing (snippet ordering quirk) → falls back to      ║
+ * ║        B2B bank + error_log() one warning per request (de-duped via static flag).      ║
+ * ║    Return shape (5 keys: name, name_en, account, holder, bank_code) is preserved       ║
+ * ║    regardless of $context so the Phase 2.2 charge handler [#1212] can consume the      ║
+ * ║    same array without rewriting downstream callers. PII protection: no NEW callsite    ║
+ * ║    passes claim context yet — Phase 2.2 charge handler will add the first inside       ║
+ * ║    GET_LOCK + START TRANSACTION (per spec §6.4 immutability contract — Phase 2.8 race  ║
+ * ║    test ClaimBankImmutabilityRaceTest). NEW PHPUnit BankInfoSignaturePinTest covers    ║
+ * ║    backward-compat (16 callsite signatures) + NEW context paths + graceful fallback.   ║
+ * ║    NEW Jest drift detector b2b-get-bank-info-callsites.test.js asserts callsite count  ║
+ * ║    pinned at 16 + flags any new caller passing 'claim'/'claim_walkin' context until    ║
+ * ║    PHPUnit fixture is coordinated. REG-029 byte-identical preserved.                   ║
  * ║  Version: V.34.35 (2026-05-13) — Sprint 6 Phase 1.3 Claim Lifecycle Flex builders:    ║
  * ║    16 NEW builders covering 10 status-keyed + 6 special-event Flex templates per      ║
  * ║    Claim Lifecycle Spec V.2.3 §5.1. Eliminates fallback dead code in Claim Lifecycle  ║
@@ -2879,9 +2901,55 @@ if ( ! function_exists( 'b2b_slip_set_cached_response_by_url' ) ) {
 if ( ! function_exists( 'b2b_get_bank_info' ) ) {
     /**
      * V.32.0: รองรับ walk-in bank account — ถ้า order เป็น walk-in + มี B2B_WALKIN_BANK_ACCOUNT จะใช้บัญชี walk-in
+     *
+     * V.34.36 (2026-05-13 — Sprint 9 Phase 2.3 B-3): EXTEND with $context parameter to
+     * bridge the claim payment flow. Service Center [#27] V.33.0 already ships the
+     * 3-tier resolver `dinoco_claim_bank_resolve($use_walkin)` (admin-editable bank
+     * account separate from B2B). This wrapper exposes it through the existing helper
+     * so the Phase 2.2 charge handler [#1212] reuses the same array shape downstream
+     * callers already consume.
+     *
+     * @param int    $order_or_claim_id  Order ID (context='order') or Claim ID (context='claim'/'claim_walkin').
+     *                                   Currently $order_or_claim_id is unused for claim contexts — claim flow
+     *                                   resolves the bank from wp_options directly (per spec §6.4 — same bank
+     *                                   for all claims; immutability snapshotting happens at charge_create time
+     *                                   not here). Reserved for future per-claim bank routing if business
+     *                                   requirements ever fork.
+     * @param string $context            'order' (default — V.34.35 byte-identical), 'claim', 'claim_walkin'.
+     *                                   Unknown values fall back to 'order' (defensive forward-compat).
+     * @return array                     {name, name_en, account, holder, bank_code} — 5-key B2B shape always.
      */
-    function b2b_get_bank_info( $order_id = 0 ) {
-        $use_walkin = $order_id && function_exists('b2b_is_walkin_order') && b2b_is_walkin_order($order_id)
+    function b2b_get_bank_info( $order_or_claim_id = 0, $context = 'order' ) {
+        // V.34.36: branch on $context BEFORE legacy walk-in detection. Claim bank is
+        // resolved entirely from wp_options/constants (no order-walkin coupling).
+        if ( $context === 'claim' || $context === 'claim_walkin' ) {
+            $use_walkin_claim = ( $context === 'claim_walkin' );
+            if ( function_exists( 'dinoco_claim_bank_resolve' ) ) {
+                $resolved = dinoco_claim_bank_resolve( $use_walkin_claim );
+                // Remap 9-key resolver shape → 5-key B2B shape so callers consume identically.
+                // Resolver returns: bank_name, bank_name_en, bank_account, bank_holder,
+                //                   bank_code, bank_branch, bank_logo_url, bucket, source, ?error
+                return array(
+                    'name'      => isset( $resolved['bank_name'] )    ? (string) $resolved['bank_name']    : '',
+                    'name_en'   => isset( $resolved['bank_name_en'] ) ? (string) $resolved['bank_name_en'] : '',
+                    'account'   => isset( $resolved['bank_account'] ) ? (string) $resolved['bank_account'] : '',
+                    'holder'    => isset( $resolved['bank_holder'] )  ? (string) $resolved['bank_holder']  : '',
+                    'bank_code' => isset( $resolved['bank_code'] )    ? (string) $resolved['bank_code']    : '',
+                );
+            }
+            // Graceful fallback — claim bank resolver not loaded (snippet ordering quirk
+            // during partial sync). Log once per request, then fall through to B2B bank.
+            static $logged_missing_resolver = false;
+            if ( ! $logged_missing_resolver ) {
+                error_log( '[b2b_get_bank_info] context=' . $context . ' requested but dinoco_claim_bank_resolve() not loaded — falling back to B2B bank. Verify Service Center [#27] sync status.' );
+                $logged_missing_resolver = true;
+            }
+            // Falls through to legacy B2B path below (defensive — better B2B bank than nothing).
+        }
+        // Defensive forward-compat: unknown $context value (typo, future variant) →
+        // treated as 'order' (legacy path). No log — silent default.
+
+        $use_walkin = $order_or_claim_id && function_exists('b2b_is_walkin_order') && b2b_is_walkin_order($order_or_claim_id)
                       && defined('B2B_WALKIN_BANK_ACCOUNT') && B2B_WALKIN_BANK_ACCOUNT;
 
         if ( $use_walkin ) {

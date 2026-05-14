@@ -1,6 +1,24 @@
 /*
  * Plugin Name: [Module] DINOCO Service Center & Claims
  * Description: ระบบบริหารจัดการงานเคลม
+ * Version: V.33.1 (2026-05-14) — Sprint 10 code-reviewer remediation (1 CRIT + 2 HIGH + 1 MED).
+ *   CRIT-1 — walkin checkbox state coherence: when admin checks "ใช้บัญชีเดียวกับบัญชีหลัก",
+ *     JS now POSTs {bucket:'walkin', clear:true} and server WIPES all 7 walkin wp_options
+ *     (audited as bucket='walkin_clear'). V.33.0 was UI-only hide → stale walkin data
+ *     would leak into Phase 2 charge handler. 'default' bucket cannot be cleared.
+ *   HIGH-2 — stale nonce auto-reload: REST 403 + rest_cookie_invalid_nonce now triggers
+ *     one-shot confirm-then-reload (mirrors Manual Invoice V.34.9 pattern). Whitelist
+ *     exact error codes (rest_cookie_invalid_nonce / rest_forbidden / rest_not_logged_in)
+ *     so unrelated 403s (rate limits etc.) fall through to normal error toast.
+ *   HIGH-3 — migration flag idempotency: dinoco_claim_bank_seeded_from_constants now
+ *     ONLY set when $touched > 0. V.33.0 always set it after first admin_init →
+ *     admin later defining DINOCO_CLAIM_BANK_* constants would never seed because
+ *     flag was prematurely set on zero-touched first run.
+ *   MED-5 — Flex preview escFull(): was .replace(/</g,'&lt;') only. Bank fields are
+ *     admin-entered strings that flow into JSON preview — full HTML escape via
+ *     escFull() prevents stored XSS via crafted bank_holder / bank_branch values.
+ *   MED-6 — companion PHPUnit walkin-partial test landed in ClaimBankResolverTest.
+ *
  * Version: V.33.0 (2026-05-13) — Sprint 9 Phase 1 Task 1.9: Claim Bank Settings.
  *   FOUNDATION for separated claim bank (boss directive 2026-05-13 — claim charges
  *   use a different bank account from B2B orders). Self-contained additive module
@@ -5256,14 +5274,20 @@ if ( ! function_exists( 'dinoco_claim_bank_maybe_migrate_constants' ) ) {
                 $touched++;
             }
         }
-        update_option( 'dinoco_claim_bank_seeded_from_constants', '1', true );
-        if ( $touched > 0 && function_exists( 'dinoco_audit_log' ) ) {
-            dinoco_audit_log( array(
-                'event_type'  => 'claim_bank_seeded_from_constants',
-                'actor_type'  => 'system',
-                'target_type' => 'wp_option',
-                'context'     => array( 'fields_seeded' => $touched ),
-            ) );
+        // V.33.1 HIGH-3 fix — flag only set when at least one seed happened.
+        // Otherwise, future admin defining DINOCO_CLAIM_BANK_* constants AFTER
+        // first admin_init (e.g., wp-config.php edit) would be silently ignored
+        // because flag was prematurely set on zero-touched first run.
+        if ( $touched > 0 ) {
+            update_option( 'dinoco_claim_bank_seeded_from_constants', '1', true );
+            if ( function_exists( 'dinoco_audit_log' ) ) {
+                dinoco_audit_log( array(
+                    'event_type'  => 'claim_bank_seeded_from_constants',
+                    'actor_type'  => 'system',
+                    'target_type' => 'wp_option',
+                    'context'     => array( 'fields_seeded' => $touched ),
+                ) );
+            }
         }
     }
 }
@@ -5410,6 +5434,39 @@ if ( ! function_exists( 'dinoco_claim_bank_rest_save' ) ) {
 
         $bucket = isset( $body['bucket'] ) && $body['bucket'] === 'walkin'
             ? 'walkin' : 'default';
+
+        // V.33.1 CRIT-1 fix — walkin bucket explicit clear semantic:
+        // When admin checks "ใช้บัญชีเดียวกับบัญชีหลัก" the JS now POSTs
+        // {bucket:'walkin', clear:true} so server WIPES all 7 walkin wp_options
+        // (audited via dual-channel). Without this, Phase 2 charge handler would
+        // resolve walkin → stale wp_options → wrong bank snapshot on customer Flex.
+        // 'default' bucket cannot be cleared (no resolver fallback chain protects it).
+        $clear = ! empty( $body['clear'] ) && $bucket === 'walkin';
+
+        if ( $clear ) {
+            $keys = dinoco_claim_bank_field_keys( $bucket );
+            $diff = array();
+            foreach ( array( 'name', 'name_en', 'account', 'holder', 'code', 'branch', 'logo_url' ) as $field ) {
+                $opt_key = $keys['options'][ $field ];
+                $before  = (string) get_option( $opt_key, '' );
+                if ( $before !== '' ) {
+                    delete_option( $opt_key );
+                    $diff[ $opt_key ] = array( 'before' => $before, 'after' => '' );
+                }
+            }
+            if ( ! empty( $diff ) ) {
+                dinoco_claim_bank_audit_save( $diff, $bucket . '_clear' );
+            }
+            return rest_ensure_response( array(
+                'saved'        => true,
+                'bucket'       => $bucket,
+                'cleared'      => true,
+                'changed_keys' => array_keys( $diff ),
+                'change_count' => count( $diff ),
+                'resolver'     => dinoco_claim_bank_resolve( true ),  // proves fallback chain works
+            ) );
+        }
+
         $payload = isset( $body['payload'] ) && is_array( $body['payload'] )
             ? $body['payload'] : array();
 
@@ -5721,21 +5778,72 @@ if ( ! function_exists( 'dinoco_claim_bank_settings_render' ) ) {
                 };
             }
 
+            // V.33.1 MED-5 fix — full HTML escape for Flex preview (was single-char only).
+            // Prevents stored XSS via bank fields when admin views Flex JSON in preview.
+            function escFull(s){
+                s = String(s == null ? '' : s);
+                return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                        .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+            }
+
+            // V.33.1 HIGH-2 fix — stale nonce auto-reload (mirrors Manual Invoice V.34.9).
+            // Long admin sessions (>24h) hit rest_cookie_invalid_nonce 403 → without
+            // this guard, every save silently fails. One-shot dialog → reload page →
+            // fresh nonce + restart clean. Whitelist exact error codes only (Sprint 7
+            // MED-2 precedent — don't catch unrelated 403s like rate_limit).
+            var _claimBankNonceReloadShown = false;
+            function _claimBankHandleAuthError(status, errCode){
+                if (status !== 403 && status !== 401) return false;
+                var nonceCodes = {
+                    'rest_cookie_invalid_nonce': 'nonce',
+                    'rest_forbidden': 'logout',
+                    'rest_not_logged_in': 'logout',
+                };
+                var match = nonceCodes[errCode];
+                if (!match) return false;
+                if (_claimBankNonceReloadShown) return true;
+                _claimBankNonceReloadShown = true;
+                if (match === 'nonce') {
+                    var ok = confirm('Security token หมดอายุ — กดตกลงเพื่อโหลดหน้าใหม่ (ข้อมูลที่กรอกค้างจะหายไป)');
+                    if (ok) window.location.reload();
+                    else _claimBankNonceReloadShown = false;
+                } else {
+                    window.location.href = '/wp-login.php?redirect_to=' + encodeURIComponent(window.location.href);
+                }
+                return true;
+            }
+
             async function saveBucket(bucket){
-                var ok = await cbCfm('ยืนยันการบันทึกบัญชี' + (bucket === 'walkin' ? ' Walk-in' : 'หลัก') + '?', {
-                    title: 'บันทึกบัญชี', confirmText: 'บันทึก'
+                // V.33.1 CRIT-1 fix — walkin "ใช้บัญชีเดียวกับบัญชีหลัก" must wipe
+                // walkin wp_options server-side (UI-only hide leaks stale data into
+                // Phase 2 charge handler). Detect walkin + checkbox checked → send
+                // clear:true instead of payload.
+                var clearWalkin = (bucket === 'walkin' && walkinToggle && walkinToggle.checked);
+
+                var confirmMsg = clearWalkin
+                    ? 'ยืนยันใช้บัญชีเดียวกับบัญชีหลัก? (ระบบจะลบข้อมูลบัญชี Walk-in ออกจาก database)'
+                    : 'ยืนยันการบันทึกบัญชี' + (bucket === 'walkin' ? ' Walk-in' : 'หลัก') + '?';
+                var ok = await cbCfm(confirmMsg, {
+                    title: clearWalkin ? 'ลบบัญชี Walk-in' : 'บันทึกบัญชี',
+                    confirmText: clearWalkin ? 'ลบและใช้บัญชีหลัก' : 'บันทึก',
+                    danger: !!clearWalkin
                 });
                 if (!ok) return;
 
-                var payload = collectPayload(bucket);
+                var bodyObj = clearWalkin
+                    ? { bucket: 'walkin', clear: true }
+                    : { bucket: bucket, payload: collectPayload(bucket) };
+
                 try {
                     var resp = await fetch(restUrl, {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json', 'X-WP-Nonce': nonce},
-                        body: JSON.stringify({bucket: bucket, payload: payload})
+                        body: JSON.stringify(bodyObj)
                     });
                     var data = await resp.json();
                     if (!resp.ok) {
+                        var errCode = data && data.code ? data.code : '';
+                        if (_claimBankHandleAuthError(resp.status, errCode)) return;
                         var errMsgs = [];
                         if (data && data.data && data.data.errors) {
                             for (var k in data.data.errors) errMsgs.push(k + ': ' + data.data.errors[k]);
@@ -5743,9 +5851,13 @@ if ( ! function_exists( 'dinoco_claim_bank_settings_render' ) ) {
                         showResult('บันทึกล้มเหลว — ' + (errMsgs.join(', ') || (data && data.message) || 'unknown'), false);
                         return;
                     }
-                    showResult('✅ บันทึกเรียบร้อย — เปลี่ยน ' + (data.change_count || 0) + ' ฟิลด์', true);
+                    if (clearWalkin) {
+                        showResult('✅ ลบบัญชี Walk-in เรียบร้อย — ' + (data.change_count || 0) + ' ฟิลด์ถูกล้าง', true);
+                    } else {
+                        showResult('✅ บันทึกเรียบร้อย — เปลี่ยน ' + (data.change_count || 0) + ' ฟิลด์', true);
+                    }
                 } catch (e) {
-                    showResult('Network error: ' + e.message, false);
+                    showResult('Network error: ' + escFull(e.message), false);
                 }
             }
 
@@ -5758,13 +5870,17 @@ if ( ! function_exists( 'dinoco_claim_bank_settings_render' ) ) {
                     });
                     var data = await resp.json();
                     if (!resp.ok) {
+                        var errCode = data && data.code ? data.code : '';
+                        if (_claimBankHandleAuthError(resp.status, errCode)) return;
                         showResult('ทดสอบล้มเหลว — ' + ((data && data.message) || 'unknown'), false);
                         return;
                     }
+                    // V.33.1 MED-5 fix — full HTML escape (was &lt; only). Bank fields
+                    // can contain user-controlled strings that flow into JSON preview.
                     showResult('🧪 Flex Preview (Phase 1 — ไม่ได้ส่งจริง):<br><pre>' +
-                        JSON.stringify(data.flex, null, 2).replace(/</g,'&lt;') + '</pre>', true);
+                        escFull(JSON.stringify(data.flex, null, 2)) + '</pre>', true);
                 } catch (e) {
-                    showResult('Network error: ' + e.message, false);
+                    showResult('Network error: ' + escFull(e.message), false);
                 }
             }
 

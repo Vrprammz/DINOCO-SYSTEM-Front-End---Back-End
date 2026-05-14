@@ -1,0 +1,424 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Claim Charges Schema                      ║
+ * ║  Version: V.0.1 (2026-05-14) — Phase 2.1 foundation              ║
+ * ║  DB_ID: (pending — boss must create WP admin entry first per     ║
+ * ║          feedback_create_wp_snippet_first memory; until then     ║
+ * ║          sync engine will skip this file)                        ║
+ * ║  Description: Lazy install + idempotent ALTER guard for          ║
+ * ║    wp_dinoco_claim_charges table. Phase 2 Payment Flow charge    ║
+ * ║    persistence (Claim Lifecycle Spec V.2.2 §3.1 + §6.4).         ║
+ * ║                                                                  ║
+ * ║  IMPORTANT for boss:                                             ║
+ * ║    1. Create snippet titled '[Admin System] DINOCO Claim         ║
+ * ║       Charges Schema' in WP admin                                ║
+ * ║    2. Run sync — DB_ID will populate automatically in this       ║
+ * ║       file's header on next pull                                 ║
+ * ║    3. Until step 1 done, this file WILL NOT SYNC (matches        ║
+ * ║       behaviour of every other "Snippet N" with no DB_ID)        ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * PROBLEM
+ * -------
+ * Phase 2 Payment Flow needs durable persistence for partial charges
+ * (e.g. customer pays return shipping, repair-out-of-warranty fee, extra
+ * parts) against a `claim_ticket` CPT. Bank info MUST be snapshotted at
+ * INSERT time so admin's mid-flow bank-account edits do not invalidate
+ * customer's already-issued Flex card (see §6.4 immutability contract).
+ *
+ * SOLUTION
+ * --------
+ * Single canonical table `wp_dinoco_claim_charges` (mirrors Idempotency
+ * Helper / Flag Audit Log lazy-install pattern) with:
+ *   - 7-column bank snapshot (bank_code/account/holder/name/branch/context)
+ *   - Slip2Go verify cache (slip_image_url / slip_ref_hash / slip_verify_data)
+ *   - State machine column (status VARCHAR(24))
+ *   - 4 KEY indexes for hot-path lookups
+ *   - 1 UNIQUE constraint (slip_ref_hash) preventing slip replay
+ *   - Optional CHECK constraints on MySQL 8.0.16+ (PHP validator is primary
+ *     defense — see B2F V.7.0 / Phase 4 migration pattern)
+ *   - 90-day retention cron for cancelled/expired rows
+ *
+ * DESIGN PRINCIPLES
+ *   - LAZY INSTALL  — schema version flag on admin_init (autoload=false)
+ *   - IDEMPOTENT    — re-runs are safe (INFORMATION_SCHEMA gated ALTERs)
+ *   - ADDITIVE      — zero behaviour change at existing endpoints
+ *                     (this file builds NOTHING but schema + table-name
+ *                     helper + retention cron)
+ *   - NON-THROWING  — best-effort everywhere; failures fall through
+ *
+ * Public API:
+ *   dinoco_claim_charges_table_name() : string  (returns prefixed table)
+ *   dinoco_claim_charges_schema_install() : void  (idempotent install)
+ *   dinoco_claim_charges_cleanup_run() : int  (cron + manual)
+ *   DINOCO_CLAIM_CHARGES_SCHEMA_VERSION (const) — current schema version
+ *   DINOCO_CLAIM_CHARGES_REASON_WHITELIST (const) — 4 canonical reason values
+ *   DINOCO_CLAIM_CHARGES_STATUS_WHITELIST (const) — 7 canonical status values
+ *   DINOCO_CLAIM_CHARGES_BANK_CONTEXT_WHITELIST (const) — 2 context values
+ *
+ * NOT included in this snippet (defer to later Phase 2 tasks):
+ *   - Charge create/read/update/refund REST handlers (Phase 2.2 — [#1212])
+ *   - Service Center "Charges" admin section (Phase 2.4 — Snippet [#27])
+ *   - Customer LIFF UI (Phase 2.5)
+ *   - Slip2Go verify wrapper `dinoco_verify_slip_for_claim` (Phase 2.2 B1)
+ *   - Expiry cron `dinoco_claim_charge_expire_cron` (Phase 2.6)
+ *
+ * Spec reference:
+ *   docs/feature-specs/FEATURE-SPEC-CLAIM-LIFECYCLE-2026-05-13.md
+ *   §3.1 (DDL) + §6.4 (immutability contract) + Phase 2 Task 2.1 (7h budget)
+ *
+ * Related snippets (cross-refs use [#NNNN] format to avoid drift detector
+ * false-positive — actual DB_IDs):
+ *   - [#1194] DINOCO Idempotency Helper — lazy-install + cron pattern
+ *   - [#1193] DINOCO Flag Audit Log — 90-day retention cron pattern
+ *   - [#27]   DINOCO Service Center & Claims — claim_bank_resolve() consumer
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 0. CONSTANTS — canonical whitelists (referenced by future Phase 2 handlers)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! defined( 'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION' ) ) {
+    define( 'DINOCO_CLAIM_CHARGES_SCHEMA_VERSION', '1.0' );
+}
+
+if ( ! defined( 'DINOCO_CLAIM_CHARGES_REASON_WHITELIST' ) ) {
+    // 4 canonical reasons per Phase 2 spec §6 charge create contract.
+    // Future handler MUST validate input against this list before INSERT.
+    define( 'DINOCO_CLAIM_CHARGES_REASON_WHITELIST', 'return_shipping,repair_oow,extra_parts,other' );
+}
+
+if ( ! defined( 'DINOCO_CLAIM_CHARGES_STATUS_WHITELIST' ) ) {
+    // 7 canonical states per Phase 2 spec §6 charge state machine.
+    // pending_payment → pending_review → verified
+    //   pending_payment → expired (cron sweep)
+    //   pending_payment → cancelled (customer or admin abort)
+    //   pending_review → rejected (admin manual reject)
+    //   verified → refunded (4-eyes — refund_approver_id required)
+    define( 'DINOCO_CLAIM_CHARGES_STATUS_WHITELIST', 'pending_payment,pending_review,verified,rejected,refunded,expired,cancelled' );
+}
+
+if ( ! defined( 'DINOCO_CLAIM_CHARGES_BANK_CONTEXT_WHITELIST' ) ) {
+    // 'claim'        → uses DINOCO_CLAIM_BANK_* / wp_options dinoco_claim_bank_*
+    // 'claim_walkin' → uses DINOCO_CLAIM_WALKIN_BANK_* (auto-detected from
+    //                  distributor.is_walkin at charge create time per H-7)
+    define( 'DINOCO_CLAIM_CHARGES_BANK_CONTEXT_WHITELIST', 'claim,claim_walkin' );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. TABLE NAME HELPER — single seam for future renames
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) {
+    /**
+     * Resolve the fully-prefixed table name. Single seam — every other
+     * helper / handler / test references this function so a future
+     * rename only touches one site.
+     *
+     * @return string e.g. "wp_dinoco_claim_charges"
+     */
+    function dinoco_claim_charges_table_name() {
+        global $wpdb;
+        return $wpdb->prefix . 'dinoco_claim_charges';
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. SCHEMA INSTALL — lazy, idempotent, version-gated
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_charges_schema_install' ) ) {
+    /**
+     * Install wp_dinoco_claim_charges table via dbDelta. Idempotent —
+     * tracks version in wp_option 'dinoco_claim_charges_schema_version'.
+     *
+     * Schema rationale (mirrors spec §3.1 V.2.2):
+     *   - id BIGINT UNSIGNED — surrogate PK
+     *   - claim_id BIGINT UNSIGNED NOT NULL — FK to wp_posts (claim_ticket)
+     *   - user_id BIGINT UNSIGNED NOT NULL — FK to wp_users (customer)
+     *   - amount_thb DECIMAL(12,2) NOT NULL — Thai baht precision (avoid float)
+     *   - reason VARCHAR(32) NOT NULL — whitelist enforced by PHP handler
+     *   - reason_note VARCHAR(500) — free-form admin annotation
+     *   - status VARCHAR(24) — state machine column (NOT ENUM — ALTER-friendly)
+     *   - bank_* columns — IMMUTABLE snapshot at INSERT (see spec §6.4)
+     *   - slip_image_url VARCHAR(500) — short LINE/CDN URL fits
+     *   - slip_ref_hash CHAR(64) — SHA256 hex; UNIQUE prevents replay
+     *   - slip_verify_data LONGTEXT — full Slip2Go response JSON
+     *   - payment_ref VARCHAR(64) — public-facing token (CLM-CHG-0001-7f3a)
+     *   - verified_at / verified_by — admin approval audit
+     *   - refund_* — 4-eyes audit (refund_approver_id = second approver)
+     *   - expires_at DATETIME NOT NULL — 24h default (set by handler)
+     *   - created_at / created_by — INSERT-time audit
+     *
+     *   - 4 KEY indexes:
+     *       idx_claim          — admin "all charges for claim N"
+     *       idx_user_status    — customer LIFF "my pending charges"
+     *       idx_status_expires — expiry cron sweep WHERE status=pending_payment
+     *                            AND expires_at < NOW()
+     *       idx_created        — chronological audit
+     *   - 1 UNIQUE: uq_slip_replay_claim (slip_ref_hash) — spec §3.1
+     *     namespace scoping: handler MUST compute hash as
+     *       sha256("claim::" . $img_sha . $amount . $ts)
+     *     to avoid collisions with Extension Marketplace's slip_ref_hash
+     *     UNIQUE constraint (parallel feature, different namespace).
+     *
+     * CHECK constraints (MySQL 8.0.16+ / MariaDB 10.2.1+ only — silently
+     * skipped on lower versions per b2f_audit_check_mysql_version pattern):
+     *   chk_amount_positive    — amount_thb > 0
+     *   chk_reason_whitelist   — reason IN (4 values)
+     *   chk_status_whitelist   — status IN (7 values)
+     * PHP validator in future Phase 2.2 handler is the PRIMARY defense.
+     * Constraints are defense-in-depth only.
+     *
+     * @return void
+     */
+    function dinoco_claim_charges_schema_install() {
+        global $wpdb;
+
+        $current = get_option( 'dinoco_claim_charges_schema_version', '0' );
+        $target  = DINOCO_CLAIM_CHARGES_SCHEMA_VERSION;
+        if ( $current === $target ) return;
+
+        $table   = dinoco_claim_charges_table_name();
+        $charset = $wpdb->get_charset_collate();
+
+        // dbDelta-compatible DDL.
+        // NOTE: dbDelta is fussy — two spaces between PRIMARY KEY and (col),
+        // each KEY on its own line, no trailing commas.
+        $sql = "CREATE TABLE {$table} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            claim_id BIGINT(20) UNSIGNED NOT NULL,
+            user_id BIGINT(20) UNSIGNED NOT NULL,
+            amount_thb DECIMAL(12,2) NOT NULL,
+            reason VARCHAR(32) NOT NULL,
+            reason_note VARCHAR(500) DEFAULT NULL,
+            status VARCHAR(24) NOT NULL DEFAULT 'pending_payment',
+            bank_code VARCHAR(16) DEFAULT NULL,
+            bank_account VARCHAR(32) DEFAULT NULL,
+            bank_holder VARCHAR(128) DEFAULT NULL,
+            bank_name VARCHAR(64) DEFAULT NULL,
+            bank_branch VARCHAR(64) DEFAULT NULL,
+            bank_context VARCHAR(16) DEFAULT 'claim',
+            slip_image_url VARCHAR(500) DEFAULT NULL,
+            slip_ref_hash CHAR(64) DEFAULT NULL,
+            slip_verify_data LONGTEXT DEFAULT NULL,
+            payment_ref VARCHAR(64) NOT NULL,
+            verified_at DATETIME DEFAULT NULL,
+            verified_by BIGINT(20) UNSIGNED DEFAULT NULL,
+            refund_reason VARCHAR(500) DEFAULT NULL,
+            refund_approver_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            refunded_at DATETIME DEFAULT NULL,
+            refunded_by BIGINT(20) UNSIGNED DEFAULT NULL,
+            expires_at DATETIME NOT NULL,
+            created_at DATETIME NOT NULL,
+            created_by BIGINT(20) UNSIGNED NOT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_claim (claim_id),
+            KEY idx_user_status (user_id, status),
+            KEY idx_status_expires (status, expires_at),
+            KEY idx_created (created_at),
+            UNIQUE KEY uq_slip_replay_claim (slip_ref_hash)
+        ) {$charset};";
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+        try {
+            dbDelta( $sql );
+        } catch ( \Throwable $e ) {
+            // Non-throwing — log + bail. Future install attempt will retry.
+            error_log( '[DINOCO_CLAIM_CHARGES] dbDelta exception: ' . $e->getMessage() );
+            return;
+        }
+
+        // ─── Optional CHECK constraints (MySQL 8.0.16+ / MariaDB 10.2.1+) ──
+        // Defense-in-depth ONLY — PHP validator in charge create handler
+        // (Phase 2.2) is the primary defense. Silent skip on lower versions.
+        dinoco_claim_charges_maybe_add_check_constraints( $table );
+
+        update_option( 'dinoco_claim_charges_schema_version', $target, false );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_charges_supports_check_constraints' ) ) {
+    /**
+     * Probe whether the current MySQL/MariaDB version enforces CHECK
+     * constraints. Mirrors b2f_audit_check_mysql_version() pattern but
+     * stays defensive (no dep on B2F snippet).
+     *
+     *   MySQL    8.0.16+  → enforced
+     *   MariaDB  10.2.1+  → enforced
+     *   Older            → parsed but silently ignored
+     *
+     * @return bool true if enforced, false otherwise
+     */
+    function dinoco_claim_charges_supports_check_constraints() {
+        global $wpdb;
+        $version = (string) $wpdb->get_var( "SELECT VERSION()" );
+        $lower   = strtolower( $version );
+        $is_mariadb = ( strpos( $lower, 'mariadb' ) !== false );
+
+        if ( ! preg_match( '/^(\d+\.\d+\.\d+)/', $version, $m ) ) {
+            return false;
+        }
+        $v = $m[1];
+
+        if ( $is_mariadb ) {
+            return version_compare( $v, '10.2.1', '>=' );
+        }
+        // MySQL
+        return version_compare( $v, '8.0.16', '>=' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_charges_maybe_add_check_constraints' ) ) {
+    /**
+     * Apply CHECK constraints if (1) the server supports them AND
+     * (2) they are not already present. Each ALTER is gated by an
+     * INFORMATION_SCHEMA.CHECK_CONSTRAINTS probe so re-runs are safe.
+     *
+     * @param string $table Fully prefixed table name
+     * @return void
+     */
+    function dinoco_claim_charges_maybe_add_check_constraints( $table ) {
+        global $wpdb;
+
+        if ( ! dinoco_claim_charges_supports_check_constraints() ) {
+            // Defense-in-depth not available; PHP validator handles whitelist.
+            return;
+        }
+
+        // Build reason whitelist literal — must match
+        // DINOCO_CLAIM_CHARGES_REASON_WHITELIST exactly.
+        $reasons  = explode( ',', DINOCO_CLAIM_CHARGES_REASON_WHITELIST );
+        $statuses = explode( ',', DINOCO_CLAIM_CHARGES_STATUS_WHITELIST );
+
+        $reason_list  = "'" . implode( "','", array_map( 'esc_sql', $reasons ) ) . "'";
+        $status_list  = "'" . implode( "','", array_map( 'esc_sql', $statuses ) ) . "'";
+
+        $constraints = array(
+            'chk_amount_positive'  => "(amount_thb > 0)",
+            'chk_reason_whitelist' => "(reason IN ({$reason_list}))",
+            'chk_status_whitelist' => "(status IN ({$status_list}))",
+        );
+
+        foreach ( $constraints as $name => $clause ) {
+            try {
+                // INFORMATION_SCHEMA gate: skip if already present
+                $exists = $wpdb->get_var( $wpdb->prepare(
+                    "SELECT CONSTRAINT_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+                     WHERE CONSTRAINT_SCHEMA = DATABASE()
+                       AND TABLE_NAME = %s
+                       AND CONSTRAINT_NAME = %s
+                       AND CONSTRAINT_TYPE = 'CHECK'
+                     LIMIT 1",
+                    $table,
+                    $name
+                ) );
+                if ( $exists === $name ) continue;
+
+                // Safe to ALTER. Note: identifier interpolation; $clause is
+                // string-built from class-internal literals, never user input.
+                $wpdb->query( "ALTER TABLE {$table} ADD CONSTRAINT {$name} CHECK {$clause}" );
+            } catch ( \Throwable $e ) {
+                error_log( '[DINOCO_CLAIM_CHARGES] ADD CONSTRAINT ' . $name . ' exception: ' . $e->getMessage() );
+                // Continue — defense-in-depth is best-effort.
+            }
+        }
+    }
+}
+
+// Lazy install on admin_init (fast — version-gated short-circuit on hot path)
+add_action( 'admin_init', function() {
+    if ( get_option( 'dinoco_claim_charges_schema_version', '0' ) !== DINOCO_CLAIM_CHARGES_SCHEMA_VERSION ) {
+        dinoco_claim_charges_schema_install();
+    }
+} );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. RETENTION CRON — 90-day purge for cancelled + expired rows
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_charges_cleanup_run' ) ) {
+    /**
+     * DELETE cancelled + expired rows older than 90 days. Chunked
+     * 1000/iter × 20 iterations max (= 20K rows/run cap). Pending /
+     * verified / refunded rows are PRESERVED indefinitely — finance
+     * audit + PDPA retention require them (refund traceability).
+     *
+     * Why limited to cancelled+expired:
+     *   - cancelled = customer aborted → no money moved → safe to purge
+     *   - expired   = 24h timeout reached → no slip uploaded → safe to purge
+     *   - verified  = money moved → keep for tax/finance
+     *   - refunded  = money moved twice → keep for refund audit
+     *   - rejected  = admin rejected slip → keep for fraud forensics
+     *
+     * @return int Total rows deleted this run
+     */
+    function dinoco_claim_charges_cleanup_run() {
+        global $wpdb;
+        $table = dinoco_claim_charges_table_name();
+
+        // Defensive: table may not exist yet (snippet activated before sync)
+        if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $table ) ) ) !== $table ) {
+            // Still write heartbeat so Health Monitor sees the cron is alive
+            update_option( 'dinoco_cron_claim_charges_cleanup_last_run', current_time( 'mysql' ), false );
+            return 0;
+        }
+
+        $days = (int) get_option( 'dinoco_claim_charges_retention_days', 90 );
+        if ( $days < 30 ) $days = 30;   // Floor — protect against misconfig
+        if ( $days > 365 ) $days = 365; // Ceiling
+
+        $total_deleted = 0;
+        $max_iters     = 20;
+        try {
+            for ( $i = 0; $i < $max_iters; $i++ ) {
+                $deleted = $wpdb->query( $wpdb->prepare(
+                    "DELETE FROM {$table}
+                      WHERE status IN ('cancelled','expired')
+                        AND created_at < DATE_SUB(NOW(), INTERVAL %d DAY)
+                      LIMIT 1000",
+                    $days
+                ) );
+                if ( ! $deleted || $deleted === false ) break;
+                $total_deleted += (int) $deleted;
+                if ( $deleted < 1000 ) break;
+                usleep( 50000 ); // 50ms gap — let other queries breathe
+            }
+        } catch ( \Throwable $e ) {
+            error_log( '[DINOCO_CLAIM_CHARGES] cleanup exception: ' . $e->getMessage() );
+        } finally {
+            // R12 pattern: heartbeat in `finally` so Health Monitor sees a
+            // cron run even when an exception aborts the loop midway.
+            update_option( 'dinoco_cron_claim_charges_cleanup_last_run', current_time( 'mysql' ), false );
+        }
+
+        if ( $total_deleted > 0 ) {
+            update_option( 'dinoco_claim_charges_cleanup_last_run', array(
+                'ran_at'  => current_time( 'mysql' ),
+                'deleted' => $total_deleted,
+                'days'    => $days,
+            ), false );
+        }
+
+        return $total_deleted;
+    }
+}
+
+if ( ! wp_next_scheduled( 'dinoco_claim_charges_cleanup_cron' ) ) {
+    // Daily at ~03:30 (offset from idempotency 03:15 and flag-audit 03:00 to
+    // spread DB load across the cron fleet).
+    $first_run = strtotime( 'tomorrow 03:30' );
+    if ( ! $first_run ) $first_run = time() + DAY_IN_SECONDS;
+    wp_schedule_event( $first_run, 'daily', 'dinoco_claim_charges_cleanup_cron' );
+}
+
+// Register heartbeat tracking via dinoco_register_cron when Health Monitor
+// available; fallback to legacy add_action when helper not synced.
+if ( function_exists( 'dinoco_register_cron' ) && function_exists( 'dinoco_claim_charges_cleanup_run' ) ) {
+    dinoco_register_cron( 'dinoco_claim_charges_cleanup_cron', 'daily', 'dinoco_claim_charges_cleanup_run' );
+} else {
+    add_action( 'dinoco_claim_charges_cleanup_cron', 'dinoco_claim_charges_cleanup_run' );
+}
