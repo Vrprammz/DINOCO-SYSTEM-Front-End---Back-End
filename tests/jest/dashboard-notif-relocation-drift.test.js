@@ -66,10 +66,8 @@ describe('Edit Profile V.35.0 — Notification Settings Relocation (Sprint 35 A2
         ];
         keys.forEach(k => {
             // Either as concat literal 'dinoco_sn_notif_' . $nk OR full string
-            // Accept both patterns
-            const suffix = k.replace('dinoco_sn_notif_', '');
-            // We use prefix concat in PHP: 'dinoco_sn_notif_' . $nk
-            // So check for both: full literal OR data-meta literal in HTML
+            // Accept both patterns. (Suffix var elided — only the full literal
+            // is asserted via regex; underscore-prefixed if future need arises.)
             const fullLiteral = new RegExp(k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
             expect(code).toMatch(fullLiteral);
         });
