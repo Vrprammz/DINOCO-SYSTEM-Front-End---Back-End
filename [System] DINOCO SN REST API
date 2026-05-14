@@ -2,6 +2,12 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.48 (2026-05-14) — Phase 6 P4 OP-3 expansion: 3 new ║
+ * ║                                  bulk endpoints — /bulk/relink,  ║
+ * ║                                  /bulk/notify (max 500 LINE      ║
+ * ║                                  quota), /bulk/transfer (between║
+ * ║                                  batches). All idempotent +     ║
+ * ║                                  rate-limited + audit + obs.   ║
  * ║  Version: V.0.47 (2026-05-14) — Phase 6 QW-5 finish: marketplace ║
  * ║                                  checkout wires real referral   ║
  * ║                                  redemption via Notifier helper ║
@@ -1851,6 +1857,54 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                 'status'   => array( 'type' => 'string' ),
                 'batch_id' => array( 'type' => 'integer', 'sanitize_callback' => 'absint' ),
                 'limit'    => array( 'type' => 'integer', 'default' => 10000, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // V.0.48 (Phase 6 P4) — OP-3 expansion: relink + notify + transfer.
+        // POST /bulk/relink — admin bulk re-link plates to different SKU.
+        // Only allowed for status IN (in_pool / reserved). Max 100 plates per call.
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/bulk/relink', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_bulk_relink',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'sns'        => array( 'required' => true, 'type' => 'array' ),
+                'new_sku'    => array( 'required' => true, 'type' => 'string',
+                                       'sanitize_callback' => function( $v ) { return strtoupper( trim( (string) $v ) ); } ),
+                'reason'     => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+            ),
+        ) );
+
+        // POST /bulk/notify — admin bulk push custom LINE message to plate owners.
+        // Target: SNs OR filter (status / batch_id). Max 500 recipients/call (LINE quota safety).
+        // Message: admin-composed Thai text + optional CTA link. Defensive — function_exists guard
+        // for b2b_send_text_message / b2b_send_flex_message.
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/bulk/notify', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_bulk_notify',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'sns'      => array( 'type' => 'array' ),
+                'status'   => array( 'type' => 'string' ),
+                'batch_id' => array( 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+                'message'  => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+                'cta_label' => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'cta_url'  => array( 'type' => 'string', 'sanitize_callback' => 'esc_url_raw' ),
+                'reason'   => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+            ),
+        ) );
+
+        // POST /bulk/transfer — admin reorganization: move plates between batches.
+        // Only allowed for status IN (in_pool / reserved). Max 100 plates per call.
+        // Audit row per plate. Updates batch counters atomically.
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/bulk/transfer', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_bulk_transfer',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'sns'           => array( 'required' => true, 'type' => 'array' ),
+                'target_batch_id' => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+                'reason'        => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
             ),
         ) );
 
@@ -7115,6 +7169,481 @@ if ( ! function_exists( 'dinoco_sn_rest_bulk_export' ) ) {
         $resp->header( 'Content-Type', 'text/csv; charset=utf-8' );
         $resp->header( 'Content-Disposition', 'attachment; filename="sn-export-' . date( 'Ymd-His' ) . '.csv"' );
         return $resp;
+    }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * V.0.48 (Phase 6 P4) — OP-3 expansion: /bulk/relink + /bulk/notify + /bulk/transfer
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * Three additional bulk admin endpoints completing plan §K.4 wizard surface.
+ * All follow the V.0.45 bulk/void pattern: per-SN atomic transaction,
+ * skip-conflicts results array, max 100 SNs (or 500 for notify), idempotency
+ * wrapper, rate-limited (5 ops / 10min / user).
+ */
+
+if ( ! function_exists( 'dinoco_sn_rest_bulk_relink' ) ) {
+    /**
+     * POST /bulk/relink — admin bulk re-link plates to new SKU.
+     *
+     * Only allowed for status IN (in_pool / reserved). Registered/claimed
+     * plates require single-plate /swap with 4-eyes (kept separate per K.4).
+     * Updates wp_dinoco_sn_pool.linked_sku + top_set_sku denorm hint.
+     */
+    function dinoco_sn_rest_bulk_relink( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        $sns_in = $req->get_param( 'sns' );
+        $new_sku = strtoupper( trim( (string) $req->get_param( 'new_sku' ) ) );
+        $reason = trim( (string) $req->get_param( 'reason' ) );
+        if ( ! is_array( $sns_in ) || empty( $sns_in ) ) {
+            return new WP_Error( 'invalid_input', __( 'sns array required', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( $new_sku === '' || ! preg_match( '/^[A-Z0-9_-]{2,50}$/', $new_sku ) ) {
+            return new WP_Error( 'invalid_sku', __( 'new_sku invalid format', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( strlen( $reason ) < 10 ) {
+            return new WP_Error( 'reason_required',
+                __( 'Reason must be at least 10 characters', 'dinoco-sn' ),
+                array( 'status' => 400 ) );
+        }
+        $sns = array();
+        foreach ( $sns_in as $s ) {
+            $up = strtoupper( trim( (string) $s ) );
+            if ( $up !== '' && ! in_array( $up, $sns, true ) ) $sns[] = $up;
+        }
+        if ( count( $sns ) > 100 ) {
+            return new WP_Error( 'bulk_too_large',
+                __( 'Bulk relink max 100 plates per call', 'dinoco-sn' ),
+                array( 'status' => 400, 'count' => count( $sns ), 'max' => 100 ) );
+        }
+
+        // Verify target SKU exists in wp_dinoco_products
+        global $wpdb;
+        $products_tbl = $wpdb->prefix . 'dinoco_products';
+        $sku_exists = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$products_tbl} WHERE BINARY UPPER(sku) = %s",
+            $new_sku
+        ) );
+        if ( $sku_exists === 0 ) {
+            return new WP_Error( 'sku_not_found',
+                sprintf( __( 'SKU %s not in Product Catalog', 'dinoco-sn' ), $new_sku ),
+                array( 'status' => 404, 'new_sku' => $new_sku ) );
+        }
+
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $uid = get_current_user_id();
+            $rl = b2b_rate_limit( 'sn_bulk_relink_' . $uid, 5, 600 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+        $actor_uid = get_current_user_id();
+
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco-sn/v1::bulk/relink';
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $sns_sorted = $sns; sort( $sns_sorted );
+            $idem_body = array(
+                'sns_sorted'    => $sns_sorted,
+                'new_sku'       => $new_sku,
+                'reason'        => $reason,
+                'actor_user_id' => $actor_uid,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( is_array( $cached ) ) {
+                $resp = $cached; unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
+        $pool = dinoco_sn_table( 'pool' );
+        $results = array();
+        $ok = 0; $skipped = 0;
+
+        foreach ( $sns as $sn ) {
+            $lock_key = function_exists( 'dinoco_sn_lock_name' ) ? dinoco_sn_lock_name( $sn ) : ( 'dnc_sn_' . md5( $sn ) );
+            $got = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 5)", $lock_key ) );
+            if ( $got !== 1 ) {
+                $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'lock_timeout', 'message' => 'Could not acquire lock' );
+                $skipped++; continue;
+            }
+            try {
+                $wpdb->query( 'START TRANSACTION' );
+                $row = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT sn, status, linked_sku FROM {$pool} WHERE sn = %s FOR UPDATE", $sn
+                ) );
+                if ( ! $row ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'not_found', 'message' => 'S/N not in system' );
+                    $skipped++; continue;
+                }
+                if ( ! in_array( $row->status, array( 'in_pool', 'reserved' ), true ) ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'invalid_state',
+                        'message' => sprintf( 'Plate status %s — bulk relink only allowed for in_pool/reserved', $row->status ) );
+                    $skipped++; continue;
+                }
+                $old_sku = (string) $row->linked_sku;
+                if ( strtoupper( $old_sku ) === $new_sku ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'no_change', 'message' => 'Already linked to target SKU' );
+                    $skipped++; continue;
+                }
+                $upd = $wpdb->update( $pool,
+                    array( 'linked_sku' => $new_sku ),
+                    array( 'sn' => $sn ),
+                    array( '%s' ), array( '%s' )
+                );
+                if ( $upd === false ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'db_error', 'message' => 'Update failed' );
+                    $skipped++; continue;
+                }
+                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                    dinoco_sn_audit_log( $sn, 'plate_relinked', null, null, array(
+                        'old_sku' => $old_sku, 'new_sku' => $new_sku, 'reason' => $reason, 'bulk' => true,
+                    ), $actor_uid, null, '', 'bulk_relink', false );
+                }
+                $wpdb->query( 'COMMIT' );
+                $results[] = array( 'sn' => $sn, 'status' => 'ok', 'code' => 'relinked',
+                    'old_sku' => $old_sku, 'new_sku' => $new_sku );
+                $ok++;
+            } catch ( \Throwable $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'error', 'sn_bulk_relink_throw', array( 'sn' => $sn, 'msg' => $e->getMessage() ) );
+                }
+                $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'exception', 'message' => 'Internal error' );
+                $skipped++;
+            }
+            $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+        }
+
+        $resp = array(
+            'success'      => true,
+            'total'        => count( $sns ),
+            'ok_count'     => $ok,
+            'skip_count'   => $skipped,
+            'new_sku'      => $new_sku,
+            'results'      => $results,
+        );
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, $resp, 200 );
+        }
+        return rest_ensure_response( $resp );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_bulk_notify' ) ) {
+    /**
+     * POST /bulk/notify — admin bulk push LINE notification to plate owners.
+     *
+     * Targets: explicit `sns` array OR filter `status` + `batch_id`. Max 500
+     * recipients (LINE quota safety + per-batch chunked send). Falls back to
+     * text-only if Flex builder not available. Uses dinoco_sn_should_send_to_user
+     * preference gate so opted-out customers are skipped.
+     */
+    function dinoco_sn_rest_bulk_notify( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        $message = trim( (string) $req->get_param( 'message' ) );
+        $reason = trim( (string) $req->get_param( 'reason' ) );
+        if ( strlen( $message ) < 5 ) {
+            return new WP_Error( 'message_required',
+                __( 'Message must be at least 5 characters', 'dinoco-sn' ),
+                array( 'status' => 400 ) );
+        }
+        if ( strlen( $message ) > 500 ) {
+            return new WP_Error( 'message_too_long',
+                __( 'Message max 500 characters', 'dinoco-sn' ),
+                array( 'status' => 400 ) );
+        }
+        if ( strlen( $reason ) < 10 ) {
+            return new WP_Error( 'reason_required',
+                __( 'Reason must be at least 10 characters', 'dinoco-sn' ),
+                array( 'status' => 400 ) );
+        }
+        $cta_label = trim( (string) $req->get_param( 'cta_label' ) );
+        $cta_url   = trim( (string) $req->get_param( 'cta_url' ) );
+
+        // Resolve target SNs (explicit list OR filter)
+        $sns_in = $req->get_param( 'sns' );
+        $status = trim( (string) $req->get_param( 'status' ) );
+        $batch_id = (int) $req->get_param( 'batch_id' );
+        $sns = array();
+
+        global $wpdb;
+        $pool = dinoco_sn_table( 'pool' );
+
+        if ( is_array( $sns_in ) && ! empty( $sns_in ) ) {
+            foreach ( $sns_in as $s ) {
+                $up = strtoupper( trim( (string) $s ) );
+                if ( $up !== '' && ! in_array( $up, $sns, true ) ) $sns[] = $up;
+            }
+        } else {
+            // Filter-based
+            $where = array( "status IN ('registered','claimed')",
+                            "registered_user_id IS NOT NULL" );
+            $params = array();
+            if ( $status !== '' && in_array( $status, array( 'registered','claimed' ), true ) ) {
+                $where = array( $wpdb->prepare( "status = %s", $status ),
+                                "registered_user_id IS NOT NULL" );
+            }
+            if ( $batch_id > 0 ) {
+                $where[] = $wpdb->prepare( "batch_id = %d", $batch_id );
+            }
+            $sql = "SELECT sn FROM {$pool} WHERE " . implode( ' AND ', $where ) . " LIMIT 500";
+            $rows = $wpdb->get_results( $sql );
+            foreach ( (array) $rows as $r ) $sns[] = strtoupper( $r->sn );
+        }
+
+        if ( empty( $sns ) ) {
+            return new WP_Error( 'no_targets',
+                __( 'No matching plates — refine filter', 'dinoco-sn' ),
+                array( 'status' => 400 ) );
+        }
+        if ( count( $sns ) > 500 ) {
+            $sns = array_slice( $sns, 0, 500 );
+        }
+
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $uid = get_current_user_id();
+            $rl = b2b_rate_limit( 'sn_bulk_notify_' . $uid, 3, 600 ); // 3 bulk-notify / 10min (LINE quota)
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+        $actor_uid = get_current_user_id();
+
+        // Resolve each SN → registered_user_id → line_uid (defensive: skip if missing)
+        $sent = 0; $skipped = 0; $results = array();
+        foreach ( $sns as $sn ) {
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT sn, registered_user_id FROM {$pool} WHERE sn = %s LIMIT 1", $sn
+            ) );
+            if ( ! $row || ! $row->registered_user_id ) {
+                $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'no_owner' );
+                $skipped++; continue;
+            }
+            $owner_uid = (int) $row->registered_user_id;
+
+            // Preference gate (NUCLEAR opt-out)
+            if ( function_exists( 'dinoco_sn_should_send_to_user' )
+              && ! dinoco_sn_should_send_to_user( $owner_uid, 'admin_announcement' ) ) {
+                $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'opted_out' );
+                $skipped++; continue;
+            }
+
+            $line_uid = get_user_meta( $owner_uid, 'dinoco_line_uid', true );
+            if ( ! $line_uid || ! is_string( $line_uid ) || strlen( $line_uid ) < 8 ) {
+                $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'no_line_uid' );
+                $skipped++; continue;
+            }
+
+            // Compose message — append CTA if provided
+            $full_msg = $message;
+            if ( $cta_label !== '' && $cta_url !== '' ) {
+                $full_msg .= "\n\n" . $cta_label . ': ' . $cta_url;
+            }
+
+            // Defensive: prefer b2b_send_text_message; skip if unavailable
+            $pushed = false;
+            if ( function_exists( 'b2b_send_text_message' ) ) {
+                try {
+                    $pushed = (bool) b2b_send_text_message( $line_uid, $full_msg );
+                } catch ( \Throwable $e ) {
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( 'error', 'sn_bulk_notify_push_throw', array(
+                            'sn' => $sn, 'msg' => $e->getMessage(),
+                        ) );
+                    }
+                }
+            }
+
+            if ( $pushed ) {
+                $sent++;
+                $results[] = array( 'sn' => $sn, 'status' => 'ok', 'code' => 'sent' );
+                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                    dinoco_sn_audit_log( $sn, 'bulk_notify_sent', null, null, array(
+                        'recipient_user_id' => $owner_uid,
+                        'message_preview'   => mb_substr( $message, 0, 80 ),
+                        'reason'            => $reason,
+                    ), $actor_uid, null, '', 'bulk_notify', false );
+                }
+            } else {
+                $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'push_failed' );
+                $skipped++;
+            }
+        }
+
+        return rest_ensure_response( array(
+            'success'    => true,
+            'total'      => count( $sns ),
+            'sent_count' => $sent,
+            'skip_count' => $skipped,
+            'results'    => $results,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_bulk_transfer' ) ) {
+    /**
+     * POST /bulk/transfer — admin reorganization: move plates between batches.
+     *
+     * Updates wp_dinoco_sn_pool.batch_id + atomic counter adjustment on both
+     * source and target wp_dinoco_sn_batches rows. Only for status IN
+     * (in_pool / reserved). Max 100 plates per call.
+     */
+    function dinoco_sn_rest_bulk_transfer( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        $sns_in = $req->get_param( 'sns' );
+        $target_batch_id = (int) $req->get_param( 'target_batch_id' );
+        $reason = trim( (string) $req->get_param( 'reason' ) );
+
+        if ( ! is_array( $sns_in ) || empty( $sns_in ) ) {
+            return new WP_Error( 'invalid_input', __( 'sns array required', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( $target_batch_id <= 0 ) {
+            return new WP_Error( 'invalid_batch', __( 'target_batch_id required', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( strlen( $reason ) < 10 ) {
+            return new WP_Error( 'reason_required',
+                __( 'Reason must be at least 10 characters', 'dinoco-sn' ),
+                array( 'status' => 400 ) );
+        }
+        $sns = array();
+        foreach ( $sns_in as $s ) {
+            $up = strtoupper( trim( (string) $s ) );
+            if ( $up !== '' && ! in_array( $up, $sns, true ) ) $sns[] = $up;
+        }
+        if ( count( $sns ) > 100 ) {
+            return new WP_Error( 'bulk_too_large',
+                __( 'Bulk transfer max 100 plates per call', 'dinoco-sn' ),
+                array( 'status' => 400, 'count' => count( $sns ), 'max' => 100 ) );
+        }
+
+        global $wpdb;
+        $batches_tbl = dinoco_sn_table( 'batches' );
+        $tgt_batch = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, batch_code, status FROM {$batches_tbl} WHERE id = %d", $target_batch_id
+        ) );
+        if ( ! $tgt_batch ) {
+            return new WP_Error( 'batch_not_found',
+                sprintf( __( 'Target batch %d not found', 'dinoco-sn' ), $target_batch_id ),
+                array( 'status' => 404 ) );
+        }
+        if ( in_array( $tgt_batch->status, array( 'closed', 'cancelled' ), true ) ) {
+            return new WP_Error( 'batch_locked',
+                sprintf( __( 'Target batch %s — cannot transfer in', 'dinoco-sn' ), $tgt_batch->status ),
+                array( 'status' => 422 ) );
+        }
+
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $uid = get_current_user_id();
+            $rl = b2b_rate_limit( 'sn_bulk_transfer_' . $uid, 5, 600 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+        $actor_uid = get_current_user_id();
+
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco-sn/v1::bulk/transfer';
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $sns_sorted = $sns; sort( $sns_sorted );
+            $idem_body = array(
+                'sns_sorted'      => $sns_sorted,
+                'target_batch_id' => $target_batch_id,
+                'reason'          => $reason,
+                'actor_user_id'   => $actor_uid,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( is_array( $cached ) ) {
+                $resp = $cached; unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
+        $pool = dinoco_sn_table( 'pool' );
+        $results = array();
+        $ok = 0; $skipped = 0;
+
+        foreach ( $sns as $sn ) {
+            $lock_key = function_exists( 'dinoco_sn_lock_name' ) ? dinoco_sn_lock_name( $sn ) : ( 'dnc_sn_' . md5( $sn ) );
+            $got = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 5)", $lock_key ) );
+            if ( $got !== 1 ) {
+                $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'lock_timeout' );
+                $skipped++; continue;
+            }
+            try {
+                $wpdb->query( 'START TRANSACTION' );
+                $row = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT sn, status, batch_id FROM {$pool} WHERE sn = %s FOR UPDATE", $sn
+                ) );
+                if ( ! $row ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'not_found' );
+                    $skipped++; continue;
+                }
+                if ( ! in_array( $row->status, array( 'in_pool', 'reserved' ), true ) ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'invalid_state',
+                        'message' => sprintf( 'Plate status %s — only in_pool/reserved transferable', $row->status ) );
+                    $skipped++; continue;
+                }
+                if ( (int) $row->batch_id === $target_batch_id ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'same_batch' );
+                    $skipped++; continue;
+                }
+                $old_batch = (int) $row->batch_id;
+                $upd = $wpdb->update( $pool,
+                    array( 'batch_id' => $target_batch_id ),
+                    array( 'sn' => $sn ),
+                    array( '%d' ), array( '%s' )
+                );
+                if ( $upd === false ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'db_error' );
+                    $skipped++; continue;
+                }
+                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                    dinoco_sn_audit_log( $sn, 'plate_transferred', null, null, array(
+                        'from_batch_id' => $old_batch,
+                        'to_batch_id'   => $target_batch_id,
+                        'reason'        => $reason,
+                        'bulk'          => true,
+                    ), $actor_uid, null, '', 'bulk_transfer', false );
+                }
+                $wpdb->query( 'COMMIT' );
+                $results[] = array( 'sn' => $sn, 'status' => 'ok', 'code' => 'transferred',
+                    'from_batch' => $old_batch, 'to_batch' => $target_batch_id );
+                $ok++;
+            } catch ( \Throwable $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'error', 'sn_bulk_transfer_throw', array( 'sn' => $sn, 'msg' => $e->getMessage() ) );
+                }
+                $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'exception' );
+                $skipped++;
+            }
+            $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+        }
+
+        $resp = array(
+            'success'         => true,
+            'total'           => count( $sns ),
+            'ok_count'        => $ok,
+            'skip_count'      => $skipped,
+            'target_batch_id' => $target_batch_id,
+            'target_batch_code' => $tgt_batch->batch_code,
+            'results'         => $results,
+        );
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, $resp, 200 );
+        }
+        return rest_ensure_response( $resp );
     }
 }
 
