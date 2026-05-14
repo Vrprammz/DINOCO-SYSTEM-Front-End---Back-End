@@ -1,6 +1,22 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Flash Dispatcher                    ║
+ * ║  Version: V.0.6 (2026-05-14) — Sprint 29 Phase 4 Batch B Item 7: ║
+ * ║    • NEW endpoint `POST /dinoco-claim/v1/pickup-at-warehouse`     ║
+ * ║      — opt-in path for "ลูกค้ามารับเองที่โกดัง" (customer picks    ║
+ * ║      up at warehouse, no Flash courier). Atomic update via single ║
+ * ║      `dinoco_claim_persist_pickup_at_warehouse` helper writing 3  ║
+ * ║      postmeta keys: `_claim_pickup_at_warehouse`=1,               ║
+ * ║      `_claim_pickup_status`='ready_for_pickup',                   ║
+ * ║      `_claim_pickup_created_at`=<wp_date>. Skips Flash dispatch   ║
+ * ║      entirely — no PNO, no Flash API call. Fires NEW action       ║
+ * ║      `dinoco/claim/pickup_ready` for Notifier listener (Notifier  ║
+ * ║      V.0.8 push Flex with warehouse address + business hours).   ║
+ * ║      Idempotency wrap (namespace `claim-pickup-at-warehouse`,    ║
+ * ║      body hash {claim_id, actor_user_id}). Permission =          ║
+ * ║      manage_options + wp_rest nonce. Returns 200 with pickup_id  ║
+ * ║      + warehouse info from `b2b_warehouse_address` option.       ║
+ * ║                                                                    ║
  * ║  Version: V.0.5 (2026-05-14) — Sprint 28 Phase 3.3+3.6:           ║
  * ║    • Phase 3.3 — NEW endpoint `GET /dinoco-claim/v1/flash/list?    ║
  * ║      claim_id=X` returns rows from `_claim_flash_pnos[]` post meta ║
@@ -615,6 +631,174 @@ if ( ! function_exists( 'dinoco_claim_flash_register_routes' ) ) {
                 'limit'    => array( 'type' => 'integer', 'required' => false, 'default' => 50 ),
             ),
         ) );
+        // V.0.6 Sprint 29 Phase 4 Batch B Item 7 — pickup-at-warehouse opt-in
+        // path. Skips Flash dispatch entirely; writes postmeta + fires action
+        // for Notifier listener to push customer Flex with warehouse address.
+        register_rest_route( 'dinoco-claim/v1', '/pickup-at-warehouse', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_claim_flash_rest_pickup_at_warehouse',
+            'permission_callback' => 'dinoco_claim_flash_admin_perm',
+            'args'                => array(
+                'claim_id' => array( 'type' => 'integer', 'required' => true ),
+            ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_flash_get_warehouse_info' ) ) {
+    /**
+     * V.0.6 — read warehouse address from `b2b_warehouse_address` option
+     * (set in B2B Admin → Print Settings). Returns canonical shape used
+     * by both pickup response + Notifier Flex builder.
+     *
+     * @return array{name:string,phone:string,address:string,district:string,city:string,province:string,postcode:string}
+     */
+    function dinoco_claim_flash_get_warehouse_info() {
+        $wh = get_option( 'b2b_warehouse_address', array() );
+        if ( ! is_array( $wh ) ) $wh = array();
+        return array(
+            'name'     => isset( $wh['wh_name'] )     ? (string) $wh['wh_name']     : '',
+            'phone'    => isset( $wh['wh_phone'] )    ? (string) $wh['wh_phone']    : '',
+            'address'  => isset( $wh['wh_address'] )  ? (string) $wh['wh_address']  : '',
+            'district' => isset( $wh['wh_district'] ) ? (string) $wh['wh_district'] : '',
+            'city'     => isset( $wh['wh_city'] )     ? (string) $wh['wh_city']     : '',
+            'province' => isset( $wh['wh_province'] ) ? (string) $wh['wh_province'] : '',
+            'postcode' => isset( $wh['wh_postcode'] ) ? (string) $wh['wh_postcode'] : '',
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_persist_pickup_at_warehouse' ) ) {
+    /**
+     * V.0.6 — atomic 3-key postmeta write for pickup-at-warehouse mode.
+     * Single function so SC modal + future automation share the same
+     * mutation point.
+     *
+     * @param int $claim_id
+     * @param int $actor_user_id
+     * @return int pickup_id (mysql timestamp seconds — monotonic, sortable)
+     */
+    function dinoco_claim_persist_pickup_at_warehouse( $claim_id, $actor_user_id ) {
+        $now = current_time( 'mysql' );
+        update_post_meta( $claim_id, '_claim_pickup_at_warehouse', 1 );
+        update_post_meta( $claim_id, '_claim_pickup_status', 'ready_for_pickup' );
+        update_post_meta( $claim_id, '_claim_pickup_created_at', $now );
+        if ( $actor_user_id > 0 ) {
+            update_post_meta( $claim_id, '_claim_pickup_created_by', (int) $actor_user_id );
+        }
+        return strtotime( $now );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_flash_rest_pickup_at_warehouse' ) ) {
+    /**
+     * POST /dinoco-claim/v1/pickup-at-warehouse
+     *
+     * Body params:
+     *   - claim_id (int, required)
+     *
+     * Returns:
+     *   201 + { success:true, pickup_id, warehouse:{...}, claim_id, created_at }
+     *   422 on bad claim_id / wrong post type
+     *   409 on idempotency conflict
+     *
+     * @param WP_REST_Request $req
+     * @return WP_REST_Response
+     */
+    function dinoco_claim_flash_rest_pickup_at_warehouse( WP_REST_Request $req ) {
+        try {
+            $claim_id = (int) $req->get_param( 'claim_id' );
+            $uid      = (int) get_current_user_id();
+
+            if ( $claim_id <= 0 || get_post_type( $claim_id ) !== 'claim_ticket' ) {
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'message' => 'claim_id ไม่ถูกต้อง',
+                    'code'    => 'bad_claim_id',
+                ), 422 );
+            }
+
+            // ─── Idempotency (Round 30+ pattern) ────────────────────────
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-claim/v1::pickup-at-warehouse';
+            $idem_body = array(
+                'claim_id'      => $claim_id,
+                'actor_user_id' => $uid,
+            );
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    return new WP_REST_Response( array(
+                        'success' => false,
+                        'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        'code'    => 'idempotency_conflict',
+                    ), 409 );
+                }
+                if ( is_array( $cached ) ) {
+                    $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 201;
+                    unset( $cached['_idem_code'] );
+                    return new WP_REST_Response( $cached, $cached_code );
+                }
+            }
+
+            // ─── Atomic single-helper postmeta write ────────────────────
+            $pickup_id = dinoco_claim_persist_pickup_at_warehouse( $claim_id, $uid );
+
+            $warehouse = dinoco_claim_flash_get_warehouse_info();
+
+            $resp = array(
+                'success'    => true,
+                'pickup_id'  => $pickup_id,
+                'claim_id'   => $claim_id,
+                'warehouse'  => $warehouse,
+                'created_at' => current_time( 'mysql' ),
+            );
+
+            // ─── Fire action for Notifier listener ──────────────────────
+            try {
+                do_action( 'dinoco/claim/pickup_ready', array(
+                    'claim_id'      => $claim_id,
+                    'pickup_id'     => $pickup_id,
+                    'warehouse'     => $warehouse,
+                    'actor_user_id' => $uid,
+                ) );
+            } catch ( \Throwable $hook_e ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'warning', 'claim_pickup_ready_hook_threw', array(
+                        'claim_id' => $claim_id,
+                        'msg'      => $hook_e->getMessage(),
+                    ) );
+                }
+                // Swallow — postmeta already persisted.
+            }
+
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 201 ) ), 201 );
+            }
+
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'info', 'claim_pickup_at_warehouse_persisted', array(
+                    'claim_id'  => $claim_id,
+                    'pickup_id' => $pickup_id,
+                    'uid'       => $uid,
+                ) );
+            }
+
+            return new WP_REST_Response( $resp, 201 );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_pickup_at_warehouse_exception', array(
+                    'msg' => $e->getMessage(),
+                ) );
+            }
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Internal error',
+                'code'    => 'internal_error',
+            ), 500 );
+        }
     }
 }
 

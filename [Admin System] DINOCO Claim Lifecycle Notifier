@@ -1,6 +1,23 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Lifecycle Notifier                  ║
+ * ║  Version: V.0.8 (2026-05-14) — Sprint 29 Phase 4 Batch B Item 7: ║
+ * ║    • NEW Flex builder `b2b_build_flex_claim_pickup_ready` —      ║
+ * ║      navy header pattern (mirrors b2b_build_flex_claim_slip_     ║
+ * ║      received Sprint 20). Body shows warehouse address + business║
+ * ║      hours + claim_id reference + LINE deep-link for questions.  ║
+ * ║      altText readable for non-Flex LINE clients.                  ║
+ * ║    • NEW listener `dinoco_claim_notify_pickup_ready` @ priority  ║
+ * ║      20 on `dinoco/claim/pickup_ready` action (fired from Flash  ║
+ * ║      Dispatcher V.0.6 pickup-at-warehouse handler). Mirrors      ║
+ * ║      charge-state-listener defenses: idempotency wrap (namespace ║
+ * ║      `claim-pickup-notif`, body hash {claim_id, pickup_id,       ║
+ * ║      actor_user_id}), governance gate via `claim_status` bucket, ║
+ * ║      LINE UID resolve from claim_ticket.post_author, dedup       ║
+ * ║      transient 60s window per claim. Writes audit row to         ║
+ * ║      `_claim_notif_log` postmeta (channel=line_flex,             ║
+ * ║      status=pickup_ready).                                        ║
+ * ║                                                                    ║
  * ║  Version: V.0.7 (2026-05-14) — Sprint 29 Phase 4 Batch A Item 4: ║
  * ║    • NEW REST GET /dinoco-claim/v1/notif-log (global filter +    ║
  * ║      pagination across ALL claims). Aggregates per-claim postmeta║
@@ -1313,6 +1330,353 @@ if ( ! function_exists( 'dinoco_claim_charge_register_crons' ) ) {
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * 4d. PICKUP-AT-WAREHOUSE Flex BUILDER + LISTENER (V.0.8 — Sprint 29 Phase 4
+ *     Batch B Item 7). Customer-facing Flex pushed when admin opts customer
+ *     into "มารับเองที่โกดัง" mode (skip Flash). Body = warehouse address +
+ *     business hours + claim # + LINE deep-link "💬 สอบถามแอดมิน".
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'b2b_build_flex_claim_pickup_ready' ) ) {
+    /**
+     * V.0.8 — Pickup-at-warehouse Flex bubble. Mirrors
+     * `b2b_build_flex_claim_slip_received` Sprint 20 navy header pattern.
+     * Defensively safe when context payload partial (warehouse fallback
+     * to "ติดต่อ Admin").
+     *
+     * @param int   $claim_id
+     * @param array $ctx { warehouse:{name,phone,address,...}, pickup_id }
+     * @return array LINE Flex message
+     */
+    function b2b_build_flex_claim_pickup_ready( $claim_id, $ctx = array() ) {
+        $ticket_num = (string) ( function_exists( 'get_field' )
+            ? ( get_field( 'ticket_number', $claim_id ) ?: ( '#' . (int) $claim_id ) )
+            : ( '#' . (int) $claim_id ) );
+
+        $wh = isset( $ctx['warehouse'] ) && is_array( $ctx['warehouse'] ) ? $ctx['warehouse'] : array();
+        $wh_name     = isset( $wh['name'] )     ? (string) $wh['name']     : '';
+        $wh_phone    = isset( $wh['phone'] )    ? (string) $wh['phone']    : '';
+        $wh_addr     = isset( $wh['address'] )  ? (string) $wh['address']  : '';
+        $wh_district = isset( $wh['district'] ) ? (string) $wh['district'] : '';
+        $wh_city     = isset( $wh['city'] )     ? (string) $wh['city']     : '';
+        $wh_province = isset( $wh['province'] ) ? (string) $wh['province'] : '';
+        $wh_postcode = isset( $wh['postcode'] ) ? (string) $wh['postcode'] : '';
+
+        $full_addr = trim( implode( ' ', array_filter( array(
+            $wh_addr, $wh_district, $wh_city, $wh_province, $wh_postcode
+        ) ) ) );
+        if ( $full_addr === '' ) $full_addr = 'โปรดสอบถามแอดมินสำหรับที่อยู่โกดัง';
+
+        $alt = sprintf( '📍 ของเคลม %s พร้อมรับที่โกดังแล้ว', $ticket_num );
+
+        $body_rows = array(
+            array(
+                'type' => 'text',
+                'text' => '📍 ของพร้อมให้รับที่โกดังแล้ว',
+                'weight' => 'bold',
+                'size' => 'md',
+                'color' => '#0F172A',
+                'wrap' => true,
+            ),
+            array(
+                'type' => 'text',
+                'text' => 'เคลม ' . $ticket_num . ' — สามารถมารับสินค้าได้ที่โกดังตามที่อยู่ด้านล่าง',
+                'size' => 'sm',
+                'color' => '#475569',
+                'wrap' => true,
+                'margin' => 'sm',
+            ),
+        );
+
+        $box_rows = array();
+        if ( $wh_name !== '' ) {
+            $box_rows[] = array(
+                'type' => 'box',
+                'layout' => 'baseline',
+                'spacing' => 'sm',
+                'contents' => array(
+                    array( 'type' => 'text', 'text' => 'สถานที่', 'size' => 'xs', 'color' => '#64748B', 'flex' => 2 ),
+                    array( 'type' => 'text', 'text' => $wh_name, 'size' => 'sm', 'color' => '#0F172A', 'flex' => 5, 'wrap' => true ),
+                ),
+            );
+        }
+        $box_rows[] = array(
+            'type' => 'box',
+            'layout' => 'baseline',
+            'spacing' => 'sm',
+            'contents' => array(
+                array( 'type' => 'text', 'text' => 'ที่อยู่', 'size' => 'xs', 'color' => '#64748B', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => $full_addr, 'size' => 'sm', 'color' => '#0F172A', 'flex' => 5, 'wrap' => true ),
+            ),
+        );
+        if ( $wh_phone !== '' ) {
+            $box_rows[] = array(
+                'type' => 'box',
+                'layout' => 'baseline',
+                'spacing' => 'sm',
+                'contents' => array(
+                    array( 'type' => 'text', 'text' => 'โทร', 'size' => 'xs', 'color' => '#64748B', 'flex' => 2 ),
+                    array( 'type' => 'text', 'text' => $wh_phone, 'size' => 'sm', 'color' => '#0F172A', 'flex' => 5 ),
+                ),
+            );
+        }
+        $box_rows[] = array(
+            'type' => 'box',
+            'layout' => 'baseline',
+            'spacing' => 'sm',
+            'contents' => array(
+                array( 'type' => 'text', 'text' => 'เวลาทำการ', 'size' => 'xs', 'color' => '#64748B', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => 'จันทร์–เสาร์ 09:00–18:00 น.', 'size' => 'sm', 'color' => '#0F172A', 'flex' => 5, 'wrap' => true ),
+            ),
+        );
+
+        $body_rows[] = array(
+            'type' => 'box',
+            'layout' => 'vertical',
+            'spacing' => 'sm',
+            'margin' => 'md',
+            'paddingAll' => 'md',
+            'backgroundColor' => '#F8FAFC',
+            'cornerRadius' => '8px',
+            'contents' => $box_rows,
+        );
+
+        $body_rows[] = array(
+            'type' => 'text',
+            'text' => '💡 กรุณาแจ้งหมายเลขเคลม ' . $ticket_num . ' ที่เคาน์เตอร์เมื่อมารับสินค้า',
+            'size' => 'xxs',
+            'color' => '#64748B',
+            'wrap' => true,
+            'margin' => 'md',
+        );
+
+        return array(
+            'type'    => 'flex',
+            'altText' => $alt,
+            'contents' => array(
+                'type' => 'bubble',
+                'size' => 'kilo',
+                'header' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'backgroundColor' => '#1A3A5C',
+                    'paddingAll' => 'md',
+                    'contents' => array(
+                        array(
+                            'type'   => 'text',
+                            'text'   => '📦 พร้อมรับที่โกดัง',
+                            'color'  => '#FFFFFF',
+                            'weight' => 'bold',
+                            'size'   => 'md',
+                        ),
+                        array(
+                            'type'   => 'text',
+                            'text'   => 'Pickup Ready',
+                            'color'  => '#BFDBFE',
+                            'size'   => 'xs',
+                            'margin' => 'sm',
+                        ),
+                    ),
+                ),
+                'body' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'spacing' => 'sm',
+                    'contents' => $body_rows,
+                ),
+                'footer' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'spacing' => 'sm',
+                    'contents' => array(
+                        array(
+                            'type' => 'button',
+                            'style' => 'primary',
+                            'color' => '#1A3A5C',
+                            'action' => array(
+                                'type' => 'uri',
+                                'label' => '💬 สอบถามแอดมิน',
+                                'uri' => 'https://line.me/R/oaMessage/@dinoco/?',
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_notify_pickup_ready' ) ) {
+    /**
+     * V.0.8 — Hook listener for `dinoco/claim/pickup_ready` action.
+     * Fires post-COMMIT from Flash Dispatcher V.0.6 pickup-at-warehouse
+     * REST handler.
+     *
+     * Action contract:
+     *   do_action( 'dinoco/claim/pickup_ready', array(
+     *       'claim_id' => $cid, 'pickup_id' => $pid,
+     *       'warehouse' => $wh, 'actor_user_id' => $uid ) );
+     *
+     * @param array $payload
+     */
+    function dinoco_claim_notify_pickup_ready( $payload ) {
+        if ( ! is_array( $payload ) ) return;
+        $claim_id  = isset( $payload['claim_id'] )      ? (int) $payload['claim_id']      : 0;
+        $pickup_id = isset( $payload['pickup_id'] )     ? (int) $payload['pickup_id']     : 0;
+        $actor     = isset( $payload['actor_user_id'] ) ? (int) $payload['actor_user_id'] : 0;
+        $warehouse = isset( $payload['warehouse'] ) && is_array( $payload['warehouse'] ) ? $payload['warehouse'] : array();
+
+        if ( $claim_id <= 0 ) return;
+
+        // Idempotency wrap — mirror charge listener pattern (V.0.5 B3 binding).
+        $idem_key = '';
+        $body_for_hash = array(
+            'claim_id'      => $claim_id,
+            'pickup_id'     => $pickup_id,
+            'actor_user_id' => $actor,
+        );
+        if ( function_exists( 'dinoco_idempotency_hash' ) && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_key = 'claim-pickup-notif:' . dinoco_idempotency_hash( $body_for_hash );
+            $cached   = dinoco_idempotency_check( $idem_key, 'claim-pickup-notif', $body_for_hash );
+            if ( is_wp_error( $cached ) ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'warning', 'claim_pickup_notif_idempotency_conflict', array(
+                        'claim_id' => $claim_id,
+                    ) );
+                }
+                return;
+            }
+            if ( $cached ) {
+                return;  // already dispatched
+            }
+        }
+
+        // Dedup transient (60s per claim).
+        $dedup_key = 'dnc_claim_pickup_notif_dedup_' . $claim_id;
+        if ( get_transient( $dedup_key ) ) return;
+
+        // Resolve customer LINE UID via claim author (mirrors status listener).
+        $author_id = (int) get_post_field( 'post_author', $claim_id );
+        if ( $author_id <= 0 ) {
+            if ( function_exists( 'dinoco_claim_notif_append_log' ) ) {
+                dinoco_claim_notif_append_log( $claim_id, array(
+                    'status'  => 'pickup_ready',
+                    'channel' => 'line_flex',
+                    'success' => false,
+                    'error'   => 'no_author',
+                ) );
+            }
+            return;
+        }
+        $line_uid = (string) get_user_meta( $author_id, 'dinoco_line_uid', true );
+        if ( $line_uid === '' ) {
+            if ( function_exists( 'dinoco_claim_notif_append_log' ) ) {
+                dinoco_claim_notif_append_log( $claim_id, array(
+                    'status'  => 'pickup_ready',
+                    'channel' => 'line_flex',
+                    'success' => false,
+                    'error'   => 'no_line_uid',
+                ) );
+            }
+            return;
+        }
+
+        // Governance gate (claim_status bucket — same as status flow).
+        if ( function_exists( 'dinoco_line_can_push' ) ) {
+            $gate = dinoco_line_can_push( $line_uid, 'claim_status' );
+            if ( ! empty( $gate ) && empty( $gate['allowed'] ) ) {
+                if ( function_exists( 'dinoco_claim_notif_append_log' ) ) {
+                    dinoco_claim_notif_append_log( $claim_id, array(
+                        'status'  => 'pickup_ready',
+                        'channel' => 'line_flex',
+                        'success' => false,
+                        'error'   => 'gov_blocked_' . ( isset( $gate['reason'] ) ? $gate['reason'] : 'unknown' ),
+                    ) );
+                }
+                return;
+            }
+        }
+
+        // Build Flex.
+        try {
+            $flex = b2b_build_flex_claim_pickup_ready( $claim_id, array(
+                'warehouse' => $warehouse,
+                'pickup_id' => $pickup_id,
+            ) );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_pickup_flex_builder_threw', array(
+                    'claim_id'  => $claim_id,
+                    'exception' => $e->getMessage(),
+                ) );
+            }
+            return;
+        }
+
+        // Push via LINE.
+        $push_err = '';
+        try {
+            if ( function_exists( 'b2b_line_push_raw' ) ) {
+                $resp = b2b_line_push_raw( $line_uid, array( $flex ) );
+                if ( $resp === false ) {
+                    $push_err = 'push_helper_unavailable';
+                } elseif ( is_array( $resp ) && isset( $resp['code'] ) ) {
+                    $code = (int) $resp['code'];
+                    if ( $code !== 200 ) {
+                        $raw_body = isset( $resp['body'] ) ? (string) $resp['body'] : '';
+                        if ( $raw_body !== '' ) {
+                            $raw_body = preg_replace( '/U[0-9a-fA-F]{32}/', 'U[REDACTED]', $raw_body );
+                            $raw_body = preg_replace( '/\b[\w.\-+]+@[\w\-]+\.[\w\-.]+\b/', '[EMAIL]', $raw_body );
+                            $raw_body = preg_replace( '/\b0\d{8,9}\b/', '[PHONE]', $raw_body );
+                        }
+                        $body_preview = substr( $raw_body, 0, 80 );
+                        $push_err = 'http_' . $code . ( $body_preview !== '' ? ':' . $body_preview : '' );
+                    }
+                } else {
+                    $push_err = 'unknown_push_response_shape';
+                }
+            } else {
+                $push_err = 'no_line_push_helper';
+            }
+        } catch ( \Throwable $e ) {
+            $push_err = 'exception:' . $e->getMessage();
+        }
+        $success = ( $push_err === '' );
+
+        // Audit log + dedup + governance log.
+        if ( function_exists( 'dinoco_claim_notif_append_log' ) ) {
+            dinoco_claim_notif_append_log( $claim_id, array(
+                'status'  => 'pickup_ready',
+                'channel' => 'line_flex',
+                'success' => $success,
+                'error'   => $push_err,
+            ) );
+        }
+        if ( function_exists( 'dinoco_line_log_push' ) ) {
+            try {
+                $gov_reason = $success ? '' : mb_substr( $push_err, 0, 60 );
+                dinoco_line_log_push( (int) $author_id, 'claim_status', 'pickup_ready', $success, $gov_reason );
+            } catch ( \Throwable $e ) {
+                // best-effort
+            }
+        }
+
+        if ( $success ) {
+            set_transient( $dedup_key, 1, 60 );
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, 'claim-pickup-notif',
+                    $body_for_hash, array( 'sent' => true, 'reason' => 'ok' ), 200 );
+            }
+        } elseif ( function_exists( 'dinoco_obs_capture' ) ) {
+            dinoco_obs_capture( 'error', 'claim_pickup_notif_push_fail', array(
+                'claim_id' => $claim_id,
+                'error'    => $push_err,
+            ) );
+        }
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * 5. WIRE-UP (only when feature flag enabled)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1320,6 +1684,8 @@ if ( $dinoco_claim_notif_enabled ) {
     add_action( 'dinoco/claim/state_changed', 'dinoco_claim_notify_status_changed', 20, 4 );
     // V.0.5 — charge state listener (separate from claim status listener)
     add_action( 'dinoco/claim/charge_state_changed', 'dinoco_claim_notify_charge_state_changed', 20, 5 );
+    // V.0.8 — pickup-at-warehouse listener (Phase 4 Batch B Item 7)
+    add_action( 'dinoco/claim/pickup_ready', 'dinoco_claim_notify_pickup_ready', 20, 1 );
     add_action( 'rest_api_init', 'dinoco_claim_notif_register_rest' );
 
     // V.0.5 — cron registration + handlers

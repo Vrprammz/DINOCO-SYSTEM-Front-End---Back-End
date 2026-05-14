@@ -1,6 +1,21 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Charges Schema                      ║
+ * ║  Version: V.0.7 (2026-05-14) — Sprint 29 Phase 4 Batch B Item 2: ║
+ * ║    • NEW REST `GET /dinoco-claim/v1/refund-audit` — admin refund ║
+ * ║      audit dashboard data source. Joins `wp_dinoco_claim_refund_ ║
+ * ║      approvals` (Sprint 15 consent table) with `wp_dinoco_claim_ ║
+ * ║      charges` (charge metadata) → returns one row per consent    ║
+ * ║      token with charge context. Filters: status (consent state — ║
+ * ║      pending/consumed/expired) · from/to (Y-m-d, against         ║
+ * ║      consent.created_at) · approver (user_id) · requester        ║
+ * ║      (charge.created_by user_id) · page (1+) · per_page (1..200, ║
+ * ║      default 50). PII guard — consent_token masked first 8 +     ║
+ * ║      "..." (forensic + privacy balance); approver/requester      ║
+ * ║      user_ids masked via SEC-L3 helper. Permission =             ║
+ * ║      manage_options + wp_rest nonce. Read-only — no rate limit.  ║
+ * ║      Powers Service Center "🔒 Refund Audit" section (V.34.6).   ║
+ * ║                                                                    ║
  * ║  Version: V.0.6 (2026-05-14) — Sprint 29 Phase 4 Batch A Item 1: ║
  * ║    • NEW REST `GET /dinoco-claim/v1/charges/export` admin CSV    ║
  * ║      export (UTF-8 BOM, 5000 row cap, manage_options + nonce,    ║
@@ -824,6 +839,265 @@ add_action( 'rest_api_init', function() {
             'claim_id' => array( 'required' => false, 'type' => 'integer', 'minimum' => 0 ),
             'from'     => array( 'required' => false, 'type' => 'string' ),
             'to'       => array( 'required' => false, 'type' => 'string' ),
+        ),
+    ) );
+} );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. REFUND AUDIT DASHBOARD (V.0.7 — Sprint 29 Phase 4 Batch B Item 2)
+ *
+ * Read-only admin endpoint surfacing refund consent token history. Joins
+ * `wp_dinoco_claim_refund_approvals` (Sprint 15 H2/M4 forgeable approver_id
+ * defense via single-use HMAC token) with charge metadata for context.
+ *
+ * Consent token states (derived in PHP — table has no `status` column):
+ *   - consumed : consumed_at IS NOT NULL                  (refund executed)
+ *   - expired  : consumed_at IS NULL AND expires_at < NOW (token died unused)
+ *   - pending  : consumed_at IS NULL AND expires_at >= NOW (waiting executor)
+ *
+ * PII discipline (Sprint 12 SEC-L3 + Sprint 15 M4):
+ *   - consent_token: SHA-256-equivalent CHAR(64). Masked first 8 + "..."
+ *     (forensic anchor for investigation but not full token leak — 0.0000058%
+ *      birthday collision @ 100k tokens; safe to display).
+ *   - approver_user_id + requester (charges.created_by): SEC-L3 mask.
+ *
+ * Permission: manage_options + wp_rest nonce. Read-only — no rate limit
+ * (cheap query, paginated, capped LIMIT 200).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_charges_mask_token' ) ) {
+    /**
+     * Mask consent_token for audit display. First 8 chars preserved as
+     * forensic anchor, rest replaced by "...". Empty input → empty string.
+     *
+     * @param string $tok 64-char hex consent token (or empty)
+     * @return string e.g. "a3f9d2e1..." (8 + "...")
+     */
+    function dinoco_claim_charges_mask_token( $tok ) {
+        $val = (string) $tok;
+        if ( $val === '' ) return '';
+        if ( strlen( $val ) <= 11 ) return $val;
+        return substr( $val, 0, 8 ) . '...';
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_charges_rest_refund_audit' ) ) {
+    /**
+     * GET /dinoco-claim/v1/refund-audit
+     *
+     * Query params:
+     *   - status    (string, optional)  pending|consumed|expired
+     *   - from      (Y-m-d, optional)   filter consent.created_at >= from
+     *   - to        (Y-m-d, optional)   filter consent.created_at <= to
+     *   - approver  (int,    optional)  approver_user_id
+     *   - requester (int,    optional)  charge.created_by (requester user)
+     *   - page      (int,    optional)  1+ (default 1)
+     *   - per_page  (int,    optional)  1..200 (default 50)
+     *
+     * Response shape:
+     *   { items: [{...}], meta: { total, page, per_page, pages } }
+     *
+     * @param WP_REST_Request $req
+     * @return WP_REST_Response|WP_Error
+     */
+    function dinoco_claim_charges_rest_refund_audit( $req ) {
+        global $wpdb;
+
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' )
+             || ! function_exists( 'dinoco_claim_refund_approvals_table_name' ) ) {
+            return new WP_Error( 'schema_missing', 'Charges schema not installed', array( 'status' => 500 ) );
+        }
+        $charges_table  = dinoco_claim_charges_table_name();
+        $approvals_table = dinoco_claim_refund_approvals_table_name();
+
+        // ─── Filter parse ───────────────────────────────────────────────
+        $status_in   = sanitize_text_field( (string) $req->get_param( 'status' ) );
+        $from        = sanitize_text_field( (string) $req->get_param( 'from' ) );
+        $to          = sanitize_text_field( (string) $req->get_param( 'to' ) );
+        $approver    = (int) $req->get_param( 'approver' );
+        $requester   = (int) $req->get_param( 'requester' );
+        $page        = max( 1, (int) $req->get_param( 'page' ) );
+        $per_page    = (int) $req->get_param( 'per_page' );
+        if ( $per_page <= 0 ) $per_page = 50;
+        $per_page    = max( 1, min( 200, $per_page ) );
+
+        $status_whitelist = array( 'pending', 'consumed', 'expired' );
+        if ( $status_in !== '' && ! in_array( $status_in, $status_whitelist, true ) ) {
+            return new WP_Error( 'invalid_status', 'status must be pending|consumed|expired', array( 'status' => 422 ) );
+        }
+
+        $date_ok = function( $s ) {
+            if ( $s === '' ) return true;
+            $dt = \DateTime::createFromFormat( 'Y-m-d', $s );
+            return ( $dt && $dt->format( 'Y-m-d' ) === $s );
+        };
+        if ( ! $date_ok( $from ) ) {
+            return new WP_Error( 'invalid_from', 'from must be Y-m-d', array( 'status' => 422 ) );
+        }
+        if ( ! $date_ok( $to ) ) {
+            return new WP_Error( 'invalid_to', 'to must be Y-m-d', array( 'status' => 422 ) );
+        }
+
+        // ─── Build WHERE ────────────────────────────────────────────────
+        $where  = "1=1";
+        $params = array();
+
+        $now_mysql = current_time( 'mysql' );
+        if ( $status_in === 'pending' ) {
+            $where   .= " AND a.consumed_at IS NULL AND a.expires_at >= %s";
+            $params[] = $now_mysql;
+        } elseif ( $status_in === 'consumed' ) {
+            $where   .= " AND a.consumed_at IS NOT NULL";
+        } elseif ( $status_in === 'expired' ) {
+            $where   .= " AND a.consumed_at IS NULL AND a.expires_at < %s";
+            $params[] = $now_mysql;
+        }
+
+        if ( $from !== '' ) {
+            $where   .= " AND a.created_at >= %s";
+            $params[] = $from . ' 00:00:00';
+        }
+        if ( $to !== '' ) {
+            $where   .= " AND a.created_at <= %s";
+            $params[] = $to . ' 23:59:59';
+        }
+        if ( $approver > 0 ) {
+            $where   .= " AND a.approver_user_id = %d";
+            $params[] = $approver;
+        }
+        if ( $requester > 0 ) {
+            $where   .= " AND c.created_by = %d";
+            $params[] = $requester;
+        }
+
+        // ─── COUNT total ────────────────────────────────────────────────
+        $count_sql = "SELECT COUNT(*)
+                        FROM {$approvals_table} a
+                   LEFT JOIN {$charges_table} c ON c.id = a.charge_id
+                       WHERE {$where}";
+        try {
+            if ( count( $params ) > 0 ) {
+                $total = (int) $wpdb->get_var( $wpdb->prepare( $count_sql, $params ) );
+            } else {
+                $total = (int) $wpdb->get_var( $count_sql );
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_refund_audit_count_threw', array(
+                    'message' => $e->getMessage(),
+                ) );
+            }
+            return new WP_Error( 'query_failed', 'Count query failed', array( 'status' => 500 ) );
+        }
+
+        // ─── SELECT page ────────────────────────────────────────────────
+        $offset    = ( $page - 1 ) * $per_page;
+        $select_sql = "SELECT
+                           a.id              AS approval_id,
+                           a.charge_id       AS charge_id,
+                           a.approver_user_id AS approver_user_id,
+                           a.consent_token   AS consent_token,
+                           a.created_at      AS created_at,
+                           a.expires_at      AS expires_at,
+                           a.consumed_at     AS consumed_at,
+                           a.consumed_by_user_id AS executor_user_id,
+                           c.amount_thb      AS amount_thb,
+                           c.refund_reason   AS refund_reason,
+                           c.created_by      AS requester_user_id,
+                           c.refunded_at     AS executed_at,
+                           c.status          AS charge_status,
+                           c.claim_id        AS claim_id
+                         FROM {$approvals_table} a
+                    LEFT JOIN {$charges_table} c ON c.id = a.charge_id
+                        WHERE {$where}
+                     ORDER BY a.created_at DESC, a.id DESC
+                        LIMIT %d OFFSET %d";
+
+        $page_params = array_merge( $params, array( $per_page, $offset ) );
+        try {
+            $rows = $wpdb->get_results( $wpdb->prepare( $select_sql, $page_params ), ARRAY_A );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_refund_audit_select_threw', array(
+                    'message' => $e->getMessage(),
+                ) );
+            }
+            return new WP_Error( 'query_failed', 'Select query failed', array( 'status' => 500 ) );
+        }
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        // ─── Derive consent state + mask PII ────────────────────────────
+        $items = array();
+        $now_ts = strtotime( $now_mysql );
+        foreach ( $rows as $r ) {
+            $consumed = isset( $r['consumed_at'] ) && $r['consumed_at'] !== null && $r['consumed_at'] !== '';
+            $expires_ts = isset( $r['expires_at'] ) ? strtotime( (string) $r['expires_at'] ) : 0;
+            $state = $consumed
+                ? 'consumed'
+                : ( ( $expires_ts && $expires_ts < $now_ts ) ? 'expired' : 'pending' );
+
+            $items[] = array(
+                'approval_id'     => (int) $r['approval_id'],
+                'charge_id'       => (int) $r['charge_id'],
+                'claim_id'        => isset( $r['claim_id'] ) ? (int) $r['claim_id'] : 0,
+                'amount_thb'      => isset( $r['amount_thb'] ) ? number_format( (float) $r['amount_thb'], 2, '.', '' ) : '0.00',
+                'requester'       => dinoco_claim_charges_mask_uid( isset( $r['requester_user_id'] ) ? $r['requester_user_id'] : 0 ),
+                'approver'        => dinoco_claim_charges_mask_uid( isset( $r['approver_user_id'] ) ? $r['approver_user_id'] : 0 ),
+                'executor'        => dinoco_claim_charges_mask_uid( isset( $r['executor_user_id'] ) ? $r['executor_user_id'] : 0 ),
+                'consent_token'   => dinoco_claim_charges_mask_token( isset( $r['consent_token'] ) ? $r['consent_token'] : '' ),
+                'state'           => $state,
+                'charge_status'   => (string) ( isset( $r['charge_status'] ) ? $r['charge_status'] : '' ),
+                'reason'          => (string) ( isset( $r['refund_reason'] ) ? $r['refund_reason'] : '' ),
+                'created_at'      => (string) ( isset( $r['created_at'] ) ? $r['created_at'] : '' ),
+                'expires_at'      => (string) ( isset( $r['expires_at'] ) ? $r['expires_at'] : '' ),
+                'consumed_at'     => (string) ( isset( $r['consumed_at'] ) ? $r['consumed_at'] : '' ),
+                'executed_at'     => (string) ( isset( $r['executed_at'] ) ? $r['executed_at'] : '' ),
+            );
+        }
+
+        $pages = ( $total > 0 ) ? (int) ceil( $total / $per_page ) : 1;
+
+        if ( function_exists( 'dinoco_obs_capture' ) ) {
+            dinoco_obs_capture( 'info', 'claim_refund_audit_query_ok', array(
+                'status'    => $status_in,
+                'from'      => $from,
+                'to'        => $to,
+                'approver'  => $approver,
+                'requester' => $requester,
+                'page'      => $page,
+                'per_page'  => $per_page,
+                'total'     => $total,
+                'rows'      => count( $items ),
+            ) );
+        }
+
+        return new WP_REST_Response( array(
+            'items' => $items,
+            'meta'  => array(
+                'total'    => $total,
+                'page'     => $page,
+                'per_page' => $per_page,
+                'pages'    => $pages,
+            ),
+        ), 200 );
+    }
+}
+
+add_action( 'rest_api_init', function() {
+    register_rest_route( 'dinoco-claim/v1', '/refund-audit', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_claim_charges_rest_refund_audit',
+        'permission_callback' => function() {
+            return current_user_can( 'manage_options' );
+        },
+        'args' => array(
+            'status'    => array( 'required' => false, 'type' => 'string' ),
+            'from'      => array( 'required' => false, 'type' => 'string' ),
+            'to'        => array( 'required' => false, 'type' => 'string' ),
+            'approver'  => array( 'required' => false, 'type' => 'integer', 'minimum' => 0 ),
+            'requester' => array( 'required' => false, 'type' => 'integer', 'minimum' => 0 ),
+            'page'      => array( 'required' => false, 'type' => 'integer', 'minimum' => 1, 'default' => 1 ),
+            'per_page'  => array( 'required' => false, 'type' => 'integer', 'minimum' => 1, 'maximum' => 200, 'default' => 50 ),
         ),
     ) );
 } );
