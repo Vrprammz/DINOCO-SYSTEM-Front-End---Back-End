@@ -412,7 +412,7 @@ export function renderDeliverForm(po) {
             "<span>" +
             L("ค้างส่ง", "Remaining", "剩余") +
             ': <b style="color:' +
-            (remaining > 0 ? "#d97706" : "#16a34a") +
+            (remaining > 0 ? "#b45309" : "#16a34a") +
             '">' +
             remaining +
             "</b></span>" +

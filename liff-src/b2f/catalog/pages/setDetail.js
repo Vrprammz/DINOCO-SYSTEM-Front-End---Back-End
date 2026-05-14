@@ -206,7 +206,7 @@ export function renderSetDetailItems(
         const sharedSetCount = countTop ? countTop(child.sku) : 0;
         if (sharedSetCount > 1) {
             infoH +=
-                '<div style="margin-top:4px;font-size:10px;color:#d97706;font-weight:600;">🔗 ใช้ใน ' +
+                '<div style="margin-top:4px;font-size:10px;color:#b45309;font-weight:600;">🔗 ใช้ใน ' +
                 sharedSetCount +
                 " ชุด</div>";
         }

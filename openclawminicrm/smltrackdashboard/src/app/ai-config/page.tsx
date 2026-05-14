@@ -60,7 +60,7 @@ const DEFAULT_PROVIDERS: Omit<ProviderConfig, "keyConfigured" | "enabled" | "rol
     vendor: "Anthropic",
     description: "ฉลาดที่สุด เหมาะกับงานวิเคราะห์ซับซ้อน",
     pricing: "เสียเงิน ($3/1M tokens)",
-    color: "#D97706",
+    color: "#B45309",
     icon: "anthropic",
     keyField: "anthropicKey",
   },
