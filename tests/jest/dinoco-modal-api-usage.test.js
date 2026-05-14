@@ -32,11 +32,16 @@ const REPO = path.resolve(__dirname, '../..');
  * Word boundary excludes method calls like `obj.confirm(`.
  */
 const NATIVE_MODAL_BASELINES = {
-    '[Admin System] DINOCO Slip Monitor': 24,
-    '[Admin System] Flash Shipping V.42 Go-Live Tool': 13,
+    // Sprint 3 #1 sweep 2026-05-14 — 4 files migrated to dinoco_modal_* shortcuts.
+    // 51 raw native modal calls removed (24+13+7+7=51). Defensive shim helpers
+    // (cnSafeConfirm in Slip Monitor) preserved as fallback when Modal Helpers
+    // snippet not synced — those use qualified window.confirm which doesn't
+    // match the lookbehind `(?<![.\w])` so count as 0.
+    '[Admin System] DINOCO Slip Monitor': 0,
+    '[Admin System] Flash Shipping V.42 Go-Live Tool': 0,
     '[System] DINOCO Warranty Activation LIFF': 8,
-    '[Admin System] DINOCO Legacy Migration Requests': 7,
-    '[Admin System] DINOCO SN Reconciliation': 7,
+    '[Admin System] DINOCO Legacy Migration Requests': 0,
+    '[Admin System] DINOCO SN Reconciliation': 0,
     '[Admin System] DINOCO Admin Finance Dashboard': 4,
     '[Admin System] DINOCO Global Inventory Database': 4,
     '[Admin System] DINOCO Brand Voice Pool': 3,
@@ -103,10 +108,11 @@ describe('Sprint 2D — dinoco_modal_* adoption (native modal usage baselines)',
     describe('Sprint 3 sweep readiness — baseline total tracks downward over time', () => {
         test('Total native-modal count across tracked files documented', () => {
             const total = Object.values(NATIVE_MODAL_BASELINES).reduce((a, b) => a + b, 0);
-            // 2026-05-14 snapshot = 77 calls. Sprint 3 sweep target = ≤40.
-            // If total exceeds historic ceiling, force baseline review.
-            expect(total).toBeLessThanOrEqual(85);
-            expect(total).toBeGreaterThanOrEqual(60);
+            // Sprint 3 #1 sweep (2026-05-14) reduced 77 → 26.
+            // Floor 0 (could go to all-zeros eventually); ceiling 40 forces
+            // baseline review if any tracked file grows native calls.
+            expect(total).toBeLessThanOrEqual(40);
+            expect(total).toBeGreaterThanOrEqual(0);
         });
     });
 });
