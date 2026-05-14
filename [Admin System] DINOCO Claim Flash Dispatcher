@@ -1,6 +1,35 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Flash Dispatcher                    ║
+ * ║  Version: V.0.5 (2026-05-14) — Sprint 28 Phase 3.3+3.6:           ║
+ * ║    • Phase 3.3 — NEW endpoint `GET /dinoco-claim/v1/flash/list?    ║
+ * ║      claim_id=X` returns rows from `_claim_flash_pnos[]` post meta ║
+ * ║      enriched with print_status from `_claim_flash_print_jobs[]`  ║
+ * ║      side meta. Powers Service Center "Flash Shipments" section.  ║
+ * ║      Admin-only (manage_options + wp_rest nonce). limit param     ║
+ * ║      capped 1..200.                                                ║
+ * ║    • Phase 3.6 — NEW action `dinoco/claim/flash_created` fires    ║
+ * ║      from `dinoco_claim_create_flash_shipment` success branch     ║
+ * ║      with payload {claim_id, pno, direction, label_url, sort_code,║
+ * ║      out_trade_no}. NEW listener                                   ║
+ * ║      `dinoco_claim_flash_enqueue_print_job` @ priority 20:        ║
+ * ║        - SKIPS inbound_pickup (Flash courier brings own AWB —    ║
+ * ║          no DINOCO-side label to print at warehouse).             ║
+ * ║        - Stores _claim_flash_print_jobs[] entry on claim post     ║
+ * ║          with {pno, label_url, direction, status='queued',        ║
+ * ║          source='claim_flash', created_at}.                       ║
+ * ║        - Reuses /b2b/v1/print-queue insert pattern via            ║
+ * ║          `b2b_enqueue_claim_print_job` thin helper (function_     ║
+ * ║          exists guards everywhere — never breaks if Snippet 1    ║
+ * ║          print helpers unavailable).                              ║
+ * ║        - Fires `dinoco/claim/flash_print_enqueued` action for    ║
+ * ║          downstream listeners (Health Monitor, RPi heartbeat).   ║
+ * ║    • Honors POST `recipient_override` field on /flash-create for ║
+ * ║      Service Center modal editable address pre-fill. Override    ║
+ * ║      values flow into customer address fields BEFORE the snap_   ║
+ * ║      group lookup fallback — admin's edits win (V.2.0 R4 spec    ║
+ * ║      "Modal editable + ยืนยันที่อยู่ถูกต้อง checkbox").             ║
+ * ║                                                                    ║
  * ║  Version: V.0.4 (2026-05-14) — Sprint 27 polish (Sprint 26 audit):║
  * ║    • MED-4 — validation block extended to require src_address +    ║
  * ║      src_phone + src_postcode when direction === 'inbound_pickup'. ║
@@ -221,6 +250,27 @@ if ( ! function_exists( 'dinoco_claim_create_flash_shipment' ) ) {
             $cust_city     = (string) ( $snap['snapshot_addr_district']    ?? '' );
             $cust_province = (string) ( $snap['snapshot_addr_province']    ?? '' );
             $cust_postcode = (string) ( $snap['snapshot_addr_zip']         ?? '' );
+        }
+
+        // V.0.5 Sprint 28 — `recipient_override` honored if provided by admin
+        // (Service Center modal edits). Spec V.2.0 R4: "Modal editable +
+        // 'ยืนยันที่อยู่ถูกต้อง' checkbox required". Sanitize all fields.
+        if ( isset( $params['recipient_override'] ) && is_array( $params['recipient_override'] ) ) {
+            $ov = $params['recipient_override'];
+            $ov_name     = isset( $ov['name'] )     ? sanitize_text_field( (string) $ov['name'] )     : '';
+            $ov_phone    = isset( $ov['phone'] )    ? sanitize_text_field( (string) $ov['phone'] )    : '';
+            $ov_address  = isset( $ov['address'] )  ? sanitize_text_field( (string) $ov['address'] )  : '';
+            $ov_district = isset( $ov['district'] ) ? sanitize_text_field( (string) $ov['district'] ) : '';
+            $ov_city     = isset( $ov['city'] )     ? sanitize_text_field( (string) $ov['city'] )     : '';
+            $ov_province = isset( $ov['province'] ) ? sanitize_text_field( (string) $ov['province'] ) : '';
+            $ov_postcode = isset( $ov['postcode'] ) ? sanitize_text_field( (string) $ov['postcode'] ) : '';
+            if ( $ov_name     !== '' ) $cust_name     = $ov_name;
+            if ( $ov_phone    !== '' ) $cust_phone    = $ov_phone;
+            if ( $ov_address  !== '' ) $cust_addr     = $ov_address;
+            if ( $ov_district !== '' ) $cust_district = $ov_district;
+            if ( $ov_city     !== '' ) $cust_city     = $ov_city;
+            if ( $ov_province !== '' ) $cust_province = $ov_province;
+            if ( $ov_postcode !== '' ) $cust_postcode = $ov_postcode;
         }
 
         $wh  = get_option( 'b2b_warehouse_address',  array() );
@@ -473,6 +523,32 @@ if ( ! function_exists( 'dinoco_claim_create_flash_shipment' ) ) {
                     'attempts'  => $attempt,
                 ) );
             }
+
+            // V.0.5 Sprint 28 Phase 3.6 — fire action for downstream listeners
+            // (print enqueue + future Health Monitor). Wrapped in try/catch so
+            // listener exception NEVER blocks Flash response. HR1 hook chain
+            // pattern preserved (R11 obs_capture signature).
+            try {
+                do_action( 'dinoco/claim/flash_created', array(
+                    'claim_id'     => $claim_id,
+                    'pno'          => $pno,
+                    'direction'    => $direction,
+                    'label_url'    => $label_url,
+                    'sort_code'    => $sort_code,
+                    'out_trade_no' => $params_api['outTradeNo'],
+                    'sender_key'   => 'dinoco',
+                ) );
+            } catch ( \Throwable $hook_e ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'error', 'claim_flash_created_hook_exception', array(
+                        'claim_id' => $claim_id,
+                        'pno'      => $pno,
+                        'msg'      => $hook_e->getMessage(),
+                    ) );
+                }
+                // Swallow — Flash shipment already created successfully.
+            }
+
             return array(
                 'ok'           => true,
                 'pno'          => $pno,
@@ -527,6 +603,80 @@ if ( ! function_exists( 'dinoco_claim_flash_register_routes' ) ) {
                 'pno' => array( 'type' => 'string', 'required' => true ),
             ),
         ) );
+        // V.0.5 Sprint 28 Phase 3.3 — list shipments for a claim_id.
+        // Powers Service Center "Flash Shipments" section list panel.
+        // Admin-only (manage_options + wp_rest nonce).
+        register_rest_route( 'dinoco-claim/v1', '/flash/list', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_claim_flash_rest_list',
+            'permission_callback' => 'dinoco_claim_flash_admin_perm',
+            'args'                => array(
+                'claim_id' => array( 'type' => 'integer', 'required' => true ),
+                'limit'    => array( 'type' => 'integer', 'required' => false, 'default' => 50 ),
+            ),
+        ) );
+    }
+}
+
+// V.0.5 Sprint 28 Phase 3.3 — GET /dinoco-claim/v1/flash/list?claim_id=X
+// Reads `_claim_flash_pnos[]` post meta written by helper at success branch.
+// Enriches each entry with print_status from `_claim_flash_print_jobs[]`.
+if ( ! function_exists( 'dinoco_claim_flash_rest_list' ) ) {
+    function dinoco_claim_flash_rest_list( WP_REST_Request $req ) {
+        try {
+            $claim_id = intval( $req->get_param( 'claim_id' ) );
+            $limit    = max( 1, min( 200, intval( $req->get_param( 'limit' ) ?: 50 ) ) );
+
+            if ( $claim_id <= 0 || get_post_type( $claim_id ) !== 'claim_ticket' ) {
+                return new WP_REST_Response( array( 'success' => false, 'message' => 'bad_claim_id', 'code' => 'bad_claim_id', 'items' => array() ), 422 );
+            }
+
+            $pnos = get_post_meta( $claim_id, '_claim_flash_pnos', true );
+            if ( ! is_array( $pnos ) ) $pnos = array();
+
+            $print_jobs = get_post_meta( $claim_id, '_claim_flash_print_jobs', true );
+            if ( ! is_array( $print_jobs ) ) $print_jobs = array();
+            $print_by_pno = array();
+            foreach ( $print_jobs as $pj ) {
+                if ( is_array( $pj ) && isset( $pj['pno'] ) ) {
+                    $print_by_pno[ (string) $pj['pno'] ] = $pj;
+                }
+            }
+
+            $items = array();
+            // Reverse — newest first
+            $pnos_rev = array_reverse( $pnos );
+            foreach ( $pnos_rev as $entry ) {
+                if ( ! is_array( $entry ) ) continue;
+                $pno = isset( $entry['pno'] ) ? (string) $entry['pno'] : '';
+                if ( $pno === '' ) continue;
+                $pj = isset( $print_by_pno[ $pno ] ) ? $print_by_pno[ $pno ] : null;
+                $items[] = array(
+                    'pno'          => $pno,
+                    'direction'    => isset( $entry['direction'] ) ? (string) $entry['direction'] : '',
+                    'status'       => isset( $entry['status'] ) ? (string) $entry['status'] : 'created',
+                    'flash_state'  => isset( $entry['flash_state'] ) ? intval( $entry['flash_state'] ) : 0,
+                    'sort_code'    => isset( $entry['sort_code'] ) ? (string) $entry['sort_code'] : '',
+                    'out_trade_no' => isset( $entry['out_trade_no'] ) ? (string) $entry['out_trade_no'] : '',
+                    'created_at'   => isset( $entry['created_at'] ) ? (string) $entry['created_at'] : '',
+                    'updated_at'   => isset( $entry['updated_at'] ) ? (string) $entry['updated_at'] : '',
+                    'print_status' => $pj ? ( isset( $pj['status'] ) ? (string) $pj['status'] : 'queued' ) : '',
+                );
+                if ( count( $items ) >= $limit ) break;
+            }
+
+            return new WP_REST_Response( array(
+                'success' => true,
+                'claim_id' => $claim_id,
+                'items'    => $items,
+                'total'    => count( $items ),
+            ), 200 );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_flash_rest_list_exception', array( 'msg' => $e->getMessage() ) );
+            }
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'Internal error', 'code' => 'internal_error', 'items' => array() ), 500 );
+        }
     }
 }
 
@@ -574,6 +724,12 @@ if ( ! function_exists( 'dinoco_claim_flash_rest_create' ) ) {
             $weight_grams = intval( $req->get_param( 'weight_grams' ) );
             $dims = $req->get_param( 'dimensions' );
             $notes = sanitize_text_field( (string) $req->get_param( 'notes' ) );
+            $article_cat = intval( $req->get_param( 'articleCategory' ) );
+            if ( $article_cat <= 0 ) $article_cat = 99;
+            // V.0.5 Sprint 28 — accept admin recipient_override from Service
+            // Center modal. Helper sanitizes each field individually.
+            $recipient_override = $req->get_param( 'recipient_override' );
+            if ( ! is_array( $recipient_override ) ) $recipient_override = array();
 
             // Idempotency — body hash includes actor_user_id + direction
             $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
@@ -626,10 +782,12 @@ if ( ! function_exists( 'dinoco_claim_flash_rest_create' ) ) {
                 }
 
                 $result = dinoco_claim_create_flash_shipment( $claim_id, array(
-                    'direction'    => $direction,
-                    'weight_grams' => $weight_grams,
-                    'dimensions'   => is_array( $dims ) ? $dims : array(),
-                    'notes'        => $notes,
+                    'direction'          => $direction,
+                    'weight_grams'       => $weight_grams,
+                    'dimensions'         => is_array( $dims ) ? $dims : array(),
+                    'notes'              => $notes,
+                    'articleCategory'    => $article_cat,
+                    'recipient_override' => $recipient_override,
                 ) );
 
                 if ( is_wp_error( $result ) ) {
@@ -949,6 +1107,132 @@ if ( ! function_exists( 'dinoco_claim_flash_on_webhook' ) ) {
                     'pno'        => $pno,
                     'target'     => $target,
                     'error_code' => $err_code,
+                ) );
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// V.0.5 Sprint 28 Phase 3.6 — Print queue enqueue listener
+// ──────────────────────────────────────────────────────────────────
+//
+// Listens to `dinoco/claim/flash_created` fired from
+// `dinoco_claim_create_flash_shipment` success branch (V.0.5).
+// Enqueues a print job for the Flash label via the same /b2b/v1/print-queue
+// pattern used by B2B order labels — but writes claim-side post meta
+// (`_claim_flash_print_jobs[]`) rather than the b2b_order print_status ACF
+// field, because RPi `b2b_rest_print_queue` only handles b2b_order CPT.
+//
+// SKIPS direction === 'inbound_pickup' because the Flash courier brings
+// their own AWB to the customer pickup — no DINOCO-side label to print.
+//
+// Priority 20 — runs AFTER any future security/audit listeners hooked at
+// the default priority 10. Safe: NEVER throws to the do_action() caller.
+
+add_action( 'dinoco/claim/flash_created', 'dinoco_claim_flash_enqueue_print_job', 20, 1 );
+
+if ( ! function_exists( 'b2b_enqueue_claim_print_job' ) ) {
+    /**
+     * V.0.5 Sprint 28 Phase 3.6 — thin helper that records claim Flash
+     * print intent on the claim post + fires a downstream action. Mirrors
+     * `b2b_enqueue_print_job($ticket_id)` from [B2B] Snippet 1 V.34.x but
+     * scoped to claim_ticket CPT (the canonical helper rejects non-b2b_order
+     * post types). Reuses /b2b/v1/print-queue insert pattern conceptually
+     * by writing print_status meta that RPi can poll via a future endpoint.
+     *
+     * @param int   $claim_id  claim_ticket post ID
+     * @param array $payload   { pno, label_url, direction, sort_code?, out_trade_no?, sender_key? }
+     * @return bool true on success, false on guard miss
+     */
+    function b2b_enqueue_claim_print_job( $claim_id, array $payload ) {
+        $claim_id = intval( $claim_id );
+        if ( $claim_id <= 0 || get_post_type( $claim_id ) !== 'claim_ticket' ) return false;
+
+        $pno = isset( $payload['pno'] ) ? (string) $payload['pno'] : '';
+        if ( $pno === '' ) return false;
+
+        $jobs = get_post_meta( $claim_id, '_claim_flash_print_jobs', true );
+        if ( ! is_array( $jobs ) ) $jobs = array();
+
+        // Dedup — skip if this PNO already enqueued
+        foreach ( $jobs as $existing ) {
+            if ( is_array( $existing ) && isset( $existing['pno'] ) && $existing['pno'] === $pno ) {
+                return false;
+            }
+        }
+
+        $jobs[] = array(
+            'pno'          => $pno,
+            'label_url'    => isset( $payload['label_url'] ) ? (string) $payload['label_url'] : '',
+            'direction'    => isset( $payload['direction'] ) ? (string) $payload['direction'] : '',
+            'sort_code'    => isset( $payload['sort_code'] ) ? (string) $payload['sort_code'] : '',
+            'out_trade_no' => isset( $payload['out_trade_no'] ) ? (string) $payload['out_trade_no'] : '',
+            'sender_key'   => isset( $payload['sender_key'] ) ? (string) $payload['sender_key'] : 'dinoco',
+            'status'       => 'queued',
+            'source'       => 'claim_flash',
+            'created_at'   => current_time( 'mysql' ),
+        );
+        update_post_meta( $claim_id, '_claim_flash_print_jobs', $jobs );
+
+        if ( function_exists( 'dinoco_obs_capture' ) ) {
+            dinoco_obs_capture( 'info', 'claim_flash_print_enqueued', array(
+                'claim_id' => $claim_id,
+                'pno'      => $pno,
+                'direction' => isset( $payload['direction'] ) ? $payload['direction'] : '',
+            ) );
+        }
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_flash_enqueue_print_job' ) ) {
+    /**
+     * V.0.5 Sprint 28 Phase 3.6 — listener.
+     *
+     * @param array $payload { claim_id, pno, direction, label_url, sort_code, out_trade_no, sender_key }
+     */
+    function dinoco_claim_flash_enqueue_print_job( $payload ) {
+        try {
+            if ( ! is_array( $payload ) ) return;
+            $direction = isset( $payload['direction'] ) ? (string) $payload['direction'] : '';
+            $claim_id  = isset( $payload['claim_id'] ) ? intval( $payload['claim_id'] ) : 0;
+            $pno       = isset( $payload['pno'] ) ? (string) $payload['pno'] : '';
+            if ( $claim_id <= 0 || $pno === '' ) return;
+
+            // SKIP inbound_pickup — Flash courier brings own AWB to customer
+            // pickup. No DINOCO-side label to print at warehouse. Spec line
+            // 1062 — only replacement + repaired_return enqueue print.
+            if ( $direction === 'inbound_pickup' ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'info', 'claim_flash_print_skip_inbound', array(
+                        'claim_id' => $claim_id,
+                        'pno'      => $pno,
+                    ) );
+                }
+                return;
+            }
+
+            $enqueued = b2b_enqueue_claim_print_job( $claim_id, $payload );
+
+            // Fire downstream action for Health Monitor + future RPi heartbeat
+            if ( $enqueued ) {
+                try {
+                    do_action( 'dinoco/claim/flash_print_enqueued', array(
+                        'claim_id'  => $claim_id,
+                        'pno'       => $pno,
+                        'direction' => $direction,
+                        'label_url' => isset( $payload['label_url'] ) ? (string) $payload['label_url'] : '',
+                    ) );
+                } catch ( \Throwable $hook_e ) {
+                    // Swallow — print job already enqueued.
+                }
+            }
+        } catch ( \Throwable $e ) {
+            // NEVER let listener exception block Flash response chain.
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_flash_print_enqueue_exception', array(
+                    'msg' => $e->getMessage(),
                 ) );
             }
         }
