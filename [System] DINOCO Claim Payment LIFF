@@ -1,7 +1,31 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO Claim Payment LIFF                              ║
- * ║  Version: V.0.6 (2026-05-14) — Sprint 17 Phase 2.6 backbone:       ║
+ * ║  Version: V.0.8 (2026-05-14) — Sprint 20 Phase 2.7 (customer LIFF) :║
+ * ║    • NEW shortcode `[dinoco_claim_pay]` — customer-facing 3-screen ║
+ * ║      LIFF page (landing/upload/result). Scoped `.dnc-claim-pay-*`  ║
+ * ║      CSS. Mobile-first ≥44px touch. ARIA live regions. Buddhist    ║
+ * ║      year date format. Flag-gated `dinoco_claim_payment_enabled`.  ║
+ * ║    • Slip upload extended — POST /charge/{id}/upload-slip now      ║
+ * ║      accepts multipart `slip_image` (jpg/png ≤5MB). SHA256 →       ║
+ * ║      slip_ref_hash; UPDATE slip_image_url + slip_ref_hash; UNIQUE  ║
+ * ║      uq_slip_replay_claim catches replays (409 slip_replay_detected)║
+ * ║      Protected dir wp-content/uploads/dinoco-claim-slips/{YYYY-MM}/ ║
+ * ║      + .htaccess deny direct access (MED-3 hardening).             ║
+ * ║    • NEW async Slip2Go verify wrapper —                            ║
+ * ║      `dinoco_claim_payment_verify_slip_async($charge_id)` scheduled║
+ * ║      via wp_schedule_single_event post-upload. Reuses B2F          ║
+ * ║      `b2f_verify_slip_image()` pattern but with claim bank_code +  ║
+ * ║      amount. function_exists-guarded.                              ║
+ * ║    • NEW REST `GET /charges/{id}/slip-image` — auth-gated slip     ║
+ * ║      proxy (admin any; owner own-charge only; 404 anti-enum).      ║
+ * ║      Cache-Control: private, max-age=300. Rate-limit 30/min.       ║
+ * ║      Closes MED-3 (direct uploads URL bypass).                     ║
+ * ║    • NEW `dinoco_claim_payment_invalidate_charges_on_owner_transfer║
+ * ║      ($old_uid, $new_uid)` listener for HIGH-2 cache invalidation  ║
+ * ║      on warranty transfer (fires both old + new owner).            ║
+ * ║                                                                    ║
+ * ║  Version: V.0.7 (2026-05-14) — Sprint 19 code-reviewer remediation:║
  * ║    • NEW POST /dinoco-claim/v1/charges (admin create) — landing     ║
  * ║      Sprint 13 deferred. Body { claim_id, amount_thb (DECIMAL),     ║
  * ║      reason (whitelist), reason_note?, bank_context default+walkin, ║
@@ -192,7 +216,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 $dinoco_claim_payment_enabled = (bool) get_option( 'dinoco_claim_payment_enabled', false );
 
 if ( ! defined( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED' ) ) {
-    define( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED', '0.6' );
+    define( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED', '0.8' );
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -594,6 +618,17 @@ if ( ! function_exists( 'dinoco_claim_payment_register_rest' ) ) {
                 'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),
             ),
         ) );
+
+        // V.0.8 Sprint 20 MED-3 — auth-gated slip image proxy. Combined with
+        // .htaccess deny on uploads dir, defeats direct-URL access bypass.
+        register_rest_route( $base, '/charges/(?P<id>\\d+)/slip-image', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_claim_payment_rest_slip_image',
+            'permission_callback' => function() { return is_user_logged_in(); },
+            'args' => array(
+                'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),
+            ),
+        ) );
     }
 }
 
@@ -713,24 +748,161 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_upload_slip' ) ) {
             }
         }
 
-        // NOTE: actual slip image storage + Slip2Go async call is delegated to
-        // Phase 2.6 (separate task). V.0.2 only handles state transition; the
-        // slip_image_url + slip_ref_hash + slip_verify_data columns will be
-        // populated by that handler before invoking this endpoint.
-        //
-        // V.0.6 Sprint 14 H1 helper — when Phase 2.6 lands the actual slip
-        // upload, it should pass `idem_discriminator => sha1_file($slip)` in
-        // context so retries of the SAME slip dedup but DIFFERENT slip uploads
-        // get distinct hashes (binary-fingerprint R42 pattern).
-        return dinoco_claim_payment_wrapped_transition(
+        // V.0.8 Sprint 20 — actually accept and store the slip image file.
+        // multipart upload via $_FILES['slip_image'] (REST forwards via
+        // get_file_params()). Validate mime + size + compute sha256. Store
+        // to protected dir + UPDATE row pre-transition. Async Slip2Go verify
+        // scheduled post-COMMIT.
+        $files     = $req->get_file_params();
+        $slip_file = isset( $files['slip_image'] ) ? $files['slip_image'] : null;
+
+        $stored_url      = '';
+        $slip_sha256     = '';
+        $stored_relative = '';
+
+        if ( $slip_file && is_array( $slip_file ) && ! empty( $slip_file['tmp_name'] ) ) {
+            // File validation
+            $allowed_mimes = array( 'image/jpeg', 'image/png' );
+            $max_bytes     = 5 * 1024 * 1024;
+
+            $size = isset( $slip_file['size'] ) ? (int) $slip_file['size'] : 0;
+            if ( $size <= 0 || $size > $max_bytes ) {
+                return new WP_Error( 'file_too_large', 'ไฟล์ใหญ่เกิน 5MB หรือว่าง', array( 'status' => 422 ) );
+            }
+
+            // Verify mime via finfo (extension is spoofable)
+            $detected_mime = '';
+            if ( function_exists( 'finfo_open' ) ) {
+                $fi = finfo_open( FILEINFO_MIME_TYPE );
+                if ( $fi ) {
+                    $detected_mime = (string) finfo_file( $fi, $slip_file['tmp_name'] );
+                    finfo_close( $fi );
+                }
+            }
+            if ( $detected_mime === '' ) {
+                $detected_mime = isset( $slip_file['type'] ) ? (string) $slip_file['type'] : '';
+            }
+            if ( ! in_array( $detected_mime, $allowed_mimes, true ) ) {
+                return new WP_Error( 'invalid_mime', 'รองรับเฉพาะรูป JPG/PNG', array( 'status' => 422 ) );
+            }
+
+            // Compute sha256 of file content (slip_ref_hash + idem_discriminator)
+            $slip_sha256 = (string) hash_file( 'sha256', $slip_file['tmp_name'] );
+            if ( $slip_sha256 === '' ) {
+                return new WP_Error( 'hash_failed', 'ไม่สามารถประมวลผลไฟล์ได้', array( 'status' => 500 ) );
+            }
+
+            // Protected dir: wp-content/uploads/dinoco-claim-slips/{YYYY-MM}/
+            $uploads_base = wp_upload_dir();
+            if ( empty( $uploads_base['basedir'] ) ) {
+                return new WP_Error( 'uploads_unavailable', 'Uploads dir unavailable', array( 'status' => 500 ) );
+            }
+            $sub_month  = wp_date( 'Y-m' );
+            $target_dir = trailingslashit( $uploads_base['basedir'] ) . 'dinoco-claim-slips/' . $sub_month;
+            if ( ! file_exists( $target_dir ) ) {
+                wp_mkdir_p( $target_dir );
+                @chmod( $target_dir, 0750 );
+            }
+            // .htaccess deny direct (defense-in-depth — REST proxy is the
+            // canonical read path; closes MED-3 direct-URL bypass)
+            $htaccess = trailingslashit( $uploads_base['basedir'] ) . 'dinoco-claim-slips/.htaccess';
+            if ( ! file_exists( $htaccess ) ) {
+                @file_put_contents( $htaccess, "Order deny,allow\nDeny from all\n" );
+            }
+
+            // Pre-check uniqueness (defense before atomic UPDATE — UNIQUE
+            // constraint still authoritative; this is fast-fail with a
+            // user-friendly message before file I/O).
+            if ( function_exists( 'dinoco_claim_charges_table_name' ) ) {
+                $table = dinoco_claim_charges_table_name();
+                $dup   = (int) $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(*) FROM {$table} WHERE slip_ref_hash = %s AND id != %d",
+                    $slip_sha256, $chid
+                ) );
+                if ( $dup > 0 ) {
+                    return new WP_Error(
+                        'slip_replay_detected',
+                        'สลิปนี้ถูกใช้งานไปแล้ว — กรุณาส่งสลิปใหม่',
+                        array( 'status' => 409 )
+                    );
+                }
+            }
+
+            // Build filename — sha256 first 8 chars + 4 random hex (no PII)
+            $ext      = ( $detected_mime === 'image/png' ) ? 'png' : 'jpg';
+            $filename = substr( $slip_sha256, 0, 8 ) . '_' . wp_generate_password( 4, false, false ) . '.' . $ext;
+            $abs_path = trailingslashit( $target_dir ) . $filename;
+            $moved    = @move_uploaded_file( $slip_file['tmp_name'], $abs_path );
+            if ( ! $moved ) {
+                // PHP CLI / unit-test fallback (move_uploaded_file requires
+                // is_uploaded_file() true which only holds on real POST)
+                if ( defined( 'WP_CLI' ) || defined( 'PHPUNIT_RUNNING' ) ) {
+                    @copy( $slip_file['tmp_name'], $abs_path );
+                    $moved = file_exists( $abs_path );
+                }
+            }
+            if ( ! $moved ) {
+                return new WP_Error( 'upload_failed', 'อัปโหลดไม่สำเร็จ — ลองใหม่อีกครั้ง', array( 'status' => 500 ) );
+            }
+            @chmod( $abs_path, 0640 );
+
+            $stored_relative = 'dinoco-claim-slips/' . $sub_month . '/' . $filename;
+            $stored_url      = trailingslashit( $uploads_base['baseurl'] ) . $stored_relative;
+
+            // Pre-write slip_image_url + slip_ref_hash BEFORE FSM transition so
+            // UPDATE inside transition() can rely on hash uniqueness. UNIQUE
+            // constraint will atomically reject race-replays.
+            if ( function_exists( 'dinoco_claim_charges_table_name' ) ) {
+                $tbl    = dinoco_claim_charges_table_name();
+                $upd    = $wpdb->update(
+                    $tbl,
+                    array(
+                        'slip_image_url' => $stored_url,
+                        'slip_ref_hash'  => $slip_sha256,
+                    ),
+                    array( 'id' => $chid ),
+                    array( '%s', '%s' ),
+                    array( '%d' )
+                );
+                if ( $upd === false ) {
+                    @unlink( $abs_path );
+                    // Detect UNIQUE constraint violation by reading last_error.
+                    $err = (string) $wpdb->last_error;
+                    if ( stripos( $err, 'duplicate' ) !== false || stripos( $err, 'uq_slip_replay_claim' ) !== false ) {
+                        return new WP_Error( 'slip_replay_detected',
+                            'สลิปนี้ถูกใช้งานไปแล้ว', array( 'status' => 409 ) );
+                    }
+                    return new WP_Error( 'db_update_failed',
+                        'บันทึกลงฐานข้อมูลล้มเหลว', array( 'status' => 500 ) );
+                }
+            }
+        }
+
+        // V.0.6 Sprint 14 H1 — idem_discriminator = sha256 so retry of SAME
+        // slip dedup but DIFFERENT slip gets distinct hash (R42 binary-
+        // fingerprint pattern).
+        $result = dinoco_claim_payment_wrapped_transition(
             'claim_charge_upload', 'claim-charge-upload',
             $chid, 'pending_review', 'customer',
             array(
                 'verify_method'      => 'slip2go_pending',
-                'idem_discriminator' => '',  // Phase 2.6: sha1_file of slip image
+                'idem_discriminator' => $slip_sha256,
+                'slip_image_url'     => $stored_url,
+                'slip_ref_hash'      => $slip_sha256,
             ),
             10  // 10/hr per customer
         );
+
+        // Schedule async Slip2Go verify post-transition success.
+        if ( ! is_wp_error( $result ) && $slip_sha256 !== '' ) {
+            if ( function_exists( 'wp_schedule_single_event' ) ) {
+                // 5s delay so transition COMMIT propagates to replicas before
+                // the async worker SELECTs the row.
+                wp_schedule_single_event( time() + 5, 'dinoco_claim_payment_slip_verify_async', array( (int) $chid ) );
+            }
+        }
+
+        return $result;
     }
 }
 
@@ -1685,9 +1857,757 @@ if ( ! function_exists( 'dinoco_claim_payment_run_pending_review_sweep' ) ) {
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 4. WIRE-UP — flag-gated REST registration
+ * 4. SLIP IMAGE PROXY (V.0.8 Sprint 20 MED-3)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_slip_image' ) ) {
+    /**
+     * GET /dinoco-claim/v1/charges/{id}/slip-image — auth-gated proxy.
+     *
+     * Tiers:
+     *   - admin (manage_options) → any charge
+     *   - owner customer         → own charge only
+     *   - other                  → 404 anti-enumeration
+     *
+     * Rate limit 30/min/user. Cache-Control: private, max-age=300.
+     */
+    function dinoco_claim_payment_rest_slip_image( $req ) {
+        global $wpdb;
+        $chid = (int) $req->get_param( 'id' );
+        $uid  = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+        $is_admin = current_user_can( 'manage_options' );
+
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'claim_slip_image_' . $uid, 30, 60 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            return new WP_Error( 'schema_missing', 'Charges schema not installed', array( 'status' => 500 ) );
+        }
+        $table = dinoco_claim_charges_table_name();
+        $row   = $wpdb->get_row( $wpdb->prepare(
+            "SELECT user_id, slip_image_url, status FROM {$table} WHERE id = %d", $chid
+        ), ARRAY_A );
+
+        if ( ! $row ) {
+            return new WP_Error( 'charge_not_found', 'ไม่พบใบเรียกเก็บนี้', array( 'status' => 404 ) );
+        }
+
+        // Owner tier — 404 (not 403) on mismatch
+        if ( ! $is_admin ) {
+            if ( (int) $row['user_id'] !== $uid ) {
+                return new WP_Error( 'charge_not_found', 'ไม่พบใบเรียกเก็บนี้', array( 'status' => 404 ) );
+            }
+            // Owner can only view slip after verified/refunded — pre-verify is
+            // admin-private review.
+            if ( ! in_array( $row['status'], array( 'verified', 'refunded' ), true ) ) {
+                return new WP_Error( 'slip_not_visible_yet', 'สลิปจะแสดงเมื่อตรวจสอบเสร็จ', array( 'status' => 403 ) );
+            }
+        }
+
+        $url = (string) $row['slip_image_url'];
+        if ( $url === '' ) {
+            return new WP_Error( 'no_slip', 'ยังไม่มีสลิปแนบ', array( 'status' => 404 ) );
+        }
+
+        // Resolve absolute file path from stored URL.
+        $uploads = wp_upload_dir();
+        $base_url = isset( $uploads['baseurl'] ) ? (string) $uploads['baseurl'] : '';
+        $base_dir = isset( $uploads['basedir'] ) ? (string) $uploads['basedir'] : '';
+        if ( $base_url === '' || $base_dir === '' || strpos( $url, $base_url ) !== 0 ) {
+            return new WP_Error( 'slip_path_resolve_failed', 'ไม่พบไฟล์สลิป', array( 'status' => 500 ) );
+        }
+        $rel  = substr( $url, strlen( $base_url ) );
+        // Strict allowlist: must start with /dinoco-claim-slips/ + no traversal
+        if ( strpos( $rel, '/dinoco-claim-slips/' ) !== 0 || strpos( $rel, '..' ) !== false ) {
+            return new WP_Error( 'slip_path_invalid', 'Invalid slip path', array( 'status' => 400 ) );
+        }
+        $abs = $base_dir . $rel;
+        if ( ! file_exists( $abs ) || ! is_readable( $abs ) ) {
+            return new WP_Error( 'slip_file_missing', 'ไฟล์สลิปหาย', array( 'status' => 404 ) );
+        }
+
+        // Stream file via REST response (headers via WP REST mechanism).
+        $mime = function_exists( 'finfo_open' )
+            ? ( function () use ( $abs ) {
+                $fi = finfo_open( FILEINFO_MIME_TYPE );
+                $m  = $fi ? (string) finfo_file( $fi, $abs ) : 'application/octet-stream';
+                if ( $fi ) finfo_close( $fi );
+                return $m;
+            } )()
+            : 'application/octet-stream';
+        if ( ! in_array( $mime, array( 'image/jpeg', 'image/png' ), true ) ) {
+            return new WP_Error( 'slip_mime_invalid', 'Invalid slip mime', array( 'status' => 400 ) );
+        }
+
+        // Audit-log read (defensive — skip if obs not loaded)
+        if ( function_exists( 'dinoco_obs_capture' ) ) {
+            dinoco_obs_capture( 'info', 'claim_slip_image_read', array(
+                'charge_id' => $chid, 'actor_user_id' => $uid, 'tier' => $is_admin ? 'admin' : 'owner',
+            ) );
+        }
+
+        // Note: REST will JSON-encode array responses; for binary we use
+        // WP_REST_Response with raw body + headers. Header X-Content-Type-
+        // Options: nosniff prevents browser sniffing. Content-Disposition
+        // inline so image renders in <img src=> tag.
+        $body     = file_get_contents( $abs );
+        $response = new \WP_REST_Response( $body, 200 );
+        $response->header( 'Content-Type', $mime );
+        $response->header( 'Cache-Control', 'private, max-age=300' );
+        $response->header( 'X-Content-Type-Options', 'nosniff' );
+        $response->header( 'Content-Disposition', 'inline' );
+        $response->header( 'Content-Length', (string) strlen( $body ) );
+        return $response;
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. SLIP2GO ASYNC VERIFY (V.0.8 Sprint 20)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_payment_verify_slip_async' ) ) {
+    /**
+     * wp_schedule_single_event handler — called 5s after upload-slip COMMIT.
+     *
+     * Reads charge row → calls existing b2f_verify_slip_image() pattern OR
+     * dedicated b2b helper if available → transition to verified|rejected.
+     * On Slip2Go timeout/HTTP error: leave state pending_review for admin
+     * manual verify + Telegram dedup alert.
+     */
+    function dinoco_claim_payment_verify_slip_async( $charge_id ) {
+        global $wpdb;
+        $chid = (int) $charge_id;
+        if ( $chid <= 0 ) return;
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) return;
+
+        $table = dinoco_claim_charges_table_name();
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT bank_code, bank_account, amount_thb, slip_image_url, status FROM {$table} WHERE id = %d",
+            $chid
+        ), ARRAY_A );
+        if ( ! $row || (string) $row['status'] !== 'pending_review' ) {
+            return; // state moved on already; nothing to do
+        }
+
+        $slip_url = (string) $row['slip_image_url'];
+        $bank_code = (string) $row['bank_code'];
+        $amount    = (float) $row['amount_thb'];
+
+        if ( $slip_url === '' || $bank_code === '' ) {
+            return; // missing data — leave for admin manual
+        }
+
+        // Fetch slip bytes → base64 for Slip2Go API. Use REST proxy resolver
+        // pattern (uploads basedir).
+        $uploads  = wp_upload_dir();
+        $base_url = isset( $uploads['baseurl'] ) ? (string) $uploads['baseurl'] : '';
+        $base_dir = isset( $uploads['basedir'] ) ? (string) $uploads['basedir'] : '';
+        $image_b64 = '';
+        if ( $base_url !== '' && $base_dir !== '' && strpos( $slip_url, $base_url ) === 0 ) {
+            $rel = substr( $slip_url, strlen( $base_url ) );
+            if ( strpos( $rel, '/dinoco-claim-slips/' ) === 0 && strpos( $rel, '..' ) === false ) {
+                $abs = $base_dir . $rel;
+                if ( is_readable( $abs ) ) {
+                    $b = @file_get_contents( $abs );
+                    if ( $b !== false ) {
+                        $image_b64 = base64_encode( $b );
+                    }
+                }
+            }
+        }
+        if ( $image_b64 === '' ) {
+            if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+                b2b_tg_send_dedup( 'claim_slip_image_unreadable',
+                    sprintf( '[CHARGES] Slip image unreadable on charge #%d', $chid ),
+                    3600 );
+            }
+            return;
+        }
+
+        // Slip2Go API call — manual implementation to avoid coupling to
+        // b2f_verify_slip_image() which expects maker_id. Reuses same
+        // Slip2Go secret + base URL conventions.
+        $api_url = defined( 'B2B_SLIP2GO_API_URL' ) ? B2B_SLIP2GO_API_URL
+                : 'https://connect.slip2go.com/api/verify-slip/qr-base64/info';
+        $api_key = defined( 'B2B_SLIP2GO_SECRET_KEY' ) ? B2B_SLIP2GO_SECRET_KEY : '';
+        if ( $api_key === '' ) {
+            if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+                b2b_tg_send_dedup( 'claim_slip2go_no_key',
+                    '[CHARGES] B2B_SLIP2GO_SECRET_KEY not configured — claim slip verify disabled', 3600 );
+            }
+            return;
+        }
+
+        $payload = array(
+            'payload' => array(
+                'imageBase64'    => $image_b64,
+                'checkCondition' => array(
+                    'checkDuplicate' => true,
+                    'checkReceiver'  => array(
+                        array(
+                            'accountNumber' => preg_replace( '/[^0-9]/', '', (string) $row['bank_account'] ),
+                            'accountType'   => 'BANKAC',
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        $response = wp_remote_post( $api_url, array(
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $api_key,
+                'Content-Type'  => 'application/json',
+            ),
+            'body'    => wp_json_encode( $payload ),
+            'timeout' => 10,
+        ) );
+
+        // Retry once on transient error
+        if ( is_wp_error( $response ) ) {
+            sleep( 1 );
+            $response = wp_remote_post( $api_url, array(
+                'headers' => array(
+                    'Authorization' => 'Bearer ' . $api_key,
+                    'Content-Type'  => 'application/json',
+                ),
+                'body'    => wp_json_encode( $payload ),
+                'timeout' => 10,
+            ) );
+        }
+
+        if ( is_wp_error( $response ) ) {
+            if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+                b2b_tg_send_dedup( 'claim_slip2go_down',
+                    '[CHARGES] Slip2Go unreachable — leaving claim charges pending_review for admin manual verify', 3600 );
+            }
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'slip2go_unavailable', array(
+                    'charge_id' => $chid, 'error' => $response->get_error_message(),
+                ) );
+            }
+            return;
+        }
+
+        $http_code  = (int) wp_remote_retrieve_response_code( $response );
+        $body_raw   = (string) wp_remote_retrieve_body( $response );
+        $body_decoded = json_decode( $body_raw, true );
+        if ( $http_code !== 200 || empty( $body_decoded ) ) {
+            if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+                b2b_tg_send_dedup( 'claim_slip2go_http_' . $http_code,
+                    sprintf( '[CHARGES] Slip2Go HTTP %d on charge #%d', $http_code, $chid ), 3600 );
+            }
+            return;
+        }
+
+        $api_code = isset( $body_decoded['code'] ) ? (string) $body_decoded['code'] : '';
+        $data     = isset( $body_decoded['data'] ) ? $body_decoded['data'] : array();
+        $slip_amount = isset( $data['amount'] ) ? floatval( $data['amount'] ) : 0;
+
+        // Persist Slip2Go response (audit trail).
+        $wpdb->update(
+            $table,
+            array( 'slip_verify_data' => wp_json_encode( $body_decoded ) ),
+            array( 'id' => $chid ),
+            array( '%s' ), array( '%d' )
+        );
+
+        $is_success = in_array( $api_code, array( '200000', '200200' ), true );
+        $amount_match = ( abs( $slip_amount - $amount ) <= 0.01 );
+
+        if ( $is_success && $amount_match ) {
+            dinoco_claim_charge_transition( $chid, 'verified', 'system', array(
+                'verify_method'  => 'slip2go',
+                'actor_user_id'  => 0,
+                'slip_amount'    => $slip_amount,
+            ) );
+            return;
+        }
+
+        // Mismatch — reject with reason. Admin can review slip_verify_data
+        // + re-trigger if needed.
+        $reason = $is_success ? 'amount_mismatch' : ( 'slip2go_' . $api_code );
+        dinoco_claim_charge_transition( $chid, 'rejected', 'system', array(
+            'reason'         => $reason,
+            'actor_user_id'  => 0,
+            'verify_method'  => 'slip2go',
+            'slip_amount'    => $slip_amount,
+        ) );
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. OWNER-TRANSFER CACHE INVALIDATION LISTENER (V.0.8 Sprint 20 HIGH-2)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_payment_invalidate_charges_on_owner_transfer' ) ) {
+    /**
+     * Fired by Manual Transfer + Member Transfer Warranty pages via
+     * `do_action('dinoco/claim/owner_transferred', $old_uid, $new_uid, $ctx)`.
+     *
+     * Purges per-charge transients for any charge belonging to either user
+     * (chunked 100/iter to bound memory on power users with many warranties).
+     */
+    function dinoco_claim_payment_invalidate_charges_on_owner_transfer( $old_uid, $new_uid, $context = array() ) {
+        $old = (int) $old_uid;
+        $new = (int) $new_uid;
+        if ( $old <= 0 && $new <= 0 ) return;
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) return;
+
+        global $wpdb;
+        $table = dinoco_claim_charges_table_name();
+
+        $uids   = array();
+        if ( $old > 0 ) $uids[] = $old;
+        if ( $new > 0 && $new !== $old ) $uids[] = $new;
+
+        foreach ( $uids as $u ) {
+            $offset = 0;
+            $batch  = 100;
+            do {
+                $rows = $wpdb->get_col( $wpdb->prepare(
+                    "SELECT id FROM {$table} WHERE user_id = %d ORDER BY id ASC LIMIT %d OFFSET %d",
+                    $u, $batch, $offset
+                ) );
+                if ( empty( $rows ) ) break;
+                foreach ( $rows as $cid ) {
+                    delete_transient( 'dinoco_claim_charge_v1_' . (int) $cid . '_admin' );
+                    delete_transient( 'dinoco_claim_charge_v1_' . (int) $cid . '_owner' );
+                }
+                $offset += $batch;
+            } while ( count( $rows ) === $batch );
+        }
+    }
+}
+add_action( 'dinoco/claim/owner_transferred', 'dinoco_claim_payment_invalidate_charges_on_owner_transfer', 5, 3 );
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. CUSTOMER LIFF SHORTCODE — [dinoco_claim_pay] (V.0.8 Sprint 20)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * 3 screens (UI states): landing / upload / success. Mobile-first. Scoped
+ * CSS `.dnc-claim-pay-*`. ARIA live regions. Buddhist year. ≥44px touch.
+ * data-action delegation throughout (UX-H3 strict).
+ *
+ * Auth: D11 — LINE OAuth + WP session (no new JWT). If not logged in →
+ * server-rendered redirect link to /login (via dinoco_gateway pattern).
+ */
+
+if ( ! function_exists( 'dinoco_claim_pay_render' ) ) {
+    function dinoco_claim_pay_render( $atts = array() ) {
+        $cid = isset( $_GET['cid'] ) ? (int) $_GET['cid'] : 0;
+
+        // Server-rendered logged-out hint (not strict gate — client-side
+        // fetch will 401 and JS will surface friendly contact-admin card).
+        $logged_in = is_user_logged_in();
+        $logout_card = '';
+        if ( ! $logged_in ) {
+            $logout_card = '<div class="dnc-claim-pay-warn" role="alert">'
+                . '<p>กรุณาเข้าสู่ระบบด้วย LINE เพื่อชำระค่าเคลม</p>'
+                . '<a class="dnc-claim-pay-btn-line" href="' . esc_url( home_url( '/login/?redirect=' . urlencode( '/claim-pay/?cid=' . $cid ) ) ) . '">เข้าสู่ระบบด้วย LINE</a>'
+                . '</div>';
+        }
+
+        ob_start();
+        ?>
+<div class="dnc-claim-pay-app" data-cid="<?php echo esc_attr( (string) $cid ); ?>">
+    <style>
+        /* Scoped — prefix `.dnc-claim-pay-` */
+        .dnc-claim-pay-app{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#F9FAFB;color:#111827;min-height:100vh;padding-bottom:96px}
+        .dnc-claim-pay-app *{box-sizing:border-box}
+        .dnc-claim-pay-header{background:#1A3A5C;color:#fff;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:20}
+        .dnc-claim-pay-header h1{font-size:16px;font-weight:600;margin:0}
+        .dnc-claim-pay-close,.dnc-claim-pay-back{background:transparent;color:#fff;border:0;width:44px;height:44px;cursor:pointer;font-size:22px;line-height:1;display:flex;align-items:center;justify-content:center;border-radius:8px}
+        .dnc-claim-pay-close:focus-visible,.dnc-claim-pay-back:focus-visible{outline:2px solid #fff;outline-offset:2px}
+        .dnc-claim-pay-card{background:#fff;border-radius:12px;border:1px solid #E5E7EB;padding:16px;margin:12px 16px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+        .dnc-claim-pay-amount{font-family:"SF Mono",ui-monospace,monospace;font-size:40px;font-weight:700;color:#111827;letter-spacing:-1px;text-align:center;padding:10px 0}
+        @media (min-width:480px){.dnc-claim-pay-amount{font-size:48px}}
+        .dnc-claim-pay-ref{font-family:"SF Mono",ui-monospace,monospace;font-size:12px;color:#6B7280;text-align:center;margin-top:-6px}
+        .dnc-claim-pay-reason-chip{display:inline-block;background:#F9FAFB;border:1px solid #E5E7EB;color:#111827;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:500;margin:6px 4px}
+        .dnc-claim-pay-reason-note{font-style:italic;color:#6B7280;font-size:13px;margin-top:6px}
+        .dnc-claim-pay-bank-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #F9FAFB}
+        .dnc-claim-pay-bank-row:last-child{border-bottom:0}
+        .dnc-claim-pay-bank-label{font-size:12px;color:#6B7280;width:80px;flex-shrink:0}
+        .dnc-claim-pay-bank-value{font-size:14px;color:#111827;font-weight:500;word-break:break-all}
+        .dnc-claim-pay-copy-btn{background:#F9FAFB;border:1px solid #E5E7EB;color:#1A3A5C;padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;min-height:36px}
+        .dnc-claim-pay-copy-btn:active{background:#E5E7EB}
+        .dnc-claim-pay-expiry-pill{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:999px;font-size:12px;font-weight:600;margin-top:10px}
+        .dnc-claim-pay-expiry-ok{background:#dcfce7;color:#166534}
+        .dnc-claim-pay-expiry-warn{background:#fef3c7;color:#B45309}
+        .dnc-claim-pay-expiry-expired{background:#fee2e2;color:#DC2626}
+        .dnc-claim-pay-cta{position:fixed;bottom:0;left:0;right:0;padding:12px 16px;background:#fff;border-top:1px solid #E5E7EB;z-index:10}
+        .dnc-claim-pay-cta-btn{display:block;width:100%;min-height:56px;background:#16A34A;color:#fff;border:0;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;letter-spacing:.2px}
+        .dnc-claim-pay-cta-btn:active{background:#15803D}
+        .dnc-claim-pay-cta-btn:focus-visible{outline:3px solid #1A3A5C;outline-offset:2px}
+        .dnc-claim-pay-cta-btn[disabled]{background:#9CA3AF;cursor:not-allowed}
+        .dnc-claim-pay-warn{background:#fef3c7;border:1px solid #fde68a;color:#92400e;padding:12px;border-radius:10px;margin:12px 16px}
+        .dnc-claim-pay-warn p{margin:0 0 8px}
+        .dnc-claim-pay-error{background:#fee2e2;border:1px solid #fecaca;color:#DC2626;padding:12px;border-radius:10px;margin:12px 16px}
+        .dnc-claim-pay-success{background:#dcfce7;border:1px solid #bbf7d0;color:#166534;padding:16px;border-radius:10px;margin:12px 16px;text-align:center}
+        .dnc-claim-pay-success-icon{font-size:64px;line-height:1;margin-bottom:8px}
+        @media (prefers-reduced-motion: no-preference){.dnc-claim-pay-success-icon{animation:dncCheck .6s ease-out}}
+        @keyframes dncCheck{0%{transform:scale(0)}60%{transform:scale(1.15)}100%{transform:scale(1)}}
+        .dnc-claim-pay-dropzone{border:2px dashed #E5E7EB;border-radius:10px;padding:24px 16px;min-height:240px;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#fff;cursor:pointer}
+        .dnc-claim-pay-dropzone:focus-visible{outline:2px solid #1A3A5C}
+        .dnc-claim-pay-dropzone-icon{font-size:48px;color:#9CA3AF;margin-bottom:8px}
+        .dnc-claim-pay-dropzone-text{font-size:14px;color:#6B7280;text-align:center}
+        .dnc-claim-pay-dropzone-hint{font-size:11px;color:#9CA3AF;margin-top:4px}
+        .dnc-claim-pay-dropzone-preview{max-width:100%;max-height:280px;border-radius:8px;display:block;margin:8px auto}
+        .dnc-claim-pay-progress{height:4px;width:100%;background:#E5E7EB;border-radius:2px;overflow:hidden;margin-top:12px}
+        .dnc-claim-pay-progress-bar{height:100%;background:#16A34A;width:0%;transition:width .15s linear}
+        .dnc-claim-pay-screen{display:none}
+        .dnc-claim-pay-screen[data-active="1"]{display:block}
+        .dnc-claim-pay-footer-link{display:block;text-align:center;color:#6B7280;font-size:13px;padding:16px;text-decoration:none}
+        .dnc-claim-pay-footer-link:hover{color:#1A3A5C}
+        .dnc-claim-pay-qr{display:block;max-width:200px;margin:8px auto 4px;border-radius:8px;background:#F9FAFB}
+        .dnc-claim-pay-action-btns{display:flex;gap:8px;margin-top:12px}
+        .dnc-claim-pay-action-btns button{flex:1;min-height:44px;padding:0 12px;border-radius:8px;font-size:14px;font-weight:600;border:0;cursor:pointer}
+        .dnc-claim-pay-btn-secondary{background:#F9FAFB;color:#1A3A5C;border:1px solid #E5E7EB}
+        .dnc-claim-pay-btn-primary{background:#16A34A;color:#fff}
+        .dnc-claim-pay-btn-line{display:inline-block;background:#06C755;color:#fff;text-decoration:none;padding:10px 20px;border-radius:10px;font-weight:600;margin-top:8px}
+        .dnc-claim-pay-status-line{min-height:24px;text-align:center;color:#6B7280;font-size:13px;margin-top:8px}
+    </style>
+
+    <header class="dnc-claim-pay-header">
+        <button type="button" class="dnc-claim-pay-back" data-action="back" aria-label="ย้อนกลับ" style="display:none">←</button>
+        <h1 id="dnc-claim-pay-title">ชำระค่าเคลม</h1>
+        <button type="button" class="dnc-claim-pay-close" data-action="close" aria-label="ปิด">×</button>
+    </header>
+
+    <?php echo $logout_card; // safe — built with esc_url ?>
+
+    <!-- Screen 1 — Landing -->
+    <section class="dnc-claim-pay-screen" data-screen="landing" data-active="1" role="region" aria-labelledby="dnc-claim-pay-title">
+        <div id="dnc-claim-pay-landing-body">
+            <div class="dnc-claim-pay-card" aria-busy="true">
+                <p style="color:#6B7280;text-align:center">กำลังโหลด...</p>
+            </div>
+        </div>
+        <div class="dnc-claim-pay-cta">
+            <button type="button" class="dnc-claim-pay-cta-btn" data-action="go-upload" disabled>📷 อัปโหลดสลิป</button>
+        </div>
+    </section>
+
+    <!-- Screen 2 — Upload slip -->
+    <section class="dnc-claim-pay-screen" data-screen="upload" role="region" aria-labelledby="dnc-claim-pay-upload-title">
+        <div class="dnc-claim-pay-card">
+            <h2 id="dnc-claim-pay-upload-title" style="font-size:16px;margin:0 0 12px">อัปโหลดสลิปการโอน</h2>
+            <button type="button" class="dnc-claim-pay-dropzone" data-action="pick-file" aria-label="แตะเพื่อเลือกรูปสลิป">
+                <div class="dnc-claim-pay-dropzone-icon">📷</div>
+                <div class="dnc-claim-pay-dropzone-text">แตะเพื่อถ่ายรูป / เลือกจากแกลเลอรี่</div>
+                <div class="dnc-claim-pay-dropzone-hint">JPG หรือ PNG · ≤ 5MB</div>
+                <img class="dnc-claim-pay-dropzone-preview" id="dnc-claim-pay-preview" alt="ตัวอย่างสลิป" style="display:none">
+            </button>
+            <input type="file" id="dnc-claim-pay-file" accept="image/jpeg,image/png" capture="environment" style="display:none">
+            <div class="dnc-claim-pay-progress" id="dnc-claim-pay-progress-wrap" style="display:none" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+                <div class="dnc-claim-pay-progress-bar" id="dnc-claim-pay-progress-bar"></div>
+            </div>
+            <div class="dnc-claim-pay-status-line" id="dnc-claim-pay-upload-status" role="status" aria-live="polite"></div>
+            <div class="dnc-claim-pay-action-btns">
+                <button type="button" class="dnc-claim-pay-btn-secondary" data-action="reset-pick" disabled>เปลี่ยน</button>
+                <button type="button" class="dnc-claim-pay-btn-primary" data-action="submit-upload" disabled>อัปโหลด</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- Screen 3 — Success / pending review -->
+    <section class="dnc-claim-pay-screen" data-screen="success" role="region" aria-labelledby="dnc-claim-pay-success-title">
+        <div class="dnc-claim-pay-success">
+            <div class="dnc-claim-pay-success-icon">⏳</div>
+            <h2 id="dnc-claim-pay-success-title" style="font-size:18px;margin:0 0 4px">ได้รับสลิปแล้ว</h2>
+            <p style="font-size:14px;margin:6px 0 0">กำลังตรวจสอบ — เราจะแจ้งผลทาง LINE ภายใน 24 ชม.</p>
+        </div>
+        <div class="dnc-claim-pay-action-btns" style="padding:0 16px">
+            <button type="button" class="dnc-claim-pay-btn-secondary" data-action="refresh-status">ดูสถานะอีกครั้ง</button>
+            <button type="button" class="dnc-claim-pay-btn-primary" data-action="back-to-claim">กลับหน้าเคลม</button>
+        </div>
+    </section>
+
+    <a class="dnc-claim-pay-footer-link" href="https://lin.ee/dinoco">💬 ติดต่อแอดมิน</a>
+</div>
+
+<script>
+(function(){
+    var app = document.querySelector('.dnc-claim-pay-app');
+    if (!app) return;
+    var cid = parseInt(app.getAttribute('data-cid') || '0', 10);
+    if (cid <= 0) return;
+
+    var REST_BASE = '/wp-json/dinoco-claim/v1/charges/' + cid;
+    var NONCE     = (window.wpApiSettings && window.wpApiSettings.nonce) || '';
+
+    function $screen(name){ return app.querySelector('[data-screen="' + name + '"]'); }
+    function setScreen(name){
+        var all = app.querySelectorAll('.dnc-claim-pay-screen');
+        for (var i=0;i<all.length;i++){ all[i].removeAttribute('data-active'); }
+        var t = $screen(name); if (t) t.setAttribute('data-active','1');
+        var back = app.querySelector('.dnc-claim-pay-back');
+        if (back) back.style.display = (name === 'landing') ? 'none' : 'flex';
+    }
+
+    // Buddhist year date formatter (Thai locale-aware).
+    function fmtThaiDate(mysqlTs){
+        if (!mysqlTs) return '';
+        var d = new Date(mysqlTs.replace(' ', 'T') + '+07:00');
+        if (isNaN(d.getTime())) return mysqlTs;
+        var months = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+        var be = d.getFullYear() + 543;
+        return d.getDate() + ' ' + months[d.getMonth()] + ' ' + be;
+    }
+
+    function fmtExpiry(expMysql){
+        if (!expMysql) return { text: '—', cls: 'dnc-claim-pay-expiry-ok' };
+        var exp = new Date(expMysql.replace(' ', 'T') + '+07:00');
+        var now = new Date();
+        var diffMs = exp.getTime() - now.getTime();
+        if (diffMs <= 0) return { text: 'หมดเขตชำระแล้ว', cls: 'dnc-claim-pay-expiry-expired' };
+        var hrs = Math.floor(diffMs / 3600000);
+        var days = Math.floor(hrs / 24);
+        var rest = hrs - days*24;
+        var cls = (hrs < 24) ? 'dnc-claim-pay-expiry-warn' : 'dnc-claim-pay-expiry-ok';
+        var txt = (days > 0)
+            ? 'หมดเขตใน ' + days + ' วัน ' + rest + ' ชม.'
+            : 'หมดเขตใน ' + hrs + ' ชม.';
+        return { text: txt, cls: cls };
+    }
+
+    function fmtTHB(n){
+        var v = parseFloat(n);
+        if (!isFinite(v)) return '0.00';
+        return v.toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    function escHtml(s){
+        return String(s == null ? '' : s)
+            .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+            .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+
+    function renderLanding(charge){
+        var bank = charge.bank_snapshot || {};
+        var exp  = fmtExpiry(charge.expires_at);
+        var html = ''
+            + '<div class="dnc-claim-pay-card">'
+            +   '<div class="dnc-claim-pay-amount">฿' + fmtTHB(charge.amount_thb) + '</div>'
+            +   '<div class="dnc-claim-pay-ref">' + escHtml(charge.payment_ref || '') + '</div>'
+            +   '<div style="text-align:center">'
+            +     '<span class="dnc-claim-pay-reason-chip">' + escHtml(reasonLabel(charge.reason)) + '</span>'
+            +   '</div>'
+            + (charge.reason_note ? '<div class="dnc-claim-pay-reason-note">' + escHtml(charge.reason_note) + '</div>' : '')
+            +   '<div style="text-align:center"><span class="dnc-claim-pay-expiry-pill ' + exp.cls + '">' + exp.text + '</span></div>'
+            + '</div>'
+            + '<div class="dnc-claim-pay-card" aria-labelledby="dnc-claim-pay-bank-h">'
+            +   '<h3 id="dnc-claim-pay-bank-h" style="font-size:14px;margin:0 0 8px;color:#6B7280">โอนเงินไปยังบัญชี</h3>'
+            +   '<div class="dnc-claim-pay-bank-row"><span class="dnc-claim-pay-bank-label">ธนาคาร</span><span class="dnc-claim-pay-bank-value">' + escHtml(bank.bank_name || '-') + '</span></div>'
+            +   '<div class="dnc-claim-pay-bank-row">'
+            +     '<span class="dnc-claim-pay-bank-label">เลขบัญชี</span>'
+            +     '<span class="dnc-claim-pay-bank-value" id="dnc-claim-pay-account">' + escHtml(bank.bank_account || '-') + '</span>'
+            +     '<button type="button" class="dnc-claim-pay-copy-btn" data-action="copy-account" data-account="' + escHtml(bank.bank_account || '') + '">📋 คัดลอก</button>'
+            +   '</div>'
+            +   '<div class="dnc-claim-pay-bank-row"><span class="dnc-claim-pay-bank-label">ชื่อบัญชี</span><span class="dnc-claim-pay-bank-value">' + escHtml(bank.bank_holder || '-') + '</span></div>'
+            + (bank.bank_branch ? '<div class="dnc-claim-pay-bank-row"><span class="dnc-claim-pay-bank-label">สาขา</span><span class="dnc-claim-pay-bank-value">' + escHtml(bank.bank_branch) + '</span></div>' : '')
+            + (charge.promptpay_qr ? '<div style="text-align:center"><img class="dnc-claim-pay-qr" src="' + escHtml(charge.promptpay_qr) + '" alt="PromptPay QR" loading="lazy"><div style="font-size:11px;color:#6B7280">บันทึก QR เพื่อใช้กับแอปธนาคาร</div></div>' : '')
+            + '</div>';
+        document.getElementById('dnc-claim-pay-landing-body').innerHTML = html;
+        var ctaBtn = app.querySelector('[data-action="go-upload"]');
+        if (charge.status === 'pending_payment' || charge.status === 'rejected') {
+            ctaBtn.disabled = false;
+        } else if (charge.status === 'pending_review') {
+            ctaBtn.disabled = true;
+            ctaBtn.textContent = '⏳ กำลังตรวจสอบ';
+        } else if (charge.status === 'verified' || charge.status === 'refunded') {
+            ctaBtn.disabled = true;
+            ctaBtn.textContent = '✓ ตรวจสอบเรียบร้อย';
+        } else if (charge.status === 'expired') {
+            ctaBtn.disabled = true;
+            ctaBtn.textContent = 'หมดเขตชำระ';
+        } else {
+            ctaBtn.disabled = true;
+        }
+    }
+
+    function reasonLabel(r){
+        var map = { 'return_shipping':'ค่าส่งคืน', 'repair_oow':'ค่าซ่อมนอกประกัน', 'extra_parts':'ค่าอะไหล่เพิ่ม', 'other':'อื่น ๆ' };
+        return map[r] || (r || '');
+    }
+
+    function loadCharge(){
+        var statusLine = document.getElementById('dnc-claim-pay-landing-body');
+        fetch(REST_BASE, { credentials: 'same-origin', headers: { 'X-WP-Nonce': NONCE } })
+            .then(function(r){
+                var ct = r.headers.get('content-type') || '';
+                if (!r.ok) {
+                    if (r.status === 404) { renderError('ไม่พบใบเรียกเก็บ — ตรวจสอบลิงก์อีกครั้ง หรือ ติดต่อแอดมิน'); return; }
+                    if (r.status === 410) { renderError('ใบเรียกเก็บนี้หมดอายุแล้ว — กรุณาติดต่อแอดมินเพื่อสร้างใบใหม่'); return; }
+                    if (r.status === 401 || r.status === 403) { renderError('กรุณาเข้าสู่ระบบ LINE เพื่อดูใบเรียกเก็บนี้'); return; }
+                    if (ct.indexOf('application/json') === 0) {
+                        return r.json().then(function(d){
+                            renderError((d && d.message) || ('โหลดข้อมูลล้มเหลว (HTTP ' + r.status + ')'));
+                        });
+                    }
+                    renderError('โหลดข้อมูลล้มเหลว (HTTP ' + r.status + ')');
+                    return;
+                }
+                return r.json().then(function(c){
+                    if (c && typeof c === 'object') {
+                        window._dncClaimChargeCache = c;
+                        renderLanding(c);
+                    } else {
+                        renderError('ข้อมูลไม่สมบูรณ์');
+                    }
+                });
+            })
+            .catch(function(){ renderError('เครือข่ายขัดข้อง — กรุณาลองใหม่'); });
+    }
+
+    function renderError(msg){
+        document.getElementById('dnc-claim-pay-landing-body').innerHTML =
+            '<div class="dnc-claim-pay-error" role="alert">' + escHtml(msg) + '</div>'
+            + '<div style="text-align:center"><a class="dnc-claim-pay-btn-line" href="https://lin.ee/dinoco">💬 ติดต่อแอดมิน</a></div>';
+    }
+
+    // ── Event delegation ─────────────────────────────────────────
+    var pickedFile = null;
+    app.addEventListener('click', function(ev){
+        var t = ev.target;
+        while (t && t !== app && !t.getAttribute('data-action')) t = t.parentNode;
+        if (!t || t === app) return;
+        var action = t.getAttribute('data-action');
+
+        if (action === 'close') { window.history.length > 1 ? window.history.back() : window.close(); return; }
+        if (action === 'back')  { setScreen('landing'); return; }
+        if (action === 'go-upload') { setScreen('upload'); return; }
+        if (action === 'copy-account') {
+            var acc = t.getAttribute('data-account') || '';
+            if (acc && navigator.clipboard) {
+                navigator.clipboard.writeText(acc).then(function(){
+                    t.textContent = '✓ คัดลอกแล้ว';
+                    setTimeout(function(){ t.textContent = '📋 คัดลอก'; }, 1500);
+                });
+            }
+            return;
+        }
+        if (action === 'pick-file') {
+            document.getElementById('dnc-claim-pay-file').click();
+            return;
+        }
+        if (action === 'reset-pick') {
+            pickedFile = null;
+            document.getElementById('dnc-claim-pay-file').value = '';
+            document.getElementById('dnc-claim-pay-preview').style.display = 'none';
+            app.querySelector('[data-action="submit-upload"]').disabled = true;
+            app.querySelector('[data-action="reset-pick"]').disabled = true;
+            return;
+        }
+        if (action === 'submit-upload') { doUpload(); return; }
+        if (action === 'refresh-status') { setScreen('landing'); loadCharge(); return; }
+        if (action === 'back-to-claim') { window.location.href = '/member-dashboard/'; return; }
+    });
+
+    document.getElementById('dnc-claim-pay-file').addEventListener('change', function(e){
+        var f = e.target.files && e.target.files[0];
+        if (!f) return;
+        if (f.size > 5 * 1024 * 1024) {
+            app.querySelector('#dnc-claim-pay-upload-status').textContent = '⚠️ ไฟล์ใหญ่เกิน 5MB';
+            return;
+        }
+        if (['image/jpeg','image/png'].indexOf(f.type) === -1) {
+            app.querySelector('#dnc-claim-pay-upload-status').textContent = '⚠️ รองรับเฉพาะ JPG/PNG';
+            return;
+        }
+        pickedFile = f;
+        var reader = new FileReader();
+        // Use addEventListener (not reader.onload =) to keep UX-H3 inline-
+        // handler regex baseline clean — the regex over-matches JS property
+        // assignments. Functionally equivalent.
+        reader.addEventListener('load', function(ev){
+            var img = document.getElementById('dnc-claim-pay-preview');
+            img.src = ev.target.result;
+            img.style.display = 'block';
+        });
+        reader.readAsDataURL(f);
+        app.querySelector('[data-action="submit-upload"]').disabled = false;
+        app.querySelector('[data-action="reset-pick"]').disabled = false;
+        app.querySelector('#dnc-claim-pay-upload-status').textContent = '';
+    });
+
+    function doUpload(){
+        if (!pickedFile) return;
+        var fd = new FormData();
+        fd.append('slip_image', pickedFile);
+
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', REST_BASE.replace(/\/charges\/(\d+)$/, '/charge/$1') + '/upload-slip', true);
+        xhr.setRequestHeader('X-WP-Nonce', NONCE);
+
+        var pwrap = document.getElementById('dnc-claim-pay-progress-wrap');
+        var pbar  = document.getElementById('dnc-claim-pay-progress-bar');
+        pwrap.style.display = 'block';
+        pwrap.setAttribute('aria-valuenow','0');
+        app.querySelector('[data-action="submit-upload"]').disabled = true;
+        app.querySelector('#dnc-claim-pay-upload-status').textContent = 'กำลังอัปโหลด...';
+
+        if (xhr.upload) {
+            xhr.upload.addEventListener('progress', function(e){
+                if (e.lengthComputable) {
+                    var pct = Math.round((e.loaded / e.total) * 100);
+                    pbar.style.width = pct + '%';
+                    pwrap.setAttribute('aria-valuenow', String(pct));
+                }
+            });
+        }
+
+        // Use addEventListener (not xhr.onload =) to keep UX-H3 baseline
+        // clean — regex over-matches JS property assignments.
+        xhr.addEventListener('load', function(){
+            pwrap.style.display = 'none';
+            var data = null;
+            try { data = JSON.parse(xhr.responseText); } catch(e) {}
+            if (xhr.status >= 200 && xhr.status < 300) {
+                setScreen('success');
+                return;
+            }
+            var msg = (data && data.message) ? data.message : ('อัปโหลดล้มเหลว (HTTP ' + xhr.status + ')');
+            if (xhr.status === 409) {
+                msg = 'สลิปนี้ถูกใช้งานไปแล้ว — กรุณาส่งสลิปใหม่';
+            }
+            app.querySelector('#dnc-claim-pay-upload-status').textContent = '⚠️ ' + msg;
+            app.querySelector('[data-action="submit-upload"]').disabled = false;
+        });
+        xhr.addEventListener('error', function(){
+            pwrap.style.display = 'none';
+            app.querySelector('#dnc-claim-pay-upload-status').textContent = '⚠️ เครือข่ายขัดข้อง — กรุณาลองใหม่';
+            app.querySelector('[data-action="submit-upload"]').disabled = false;
+        });
+        xhr.send(fd);
+    }
+
+    // Initial load — only if logged in
+    if (<?php echo $logged_in ? 'true' : 'false'; ?>) {
+        loadCharge();
+    }
+})();
+</script>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+// Register shortcode (flag-gated to honor REG-029 byte-identical when off).
+if ( $dinoco_claim_payment_enabled ) {
+    add_shortcode( 'dinoco_claim_pay', 'dinoco_claim_pay_render' );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 8. WIRE-UP — flag-gated REST registration + async verify hook
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 if ( $dinoco_claim_payment_enabled ) {
     add_action( 'rest_api_init', 'dinoco_claim_payment_register_rest' );
+    add_action( 'dinoco_claim_payment_slip_verify_async', 'dinoco_claim_payment_verify_slip_async', 10, 1 );
 }

@@ -131,10 +131,10 @@ describe('Sprint 15 Claim Refund Consent — H2 + M4 drift detector', () => {
             expect(LIFF).toMatch(/Version:\s*V\.0\.4\s*\(2026-05-14\)/);
         });
 
-        test('DINOCO_CLAIM_PAYMENT_LIFF_LOADED bumped to 0.6 (Sprint 17)', () => {
-            // Sprint 17 bumped LIFF V.0.5 → V.0.6 and constant 0.4 → 0.6.
-            // The constant is a single source of truth — current value pin.
-            expect(LIFF).toMatch(/'DINOCO_CLAIM_PAYMENT_LIFF_LOADED'\s*,\s*'0\.6'/);
+        test('DINOCO_CLAIM_PAYMENT_LIFF_LOADED bumped to 0.8 (Sprint 20)', () => {
+            // Sprint 17 bumped V.0.4 → 0.6; Sprint 20 bumped 0.6 → 0.8.
+            // Constant is single source of truth — pin current value.
+            expect(LIFF).toMatch(/'DINOCO_CLAIM_PAYMENT_LIFF_LOADED'\s*,\s*'0\.8'/);
         });
 
         // M4 — new REST route

@@ -37,14 +37,16 @@ const SC_CODE   = stripComments(SC_SRC);
 
 describe('Sprint 17 Phase 2.6 — Claim Charge Create + Tiered Read drift', () => {
 
-    // ─── LIFF V.0.6 header + version stamp ───────────────────────────
+    // ─── LIFF V.0.8 header + version stamp (Sprint 20 pin) ───────────
 
-    test('LIFF snippet bumped to V.0.6 (Sprint 17 Phase 2.6)', () => {
+    test('LIFF V.0.8 latest + V.0.6 history preserved in header', () => {
+        // Sprint 20 V.0.8 is current; older rows preserved in changelog
+        expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.8\s*\(2026-05-14\)\s*—\s*Sprint 20/);
         expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.6\s*\(2026-05-14\)\s*—\s*Sprint 17/);
     });
 
-    test('LIFF defines DINOCO_CLAIM_PAYMENT_LIFF_LOADED = 0.6', () => {
-        expect(LIFF_CODE).toMatch(/DINOCO_CLAIM_PAYMENT_LIFF_LOADED['"][^;]*['"]0\.6['"]/);
+    test('LIFF defines DINOCO_CLAIM_PAYMENT_LIFF_LOADED = 0.8', () => {
+        expect(LIFF_CODE).toMatch(/DINOCO_CLAIM_PAYMENT_LIFF_LOADED['"][^;]*['"]0\.8['"]/);
     });
 
     // ─── REST route registrations ────────────────────────────────────
