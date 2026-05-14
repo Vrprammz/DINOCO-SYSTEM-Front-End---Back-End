@@ -85,50 +85,46 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         expect(code).toMatch(/V\.31\.15[\s\S]{0,500}?Royal Warranty/);
     });
 
-    test('C4 — V.32.0 FULL REDESIGN: 3-card action row REMOVED (bottom nav canonical)', () => {
-        // V.32.0 full redesign: 3-card row deleted. Bottom nav (Global App Menu
-        // L624/631/640) has claim/scan/transfer as canonical persistent surfaces.
-        // Empty-state green hero (Assets List V.32.2 line 3120) handles new-user
-        // onboarding. Triple-duplication eliminated.
+    test('C4 — V.31.15 RESTORE 3-card action row (boss "แถบเมนูหายไปหมด")', () => {
+        // V.31.14 Direction A deleted action row. V.31.15 restored FULL 3 cards
+        // per boss: 📷 ลงทะเบียน + 🔧 แจ้งเคลม + 🤝 โอนสิทธิ์. ลงทะเบียน is intentionally
+        // a visible duplicate of FAB SCAN (boss explicit). Search-box-wrap stays
+        // deleted (manual S/N entry in FAB modal). Notif relocated to Profile.
         const code = read('header');
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
             .replace(/<\?php[\s\S]*?\?>/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '');
-        // V.32.0 — 3-card row REMOVED
-        expect(stripped).not.toMatch(/<div class="dnc-dash-quick-actions"/);
-        expect(stripped).not.toMatch(/dnc-dash-quick-card--register/);
-        expect(stripped).not.toMatch(/dnc-dash-quick-card--claim/);
-        expect(stripped).not.toMatch(/dnc-dash-quick-card--transfer/);
+        // 3-card row markup
+        expect(stripped).toMatch(/<div class="dnc-dash-quick-actions"/);
+        expect(stripped).toMatch(/dnc-dash-quick-card--register/);
+        expect(stripped).toMatch(/dnc-dash-quick-card--claim/);
+        expect(stripped).toMatch(/dnc-dash-quick-card--transfer/);
+        // UX-H3: no inline onclick (data-action delegation)
+        expect(stripped).not.toMatch(/dnc-dash-quick-card[^>]*onclick=/);
         // Search-box-wrap + notif accordion stay DELETED
         expect(stripped).not.toMatch(/<div class="search-box-wrap">/);
         expect(stripped).not.toMatch(/<div class="dnc-sn-notif-settings"/);
         // V.31.16 — notif link REMOVED (settings ONLY in Profile via bottom nav)
         expect(stripped).not.toMatch(/<a[^>]*href="\/edit-profile\/#sec-notif"/);
-        // dinocoScanFirstQr handler retained for FAB SCAN modal + future surfaces
         expect(code).toContain('dinocoScanFirstQr');
     });
 
-    test('V.32.0 — Logo inline SVG wordmark (PNG retired after 11 failed rounds)', () => {
+    test('V.31.15 — Logo PNG further shrunk 50% (boss "เล็กกว่านี้ 50%")', () => {
         const code = read('header');
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
             .replace(/<\?php[\s\S]*?\?>/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '')
             .replace(/^\s*\/\/.*$/gm, '');
-        // V.32.0 — inline SVG replaces PNG
-        expect(stripped).toMatch(/<svg class="card-title-mark"[\s\S]*?aria-label="DINOCO"/);
-        expect(stripped).toMatch(/<svg class="card-title-mark"[^>]*width="64"[^>]*height="11"/);
-        expect(stripped).toMatch(/viewBox="0 0 128 22"/);
-        expect(stripped).toMatch(/<text[^>]*>DINOCO<\/text>/);
-        // PNG must be gone (no more <img class="card-title-mark">)
-        expect(stripped).not.toMatch(/<img[^>]*class="card-title-mark"/);
+        expect(stripped).toMatch(/<img[^>]*src="https:\/\/www\.dinoco\.in\.th\/wp-content\/uploads\/2026\/01\/sss\.png"[^>]*class="card-title-mark"/);
         expect(stripped).not.toMatch(/<span class="card-title-wordmark">/);
-        // V.32.0 specificity-war !important rules REMOVED (SVG bypasses cascade)
-        expect(code).not.toMatch(/\.card-title-mark[\s\S]{0,200}?height:\s*10px\s*!important/);
-        // V.32.0 mobile <360px: 52×9px via media query
-        expect(code).toMatch(/@media \(max-width: 360px\)[\s\S]{0,500}?width:\s*52px/);
-        expect(code).toMatch(/@media \(max-width: 360px\)[\s\S]{0,500}?height:\s*9px/);
+        // V.31.15 — half of V.31.14: height 7px / max-width 40px
+        expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*10px/);
+        expect(code).toMatch(/\.card-title-mark[\s\S]*?max-width:\s*50px/);
+        // <360px mobile responsive (V.31.16 selector chain — comma-separated)
+        expect(code).toMatch(/@media \(max-width: 360px\)[\s\S]{0,500}?height:\s*8px/);
+        expect(code).toMatch(/@media \(max-width: 360px\)[\s\S]{0,500}?max-width:\s*40px/);
     });
 
     test('V.31.14 — Scan delegation handler retained (FAB modal future surfaces)', () => {
