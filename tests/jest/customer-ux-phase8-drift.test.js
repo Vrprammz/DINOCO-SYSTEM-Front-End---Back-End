@@ -33,18 +33,18 @@ describe('Customer-facing UX Phase 8 Bundle A — 5 SHOULD-FIX closed', () => {
         expect(code).toMatch(/<div class="dinoco-wrapper"\s+lang="th">/);
     });
 
-    test('S6 — Notification settings has collapse CSS + smooth transition', () => {
+    test('S6 — V.31.14 SUPERSEDED: notif accordion relocated to Edit Profile #sec-notif', () => {
+        // Sprint 36 V.31.14 — boss directive 2026-05-14 + ux-ui-expert Direction A:
+        // notification settings moved from Home Dashboard accordion → Edit Profile
+        // V.35.0 #sec-notif. Old S6 collapse CSS no longer applies (accordion gone).
+        // New canonical surface: thin link row .dnc-notif-link-row.
         const code = read('header');
-        // Version header marker
-        expect(code).toMatch(/V\.31\.5[\s\S]{0,500}?S6/);
-        // Body hidden by default (max-height:0)
-        expect(code).toMatch(/\.dnc-sn-notif-settings \.dnc-sn-notif-body\s*\{[\s\S]{0,200}?max-height:\s*0/);
-        // Body expanded when data-open="1"
-        expect(code).toMatch(/\.dnc-sn-notif-settings\[data-open="1"\] \.dnc-sn-notif-body\s*\{[\s\S]{0,200}?max-height:\s*\d+/);
-        // Toggle arrow rotates 180deg when open
-        expect(code).toMatch(/\.dnc-sn-notif-settings\[data-open="1"\] \.dnc-sn-notif-toggle\s*\{[\s\S]{0,100}?transform:\s*rotate\(180deg\)/);
-        // prefers-reduced-motion respected
-        expect(code).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]{0,300}?dnc-sn-notif/);
+        const stripped = code
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<\?php[\s\S]*?\?>/g, '')
+            .replace(/\/\*[\s\S]*?\*\//g, '');
+        expect(stripped).not.toMatch(/<div class="dnc-sn-notif-settings"/);
+        expect(stripped).toMatch(/<a[^>]*href="\/edit-profile\/#sec-notif"[^>]*dnc-notif-link-row/);
     });
 
     test('S4 — Already-registered state has masked owner + anti-fraud panel', () => {

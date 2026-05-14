@@ -2727,20 +2727,16 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(cardScope.split('class="card-id"')[0]).toContain('$tier_badge_html');
         });
 
-        test('W7.3 notification settings 5 checkboxes with usermeta keys', () => {
+        test('W7.3 V.31.14 SUPERSEDED — notif 5 checkboxes relocated to Edit Profile V.35.0', () => {
+            // Sprint 36 V.31.14: settings + defaults moved to Edit Profile #sec-notif.
+            // wp_usermeta keys unchanged (dinoco_sn_notif_expiry/anniversary/review/
+            // promo/service + dinoco_line_opt_out_all + dinoco_sn_quiet_hours_*).
+            // AJAX handler stays at Header & Forms L211 (server route preserved).
             const code = readByPath(HEADER_PATH);
-            // wp_usermeta key prefix (PHP concat: 'dinoco_sn_notif_' . $k)
+            // AJAX server route preserved (handler still registered)
+            expect(code).toContain("add_action( 'wp_ajax_dinoco_save_notif_prefs'");
+            // wp_usermeta key prefix still referenced by server-side save handler
             expect(code).toContain('dinoco_sn_notif_');
-            // 5 checkbox names + form keys (per-key literal)
-            ['expiry', 'anniversary', 'review', 'promo', 'service'].forEach((k) => {
-                expect(code).toContain(`notif_${k}`);
-            });
-            // First 3 default ON, last 2 default OFF (boss Q26 = A per-type)
-            expect(code).toMatch(/'expiry'\s*=>\s*'1'/);
-            expect(code).toMatch(/'anniversary'\s*=>\s*'1'/);
-            expect(code).toMatch(/'review'\s*=>\s*'1'/);
-            expect(code).toMatch(/'promo'\s*=>\s*'0'/);
-            expect(code).toMatch(/'service'\s*=>\s*'0'/);
         });
 
         test('W7.3 notification AJAX handler registered with nonce verify', () => {
@@ -2753,30 +2749,28 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toContain('update_user_meta');
         });
 
-        test('W7.3 scan-first entry point + html5-qrcode lazy load (V.31.13: moved to action row)', () => {
+        test('W7.3 V.31.14 scan handler + lazy loader retained (FAB modal future surfaces)', () => {
             const code = readByPath(HEADER_PATH);
-            // V.31.13 — green CTA in .search-box-wrap deleted; SCAN now lives
-            // in the 3-col quick action row (center, emphasis) above.
-            // Verify the canonical scan handler + lazy loader still exist.
+            // V.31.14 (Sprint 36): action row deleted; SCAN canonical surface is
+            // bottom nav FAB (Global App Menu L631). Handler kept for any future
+            // scan-trigger surface + FAB modal manual entry fallback (L600-611).
             expect(code).toContain('dinocoScanFirstQr');
-            // SCAN button + data-action delegation (UX-H3, replaces inline onclick)
-            expect(code).toMatch(/data-action="dnc-scan-qr"/);
-            expect(code).toMatch(/dnc-dash-quick-card--scan/);
-            // Lazy load via dynamic script tag
+            expect(code).toMatch(/__dncScanDelegationWired/);
             expect(code).toMatch(/unpkg\.com\/html5-qrcode/);
-            // Reuses startQR from Global App Menu when available (P02 dedup)
             expect(code).toContain('startQR');
-            // Legacy green CTA class MUST NOT return
-            expect(code).not.toMatch(/dnc-sn-scan-first-btn/);
         });
 
-        test('W7.3 typed S/N input retained as fallback', () => {
+        test('W7.3 V.31.14 S/N input form DELETED — FAB SCAN modal is canonical', () => {
             const code = readByPath(HEADER_PATH);
-            // Existing typed input must still exist
-            expect(code).toContain('name="register_serial"');
-            // V.31.13 — label simplified from "หรือ พิมพ์ S/N เอง" → "พิมพ์ S/N เอง"
-            // (SCAN now in 3-col action row above, so this is no longer "the alternative")
-            expect(code).toMatch(/พิมพ์\s+S\/N\s+เอง/);
+            const stripped = code
+                .replace(/<!--[\s\S]*?-->/g, '')
+                .replace(/<\?php[\s\S]*?\?>/g, '')
+                .replace(/\/\*[\s\S]*?\*\//g, '');
+            // V.31.14: name="register_serial" input form REMOVED from home dashboard.
+            // Manual S/N entry now lives only in FAB SCAN modal (Global App Menu
+            // #qr-manual-input). Boss "กรอก S/N บราๆ ตลอด" → single canonical surface.
+            expect(stripped).not.toMatch(/name="register_serial"/);
+            expect(stripped).not.toMatch(/class="dinoco-input-search"/);
         });
 
         test('W7 F#3 register_serial DNCSS prefix → /warranty/activate redirect', () => {
@@ -2799,44 +2793,38 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toContain('/warranty/activate');
         });
 
-        test('W7.1 quick action row REFINED in V.31.13 — 3 cards (claim + SCAN center + transfer)', () => {
-            // V.31.10 removed 3 buttons. V.31.12 restored 2. V.31.13 boss directive
-            // "QR สแกน อยู่ตรงกลาง" → 3-col with SCAN center (emphasis). Green scan
-            // CTA in .search-box-wrap deleted (moved up to action row).
+        test('W7.1 V.31.14 Direction A — action row + S/N input + notif accordion DELETED', () => {
+            // V.31.14 Sprint 36 (ux-ui-expert audit): bottom nav (Global App Menu)
+            // is canonical surface for claim/SCAN/transfer. Notif relocated to Edit
+            // Profile V.35.0 #sec-notif. Manual S/N entry in FAB SCAN modal.
             const code = readByPath(HEADER_PATH);
             const stripped = code
                 .replace(/<!--[\s\S]*?-->/g, '')
                 .replace(/<\?php[\s\S]*?\?>/g, '')
                 .replace(/\/\*[\s\S]*?\*\//g, '');
-            // Old markup gone
             expect(stripped).not.toMatch(/class="action-grid dnc-sn-action-grid-4"/);
             expect(stripped).not.toMatch(/btn-reg/);
-            // New canonical 3-card markup present
-            expect(stripped).toMatch(/dnc-dash-quick-actions/);
-            expect(stripped).toMatch(/dnc-dash-quick-card--claim/);
-            expect(stripped).toMatch(/dnc-dash-quick-card--scan/);
-            expect(stripped).toMatch(/dnc-dash-quick-card--transfer/);
-            // SCAN delegates via data-action (UX-H3 NO inline onclick)
-            expect(stripped).toMatch(/data-action="dnc-scan-qr"/);
-            // Grid layout — center card 25% wider (1fr 1.25fr 1fr)
-            expect(code).toMatch(/grid-template-columns:\s*1fr\s+1\.25fr\s+1fr/);
+            expect(stripped).not.toMatch(/<div class="dnc-dash-quick-actions"/);
+            expect(stripped).not.toMatch(/dnc-dash-quick-card/);
+            expect(stripped).not.toMatch(/<div class="dnc-sn-notif-settings"/);
+            // Notif link row replaces accordion
+            expect(stripped).toMatch(/href="\/edit-profile\/#sec-notif"/);
         });
 
-        test('W7.1 V.31.13 logo PIVOT to text wordmark', () => {
+        test('W7.1 V.31.14 — logo PNG RESTORED (wordmark pivot reverted)', () => {
             const code = readByPath(HEADER_PATH);
-            // Strip comments (version-header narrates the removed class name)
             const stripped = code
                 .replace(/<!--[\s\S]*?-->/g, '')
                 .replace(/<\?php[\s\S]*?\?>/g, '')
                 .replace(/\/\*[\s\S]*?\*\//g, '')
                 .replace(/^\s*\/\/.*$/gm, '');
-            // PNG image markup removed (in active code, not comments)
-            expect(stripped).not.toMatch(/class="card-title-logo"/);
-            // Text wordmark present
-            expect(code).toMatch(/<span class="card-title-wordmark">DINOCO<\/span>/);
-            // Wordmark CSS fundamentals (allow newlines in block)
-            expect(code).toMatch(/\.card-title-wordmark\s*\{[\s\S]*?font-size:\s*16px/);
-            expect(code).toMatch(/\.card-title-wordmark\s*\{[\s\S]*?font-weight:\s*800/);
+            // PNG restored at canonical CDN URL
+            expect(stripped).toMatch(/src="https:\/\/www\.dinoco\.in\.th\/wp-content\/uploads\/2026\/01\/sss\.png"/);
+            expect(stripped).toMatch(/class="card-title-mark"/);
+            // Wordmark gone
+            expect(stripped).not.toMatch(/<span class="card-title-wordmark">/);
+            // Final size cap
+            expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*14px/);
         });
 
         test('W7 SnTierBadgeTest helper test file exists with required cases', () => {

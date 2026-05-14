@@ -78,57 +78,57 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         expect(code).toMatch(/<\?php if \(\s*\$has_legacy_warranty\s*\)\s*:\s*\?>[\s\S]{0,500}?royal-upgrade-btn[\s\S]{0,500}?<\?php endif;\s*\?>/);
     });
 
-    test('C4 — quick action row REFINED in V.31.13 (3 cards: claim + SCAN center + transfer)', () => {
+    test('C4 — Direction A V.31.14: action row + S/N input + notif accordion all DELETED', () => {
         const code = read('header');
-        // V.31.10 removed all 3 buttons. V.31.12 restored 2 (claim + transfer).
-        // V.31.13 boss directive 2026-05-14 "QR สแกน อยู่ตรงกลาง" → 3-col layout
-        // with SCAN in center. Green scan CTA in .search-box-wrap deleted (moved up).
+        // V.31.14 Sprint 36 (ux-ui-expert audit): Direction A consolidation.
+        // Bottom nav (Global App Menu L624/631/640) is canonical surface for
+        // claim/SCAN/transfer. Manual S/N entry lives in FAB SCAN modal.
+        // Notification accordion moved to Edit Profile V.35.0 #sec-notif.
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
-            .replace(/<\?php[\s\S]*?\?>/g, '')   // strip PHP comment blocks too
+            .replace(/<\?php[\s\S]*?\?>/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '');
-        // New canonical markup — 3 cards
-        expect(stripped).toMatch(/<div class="dnc-dash-quick-actions"/);
-        expect(stripped).toMatch(/<a[^>]*href="\/claim-system\/"[^>]*dnc-dash-quick-card--claim/);
-        expect(stripped).toMatch(/<a[^>]*href="\/transfer-warranty"[^>]*dnc-dash-quick-card--transfer/);
-        // SCAN center button (button element + data-action delegation, UX-H3)
-        expect(stripped).toMatch(/<button[^>]*dnc-dash-quick-card--scan[^>]*data-action="dnc-scan-qr"|<button[^>]*data-action="dnc-scan-qr"[^>]*dnc-dash-quick-card--scan/);
-        // UX-H3: no inline onclick on quick cards (data-action delegation)
-        expect(stripped).not.toMatch(/dnc-dash-quick-card[^>]*onclick=/);
-        // Legacy "btn-reg" (ลงทะเบียน) MUST NOT return — that was the dupe
+        // Active code MUST NOT contain any of the deleted blocks
+        expect(stripped).not.toMatch(/<div class="dnc-dash-quick-actions"/);
+        expect(stripped).not.toMatch(/dnc-dash-quick-card--claim/);
+        expect(stripped).not.toMatch(/dnc-dash-quick-card--transfer/);
+        expect(stripped).not.toMatch(/dnc-dash-quick-card--scan/);
+        expect(stripped).not.toMatch(/<div class="search-box-wrap">/);
+        expect(stripped).not.toMatch(/class="search-form-flex"/);
+        expect(stripped).not.toMatch(/class="dinoco-input-search"/);
+        expect(stripped).not.toMatch(/<div class="dnc-sn-notif-settings"/);
         expect(stripped).not.toMatch(/btn-reg/);
-        expect(stripped).not.toMatch(/<div class="action-grid dnc-sn-action-grid-4">/);
-        // V.31.13 — green scan CTA in search-box-wrap is GONE (moved up to row)
-        expect(stripped).not.toMatch(/dnc-sn-scan-first-btn/);
+        // Notif relocated to Profile — thin link row replaces accordion
+        expect(stripped).toMatch(/<a[^>]*href="\/edit-profile\/#sec-notif"[^>]*dnc-notif-link-row/);
+        // SCAN delegation handler retained (FAB modal future surfaces)
+        expect(code).toContain('dinocoScanFirstQr');
     });
 
-    test('V.31.13 — Logo wordmark replaces PNG (deep review pivot)', () => {
+    test('V.31.14 — Logo PNG RESTORED (wordmark pivot reverted per boss)', () => {
         const code = read('header');
-        // Strip comments (version-header narrates the removed class name)
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
             .replace(/<\?php[\s\S]*?\?>/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '')
             .replace(/^\s*\/\/.*$/gm, '');
-        // PNG image markup removed (in active code, not comments)
-        expect(stripped).not.toMatch(/class="card-title-logo"/);
-        expect(stripped).not.toMatch(/src="https?:\/\/[^"]*\/sss\.png"/);
-        // Text wordmark present
-        expect(code).toMatch(/<span class="card-title-wordmark">DINOCO<\/span>/);
-        // Wordmark CSS exists with correct fundamentals (allow newlines in block)
-        expect(code).toMatch(/\.card-title-wordmark\s*\{[\s\S]*?font-size:\s*16px/);
-        expect(code).toMatch(/\.card-title-wordmark\s*\{[\s\S]*?font-weight:\s*800/);
-        // <360px scaling
-        expect(code).toMatch(/\.card-title-wordmark\s*\{\s*font-size:\s*14px/);
+        // V.31.14 — PNG restored at canonical CDN URL with very small size cap
+        expect(stripped).toMatch(/<img[^>]*src="https:\/\/www\.dinoco\.in\.th\/wp-content\/uploads\/2026\/01\/sss\.png"[^>]*class="card-title-mark"/);
+        expect(stripped).toMatch(/alt="DINOCO"/);
+        // Wordmark span GONE from active code
+        expect(stripped).not.toMatch(/<span class="card-title-wordmark">/);
+        // Final size: height 14px + max-width 80px abs cap
+        expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*14px/);
+        expect(code).toMatch(/\.card-title-mark[\s\S]*?max-width:\s*80px/);
+        // <360px: 12px / 65px
+        expect(code).toMatch(/\.card-title-mark\s*\{\s*height:\s*12px;?\s*max-width:\s*65px/);
     });
 
-    test('V.31.13 — Scan delegation handler wired (data-action="dnc-scan-qr")', () => {
+    test('V.31.14 — Scan delegation handler retained (FAB modal future surfaces)', () => {
         const code = read('header');
-        // Idempotent global click listener
-        expect(code).toMatch(/__dncScanDelegationWired/);
-        expect(code).toMatch(/data-action="dnc-scan-qr"/);
-        // Handler calls dinocoScanFirstQr (which reuses Global App Menu's startQR)
+        // Handler kept even after action row deletion — used by Global App Menu
+        // bottom nav FAB SCAN modal + any future scan entry points
         expect(code).toContain('dinocoScanFirstQr');
+        expect(code).toMatch(/__dncScanDelegationWired/);
     });
 
     test('C5 — Profile form has Thai-mobile-correct inputmode + autocomplete + pattern', () => {
@@ -148,14 +148,15 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         expect(code).toMatch(/name="p_subdist"[\s\S]{0,200}?autocomplete="address-level3"/);
         // Birth field has bday autocomplete
         expect(code).toMatch(/name="p_birth"[\s\S]{0,200}?autocomplete="bday"/);
-        // S/N search input: inputmode=text + autocapitalize=characters + autocomplete=off
-        expect(code).toMatch(/name="register_serial"[\s\S]{0,400}?inputmode="text"[\s\S]{0,400}?autocapitalize="characters"[\s\S]{0,400}?autocomplete="off"/);
-        // S/N input pattern + maxlength
-        expect(code).toMatch(/name="register_serial"[\s\S]{0,400}?pattern="\[A-Za-z0-9\]\{8,16\}"[\s\S]{0,400}?maxlength="16"/);
+        // V.31.14: S/N input form REMOVED from home dashboard (Direction A —
+        // canonical surface = FAB SCAN modal manual entry in Global App Menu).
         // OLD pattern `[0-9]{9,10}` MUST be gone (allowed 9-digit which Thai mobiles never)
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<\?php[\s\S]*?\?>/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '');
         expect(stripped).not.toMatch(/pattern="\[0-9\]\{9,10\}"/);
+        // register_serial input MUST be gone (relocated to Global App Menu modal)
+        expect(stripped).not.toMatch(/name="register_serial"/);
     });
 });
