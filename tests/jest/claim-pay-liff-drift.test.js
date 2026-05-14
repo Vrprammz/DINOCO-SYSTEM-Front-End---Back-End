@@ -34,12 +34,25 @@ describe('Sprint 20 Phase 2.7 — Claim Pay customer LIFF drift', () => {
 
     // ─── Version header + LIFF_LOADED constant ────────────────────
 
-    test('LIFF V.0.8 header present', () => {
+    test('LIFF V.0.9 latest + V.0.8 lineage preserved', () => {
+        expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.9\s*\(2026-05-14\)\s*—\s*Sprint 22/);
         expect(LIFF_SRC).toMatch(/Version:\s*V\.0\.8\s*\(2026-05-14\)\s*—\s*Sprint 20/);
     });
 
-    test('DINOCO_CLAIM_PAYMENT_LIFF_LOADED bumped to 0.8', () => {
-        expect(LIFF_CODE).toMatch(/DINOCO_CLAIM_PAYMENT_LIFF_LOADED['"]\s*,\s*['"]0\.8['"]/);
+    test('Sprint 22 — DINOCO_CLAIM_PAYMENT_LIFF_LOADED bumped to 0.9', () => {
+        expect(LIFF_CODE).toMatch(/DINOCO_CLAIM_PAYMENT_LIFF_LOADED['"]\s*,\s*['"]0\.9['"]/);
+    });
+
+    // ─── Sprint 22 audit fixes ───────────────────────────────────────
+
+    test('Sprint 22 HIGH-3 — slip-image proxy rate limit split per tier', () => {
+        expect(LIFF_CODE).toMatch(/\$cap\s*=\s*\$is_admin\s*\?\s*120\s*:\s*30/);
+    });
+
+    test('Sprint 22 CRIT-2 — slip-image proxy emits Content-Security-Policy header', () => {
+        expect(LIFF_CODE).toMatch(/Content-Security-Policy/);
+        expect(LIFF_CODE).toMatch(/default-src\s*'none'[\s\S]*?img-src\s*'self'[\s\S]*?sandbox/);
+        expect(LIFF_CODE).toMatch(/X-Frame-Options['"]?\s*,\s*['"]DENY/);
     });
 
     // ─── Shortcode registration ───────────────────────────────────
@@ -212,8 +225,9 @@ describe('Sprint 20 Phase 2.7 — Claim Pay customer LIFF drift', () => {
         expect(proxyBlock[0]).toMatch(/'methods'\s*=>\s*'GET'/);
     });
 
-    test('Slip image proxy rate-limited 30/min', () => {
-        expect(LIFF_CODE).toMatch(/b2b_rate_limit\(\s*'claim_slip_image_'\s*\.\s*\$uid\s*,\s*30\s*,\s*60\s*\)/);
+    test('Sprint 22 HIGH-3 — slip image proxy rate-limited tiered (120/min admin, 30/min owner)', () => {
+        // Sprint 22 HIGH-3 split per-tier cap. $cap=120 if admin, 30 else.
+        expect(LIFF_CODE).toMatch(/b2b_rate_limit\(\s*'claim_slip_image_'\s*\.\s*\$uid\s*,\s*\$cap\s*,\s*60\s*\)/);
     });
 
     test('Slip image proxy sends Cache-Control private', () => {

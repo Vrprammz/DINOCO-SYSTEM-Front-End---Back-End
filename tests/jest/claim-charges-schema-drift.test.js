@@ -48,16 +48,12 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
         expect(SRC).toMatch(/Version:\s*V\.0\.4\s*\(2026-05-14\)/);
     });
 
-    test('DB_ID placeholder present until boss creates WP admin entry', () => {
-        // Per feedback_create_wp_snippet_first memory — boss must create WP
-        // entry first. Until then, header carries an explicit placeholder so
-        // sync engine + audit can detect.
-        expect(SRC).toMatch(/DB_ID:\s*\(pending/);
-    });
-
-    test('header documents the boss-must-create-first deploy gate', () => {
-        expect(SRC).toMatch(/Create snippet titled/);
-        expect(SRC).toMatch(/WILL NOT SYNC/);
+    test('Sprint 22 — boss assigned DB_ID 1214 (sync unlocked)', () => {
+        // Boss created the WP admin entry 2026-05-14 per
+        // feedback_create_wp_snippet_first memory. Now DB_ID=1214 in header.
+        expect(SRC).toMatch(/DB_ID:\s*1214/);
+        // Old placeholder must be gone
+        expect(SRC).not.toMatch(/DB_ID:\s*\(pending/);
     });
 
     test('cross-snippet refs use [#NNNN] format (avoids snippet-db-id detector false-positive)', () => {
