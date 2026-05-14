@@ -120,11 +120,11 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         expect(stripped).toMatch(/<img[^>]*src="https:\/\/www\.dinoco\.in\.th\/wp-content\/uploads\/2026\/01\/sss\.png"[^>]*class="card-title-mark"/);
         expect(stripped).not.toMatch(/<span class="card-title-wordmark">/);
         // V.31.15 — half of V.31.14: height 7px / max-width 40px
-        expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*14px/);
-        expect(code).toMatch(/\.card-title-mark[\s\S]*?max-width:\s*100px/);
+        expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*28px/);
+        expect(code).toMatch(/\.card-title-mark[\s\S]*?max-width:\s*200px/);
         // <360px mobile responsive (V.31.16 selector chain — comma-separated)
-        expect(code).toMatch(/@media \(max-width: 360px\)[\s\S]{0,500}?height:\s*12px/);
-        expect(code).toMatch(/@media \(max-width: 360px\)[\s\S]{0,500}?max-width:\s*80px/);
+        expect(code).toMatch(/@media \(max-width: 360px\)[\s\S]{0,500}?height:\s*24px/);
+        expect(code).toMatch(/@media \(max-width: 360px\)[\s\S]{0,500}?max-width:\s*160px/);
     });
 
     test('V.31.14 — Scan delegation handler retained (FAB modal future surfaces)', () => {

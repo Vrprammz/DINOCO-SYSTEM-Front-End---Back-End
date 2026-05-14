@@ -2823,7 +2823,7 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(stripped).toMatch(/class="card-title-mark"/);
             expect(stripped).not.toMatch(/<span class="card-title-wordmark">/);
             // V.31.15: 7px / 40px (half of V.31.14)
-            expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*14px/);
+            expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*28px/);
         });
 
         test('W7 SnTierBadgeTest helper test file exists with required cases', () => {
