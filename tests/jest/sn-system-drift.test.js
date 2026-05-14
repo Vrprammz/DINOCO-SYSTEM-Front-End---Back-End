@@ -2791,17 +2791,19 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toContain('/warranty/activate');
         });
 
-        test('W7.1 "📋 เคลม" quick action button added (additive)', () => {
+        test('W7.1 quick action row REMOVED in V.31.10 — superseded by Scan CTA + bottom nav', () => {
+            // V.31.10 (2026-05-14, boss directive): 3-button row (ลงทะเบียน/แจ้งเคลม/
+            // โอนสิทธิ์) removed entirely — duplicated bottom nav + green scan CTA.
+            // W7.1's original "additive 4th button" goal achieved differently: scan path
+            // now lives in .search-box-wrap; claim/transfer in asset card overflow.
             const code = readByPath(HEADER_PATH);
-            // 4-button grid class
-            expect(code).toContain('dnc-sn-action-grid-4');
-            // New claim page button
-            expect(code).toContain('btn-claim-page');
-            expect(code).toContain('📋');
-            // Existing 3 buttons preserved (backward compat)
-            expect(code).toContain('btn-reg');
-            expect(code).toContain('btn-claim');
-            expect(code).toContain('btn-trans');
+            const stripped = code
+                .replace(/<!--[\s\S]*?-->/g, '')
+                .replace(/\/\*[\s\S]*?\*\//g, '');
+            expect(stripped).not.toMatch(/class="action-grid dnc-sn-action-grid-4"/);
+            expect(stripped).not.toMatch(/btn-claim-page/);
+            // Version comment retains audit trail
+            expect(code).toMatch(/V\.31\.10[\s\S]{0,500}?3-button/);
         });
 
         test('W7 SnTierBadgeTest helper test file exists with required cases', () => {

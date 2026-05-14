@@ -78,23 +78,22 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         expect(code).toMatch(/<\?php if \(\s*\$has_legacy_warranty\s*\)\s*:\s*\?>[\s\S]{0,500}?royal-upgrade-btn[\s\S]{0,500}?<\?php endif;\s*\?>/);
     });
 
-    test('C4 — Duplicate "เคลม" button removed; canonical URL is /claim-system/ (V.31.7 bug fix)', () => {
+    test('C4 — 3-button quick action row REMOVED in V.31.10 (boss directive 2026-05-14)', () => {
         const code = read('header');
-        // V.31.7 (2026-05-13): URL corrected /claim → /claim-system/ (the /claim slug
-        // did not exist in WP page registry → 404. Canonical page wraps
-        // [dinoco_claim_page] shortcode from DB_ID 16 at slug `claim-system`).
+        // V.31.10 (2026-05-14): entire `.action-grid.dnc-sn-action-grid-4` div removed.
+        // All 3 buttons (ลงทะเบียน/แจ้งเคลม/โอนสิทธิ์) duplicated bottom nav + green
+        // scan CTA below. One scan path now lives in .search-box-wrap. Per-asset
+        // claim/transfer in asset card overflow menu where they have plate context.
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '');
-        // Single internal /claim-system/ button (btn-claim-page class still exists)
-        expect(code).toMatch(/btn-claim-page[\s\S]{0,200}?window\.location\.href='\/claim-system\/'/);
-        // Buggy bare /claim slug MUST NOT appear in active button code (only in version comments)
+        // Active markup MUST NOT contain the 3-button grid or its child handlers
+        expect(stripped).not.toMatch(/<div class="action-grid dnc-sn-action-grid-4">/);
+        expect(stripped).not.toMatch(/btn-claim-page[\s\S]{0,200}?window\.location\.href='\/claim-system\/'/);
+        expect(stripped).not.toMatch(/btn-trans[\s\S]{0,200}?window\.location\.href='\/transfer-warranty'/);
         expect(stripped).not.toMatch(/window\.location\.href='\/claim'/);
-        // Layout still uses dnc-sn-action-grid-4 class but with 3 cells
-        const grid = code.match(/<div class="action-grid dnc-sn-action-grid-4">[\s\S]{0,2000}?<\/div>/);
-        expect(grid).not.toBeNull();
-        const btnCount = (grid[0].match(/<button/g) || []).length;
-        expect(btnCount).toBe(3);
+        // Comments may still mention canonical URL for audit history
+        expect(code).toMatch(/V\.31\.10[\s\S]{0,500}?3-button/);
     });
 
     test('C5 — Profile form has Thai-mobile-correct inputmode + autocomplete + pattern', () => {
