@@ -78,22 +78,23 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         expect(code).toMatch(/<\?php if \(\s*\$has_legacy_warranty\s*\)\s*:\s*\?>[\s\S]{0,500}?royal-upgrade-btn[\s\S]{0,500}?<\?php endif;\s*\?>/);
     });
 
-    test('C4 — 3-button quick action row REMOVED in V.31.10 (boss directive 2026-05-14)', () => {
+    test('C4 — quick action row REFINED in V.31.12 (2 cards: แจ้งเคลม + โอนสิทธิ์, no ลงทะเบียน dupe)', () => {
         const code = read('header');
-        // V.31.10 (2026-05-14): entire `.action-grid.dnc-sn-action-grid-4` div removed.
-        // All 3 buttons (ลงทะเบียน/แจ้งเคลม/โอนสิทธิ์) duplicated bottom nav + green
-        // scan CTA below. One scan path now lives in .search-box-wrap. Per-asset
-        // claim/transfer in asset card overflow menu where they have plate context.
+        // V.31.10 removed all 3 buttons. V.31.12 restored 2 (claim + transfer) per
+        // boss feedback "บ้อบอหายทั้งเมนู". "ลงทะเบียน" stays absorbed in green scan
+        // CTA (true dupe). Claim + transfer are NOT scan-related → visible primary.
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '');
-        // Active markup MUST NOT contain the 3-button grid or its child handlers
+        // New canonical markup
+        expect(stripped).toMatch(/<div class="dnc-dash-quick-actions"/);
+        expect(stripped).toMatch(/<a[^>]*href="\/claim-system\/"[^>]*dnc-dash-quick-card--claim/);
+        expect(stripped).toMatch(/<a[^>]*href="\/transfer-warranty"[^>]*dnc-dash-quick-card--transfer/);
+        // UX-H3: no inline onclick on quick cards (data-action delegation)
+        expect(stripped).not.toMatch(/dnc-dash-quick-card[^>]*onclick=/);
+        // Legacy "btn-reg" (ลงทะเบียน) MUST NOT return — that was the dupe
+        expect(stripped).not.toMatch(/btn-reg/);
         expect(stripped).not.toMatch(/<div class="action-grid dnc-sn-action-grid-4">/);
-        expect(stripped).not.toMatch(/btn-claim-page[\s\S]{0,200}?window\.location\.href='\/claim-system\/'/);
-        expect(stripped).not.toMatch(/btn-trans[\s\S]{0,200}?window\.location\.href='\/transfer-warranty'/);
-        expect(stripped).not.toMatch(/window\.location\.href='\/claim'/);
-        // Comments may still mention canonical URL for audit history
-        expect(code).toMatch(/V\.31\.10[\s\S]{0,500}?3-button/);
     });
 
     test('C5 — Profile form has Thai-mobile-correct inputmode + autocomplete + pattern', () => {
