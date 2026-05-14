@@ -1,6 +1,21 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Flash Dispatcher                    ║
+ * ║  Version: V.0.3 (2026-05-14) — Sprint 25 code-reviewer remediation:║
+ * ║    • CRIT-1: PII leak via b2b_flash_mask_request_for_dlq — masker  ║
+ * ║      assumes src=DINOCO warehouse never PII. For inbound_pickup   ║
+ * ║      direction src=customer (PII!) — built params_for_mask swap    ║
+ * ║      copy before masking. Flash API payload unchanged.            ║
+ * ║    • CRIT-2: G2 1003 outTradeNo bookkeeping — pin params_api      ║
+ * ║      ['outTradeNo'] to the value Flash actually recorded (from    ║
+ * ║      lookup response) so cancel/status hit the correct order.    ║
+ * ║    • HIGH-3: returnXxx fallbacks use $src_* if reg-address empty. ║
+ * ║      Prevents "lose customer parcel on inbound_pickup failure".   ║
+ * ║    • HIGH-5: webhook invalidates flash-status transient (admin +  ║
+ * ║      owner tiers). Was up to 60s stale post-delivery.            ║
+ * ║    • HIGH-7: G2 1003 detection checks BOTH `code` + `status_code` ║
+ * ║      fields. Was missing Flash failure-shaped envelopes.         ║
+ * ║                                                                   ║
  * ║  Version: V.0.2 (2026-05-14) — Sprint 23 Phase 3.1+3.2 — REST    ║
  * ║    endpoints + internal helper + webhook listener live.          ║
  * ║  DB_ID: 1213 (WP-assigned 2026-05-13 by boss)                    ║
@@ -281,14 +296,30 @@ if ( ! function_exists( 'dinoco_claim_create_flash_shipment' ) ) {
         if ( $H > 0 ) $params_api['height'] = $H;
 
         // returnXXX — registered address (legal entity returns)
+        // V.0.3 Sprint 25 HIGH-3 fix — address field fallbacks to $src_address
+        // so inbound_pickup failures route parcel BACK to customer (src=
+        // customer in inbound_pickup direction) instead of empty string =
+        // "lose customer's broken motorcycle accessory in transit". For
+        // replacement/repaired_return, fallback uses warehouse address.
         if ( ! empty( $reg ) && is_array( $reg ) ) {
             $params_api['returnName']          = ! empty( $reg['reg_name'] )     ? (string) $reg['reg_name']     : $src_name;
             $params_api['returnPhone']         = ! empty( $reg['reg_phone'] )    ? (string) $reg['reg_phone']    : $src_phone;
-            $params_api['returnDetailAddress'] = ! empty( $reg['reg_address'] )  ? (string) $reg['reg_address']  : '';
-            $params_api['returnDistrictName']  = ! empty( $reg['reg_district'] ) ? (string) $reg['reg_district'] : '';
-            $params_api['returnCityName']      = ! empty( $reg['reg_city'] )     ? (string) $reg['reg_city']     : '';
-            $params_api['returnProvinceName']  = ! empty( $reg['reg_province'] ) ? (string) $reg['reg_province'] : '';
-            $params_api['returnPostalCode']    = ! empty( $reg['reg_postcode'] ) ? (string) $reg['reg_postcode'] : '';
+            $params_api['returnDetailAddress'] = ! empty( $reg['reg_address'] )  ? (string) $reg['reg_address']  : $src_address;
+            $params_api['returnDistrictName']  = ! empty( $reg['reg_district'] ) ? (string) $reg['reg_district'] : $src_district;
+            $params_api['returnCityName']      = ! empty( $reg['reg_city'] )     ? (string) $reg['reg_city']     : $src_city;
+            $params_api['returnProvinceName']  = ! empty( $reg['reg_province'] ) ? (string) $reg['reg_province'] : $src_province;
+            $params_api['returnPostalCode']    = ! empty( $reg['reg_postcode'] ) ? (string) $reg['reg_postcode'] : $src_postcode;
+        } else {
+            // V.0.3 Sprint 25 HIGH-3 — even if registered-address option entirely
+            // missing, must populate return* to prevent Flash silent reject AND
+            // route returns to a recoverable address (src side).
+            $params_api['returnName']          = $src_name;
+            $params_api['returnPhone']         = $src_phone;
+            $params_api['returnDetailAddress'] = $src_address;
+            $params_api['returnDistrictName']  = $src_district;
+            $params_api['returnCityName']      = $src_city;
+            $params_api['returnProvinceName']  = $src_province;
+            $params_api['returnPostalCode']    = $src_postcode;
         }
 
         global $wpdb;
@@ -311,9 +342,26 @@ if ( ! function_exists( 'dinoco_claim_create_flash_shipment' ) ) {
                 if ( isset( $r['code'] ) )            $code = (string) $r['code'];
                 elseif ( isset( $r['status_code'] ) ) $code = (string) $r['status_code'];
             }
-            if ( $code === '1003' && function_exists( 'b2b_flash_get_order_by_mch_pno' ) ) {
+            // V.0.3 Sprint 25 HIGH-7 fix — Flash error code may surface under
+            // EITHER `code` (success-shaped envelope) or `status_code` (failure-
+            // shaped from dinoco_api_retry helper). Check both inclusively so
+            // 1003 detection never misses → recovery actually fires.
+            $code_any = ( $code === '1003' )
+                || ( is_array( $r ) && isset( $r['status_code'] ) && (string) $r['status_code'] === '1003' );
+            if ( $code_any && function_exists( 'b2b_flash_get_order_by_mch_pno' ) ) {
                 $lookup = b2b_flash_get_order_by_mch_pno( $params_api['outTradeNo'] );
                 if ( is_array( $lookup ) && ! empty( $lookup['ok'] ) && ! empty( $lookup['data']['pno'] ) ) {
+                    // V.0.3 Sprint 25 CRIT-2 fix — pin `params_api['outTradeNo']`
+                    // to the outTradeNo Flash actually recorded (the queried
+                    // value at the moment of duplicate detection). If lookup
+                    // succeeds, this IS the right out_trade_no to persist into
+                    // `_claim_flash_pnos[]` so future cancel/status lookups
+                    // hit the correct order. Without this fix, params_api
+                    // could later be mutated to `-r2/r3` even though Flash's
+                    // canonical record carries the original suffix.
+                    if ( isset( $lookup['data']['outTradeNo'] ) ) {
+                        $params_api['outTradeNo'] = (string) $lookup['data']['outTradeNo'];
+                    }
                     return $lookup;
                 }
                 // Regenerate suffix
@@ -329,11 +377,39 @@ if ( ! function_exists( 'dinoco_claim_create_flash_shipment' ) ) {
 
         $is_ok = is_array( $result ) && ! empty( $result['ok'] ) && ! empty( $result['data']['pno'] );
 
+        // V.0.3 Sprint 25 CRIT-1 fix — for inbound_pickup direction, customer
+        // PII is placed in srcXxx fields (Flash semantics: src = pickup
+        // location = customer's address). But `b2b_flash_mask_request_for_dlq`
+        // [B2B Snippet 1] hardcoded assumes src = DINOCO warehouse (no
+        // masking) and only masks dstXxx (where customer normally lives in
+        // B2B order flow). For inbound_pickup we must pre-swap src/dst into
+        // the masker's expected slots so customer PII gets the dst* mask
+        // treatment (first 3 chars + bullets pattern from Sprint 12 SEC-L3).
+        // Audit row + Sentry context then carry properly-masked customer info.
+        // The actual Flash API payload (sent to Flash earlier line ~306) is
+        // unchanged — only the in-memory mask copy is swapped.
+        $params_for_mask = $params_api;
+        if ( $direction === 'inbound_pickup' ) {
+            $swap_pairs = array(
+                array( 'srcName',          'dstName' ),
+                array( 'srcPhone',         'dstPhone' ),
+                array( 'srcDetailAddress', 'dstDetailAddress' ),
+                array( 'srcDistrictName',  'dstDistrictName' ),
+                array( 'srcCityName',      'dstCityName' ),
+                array( 'srcProvinceName',  'dstProvinceName' ),
+                array( 'srcPostalCode',    'dstPostalCode' ),
+            );
+            foreach ( $swap_pairs as $pair ) {
+                $tmp = isset( $params_for_mask[ $pair[0] ] ) ? $params_for_mask[ $pair[0] ] : '';
+                $params_for_mask[ $pair[0] ] = isset( $params_for_mask[ $pair[1] ] ) ? $params_for_mask[ $pair[1] ] : '';
+                $params_for_mask[ $pair[1] ] = $tmp;
+            }
+        }
         // Audit row — PII masked
         if ( $audit_supported ) {
             $masked_req = function_exists( 'b2b_flash_mask_request_for_dlq' )
-                ? b2b_flash_mask_request_for_dlq( $params_api )
-                : array_intersect_key( $params_api, array_flip( array( 'outTradeNo', 'expressCategory', 'articleCategory', 'weight' ) ) );
+                ? b2b_flash_mask_request_for_dlq( $params_for_mask )
+                : array_intersect_key( $params_for_mask, array_flip( array( 'outTradeNo', 'expressCategory', 'articleCategory', 'weight' ) ) );
             $masked_req['claim_id']  = $claim_id;
             $masked_req['direction'] = $direction;
             $masked_req['attempts']  = $attempt;
@@ -762,6 +838,13 @@ if ( ! function_exists( 'dinoco_claim_flash_update_pno_entry' ) ) {
         }
         if ( $changed ) {
             update_post_meta( $claim_id, '_claim_flash_pnos', $pnos );
+            // V.0.3 Sprint 25 HIGH-5 fix — invalidate both tier transients so
+            // next admin/owner /flash-status read sees fresh data. Without
+            // this, admin could see stale Flash state up to 60s after a
+            // webhook indicated delivery (during which the claim FSM may
+            // have already auto-flipped via the @priority 10 listener below).
+            delete_transient( 'dinoco_claim_flash_status_' . md5( $pno . '|admin' ) );
+            delete_transient( 'dinoco_claim_flash_status_' . md5( $pno . '|owner' ) );
         }
         return $changed;
     }

@@ -40,8 +40,41 @@ describe('Claim Flash Dispatcher — Sprint 23 Phase 3.1+3.2 drift detector', ()
         expect(dispatcher).toMatch(/DB_ID:\s*1213/);
     });
 
-    test('dispatcher version bumped to V.0.2 (2026-05-14)', () => {
+    test('dispatcher version bumped to V.0.3 + V.0.2 lineage preserved', () => {
+        expect(dispatcher).toMatch(/Version:\s*V\.0\.3\s*\(2026-05-14\)/);
         expect(dispatcher).toMatch(/Version:\s*V\.0\.2\s*\(2026-05-14\)/);
+    });
+
+    // ─── Sprint 25 code-reviewer remediation pins ─────────────────────
+
+    test('Sprint 25 CRIT-1 — inbound_pickup builds swap copy before mask call', () => {
+        // Test for direction-aware mask: $params_for_mask = $params_api with
+        // src/dst swapped when direction === 'inbound_pickup'.
+        expect(dispatcher).toMatch(/\$params_for_mask\s*=\s*\$params_api/);
+        expect(dispatcher).toMatch(/if\s*\(\s*\$direction\s*===\s*'inbound_pickup'/);
+        // Mask call uses the swapped copy
+        expect(dispatcher).toMatch(/b2b_flash_mask_request_for_dlq\(\s*\$params_for_mask\s*\)/);
+    });
+
+    test('Sprint 25 CRIT-2 — G2 1003 lookup pins outTradeNo from Flash response', () => {
+        // After lookup hit, params_api['outTradeNo'] is set from lookup data
+        expect(dispatcher).toMatch(/\$params_api\['outTradeNo'\]\s*=\s*\(string\)\s*\$lookup\['data'\]\['outTradeNo'\]/);
+    });
+
+    test('Sprint 25 HIGH-3 — returnXxx falls back to src_* not empty string', () => {
+        expect(dispatcher).toMatch(/'returnDetailAddress'\][\s\S]{0,80}?:\s*\$src_address/);
+        expect(dispatcher).toMatch(/'returnDistrictName'\][\s\S]{0,80}?:\s*\$src_district/);
+    });
+
+    test('Sprint 25 HIGH-5 — webhook listener invalidates flash-status transient', () => {
+        // Both admin + owner tier transients deleted in update_pno_entry post-write
+        expect(dispatcher).toMatch(/delete_transient\(\s*'dinoco_claim_flash_status_'\s*\.\s*md5\(\s*\$pno\s*\.\s*'\|admin'\s*\)\s*\)/);
+        expect(dispatcher).toMatch(/delete_transient\(\s*'dinoco_claim_flash_status_'\s*\.\s*md5\(\s*\$pno\s*\.\s*'\|owner'\s*\)\s*\)/);
+    });
+
+    test('Sprint 25 HIGH-7 — G2 1003 detection checks BOTH code + status_code', () => {
+        expect(dispatcher).toMatch(/\$code_any\s*=\s*\(\s*\$code\s*===\s*'1003'\s*\)/);
+        expect(dispatcher).toMatch(/\$r\['status_code'\][\s\S]{0,40}?===\s*'1003'/);
     });
 
     test('kill switch flag default OFF (REG-029)', () => {
@@ -230,7 +263,10 @@ describe('Claim Flash Dispatcher — Sprint 23 Phase 3.1+3.2 drift detector', ()
     });
 
     test('Audit row PII masked via b2b_flash_mask_request_for_dlq', () => {
-        expect(dispatcher).toMatch(/b2b_flash_mask_request_for_dlq\(\s*\$params_api\s*\)/);
+        // Sprint 25 CRIT-1 — input switched from $params_api to direction-
+        // aware $params_for_mask copy. Accept either form (older lineage
+        // tests must still pass for repos that may not have applied Sprint 25).
+        expect(dispatcher).toMatch(/b2b_flash_mask_request_for_dlq\(\s*\$params_(?:api|for_mask)\s*\)/);
     });
 
     test('Audit table is wp_dinoco_flash_audit', () => {
