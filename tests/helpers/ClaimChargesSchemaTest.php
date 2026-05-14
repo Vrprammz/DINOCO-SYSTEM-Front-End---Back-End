@@ -406,9 +406,10 @@ class ClaimChargesSchemaTest extends TestCase {
         $this->assertMatchesRegularExpression( '/\}\s*finally\s*\{[\s\S]*?dinoco_cron_claim_charges_cleanup_last_run/', $src );
     }
 
-    public function test_retention_cron_scheduled_daily_at_03_30(): void {
+    public function test_retention_cron_scheduled_daily_at_03_45(): void {
+        // Sprint 11 HIGH-1 — moved 03:30 → 03:45 to avoid contention with 4 other 03:30 crons
         $src = SnippetFixture::load();
-        $this->assertStringContainsString( "strtotime( 'tomorrow 03:30' )", $src );
+        $this->assertStringContainsString( "strtotime( 'tomorrow 03:45' )", $src );
         $this->assertStringContainsString( "wp_schedule_event( \$first_run, 'daily', 'dinoco_claim_charges_cleanup_cron' )", $src );
     }
 

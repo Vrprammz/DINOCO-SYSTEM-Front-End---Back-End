@@ -1,6 +1,26 @@
 /*
  * Plugin Name: [Module] DINOCO Service Center & Claims
  * Description: ระบบบริหารจัดการงานเคลม
+ * Version: V.33.2 (2026-05-14) — Sprint 11 code-reviewer remediation (2 HIGH + 2 MED + 1 LOW).
+ *   HIGH-2 — Walkin clear/save race: REST handler now wraps clear-or-save body in
+ *     MySQL GET_LOCK('dnc_claim_bank_save', 5) + try/finally RELEASE. Mirrors
+ *     b2b_rate_limit / b2b_debt_add atomic pattern. Two parallel REST calls
+ *     (clear from tab A + save from tab B) now serialize → deterministic final
+ *     state + audit trail. 503 + retry_after=5 on lock acquire failure.
+ *   MED-1 — Migration race + UI-only perf bleed: maybe_migrate_constants() now
+ *     short-circuits BEFORE option lookups when zero constants defined (~14
+ *     get_option saved per admin_init for UI-only admins). Migration body
+ *     wrapped in GET_LOCK(...,0) non-blocking + flag re-check inside lock (TOCTOU
+ *     defense) + try/finally RELEASE.
+ *   MED-2 — Auth code whitelist extended: added 'rest_user_invalid_session' (WP
+ *     core emits when session_tokens row disappears). NEW escFullUnbounded()
+ *     variant for trusted JSON.stringify output (Flex preview can legitimately
+ *     exceed 200-char escFull() cap). Added inline TODO documenting native
+ *     confirm() blocking dependency of _claimBankNonceReloadShown guard.
+ *   LOW-2 — escFull() now caps input at 200 chars + ellipsis. Network errors
+ *     from misbehaving servers could otherwise return multi-MB strings into
+ *     the toast UI. Trusted JSON preview uses escFullUnbounded() variant.
+ *
  * Version: V.33.1 (2026-05-14) — Sprint 10 code-reviewer remediation (1 CRIT + 2 HIGH + 1 MED).
  *   CRIT-1 — walkin checkbox state coherence: when admin checks "ใช้บัญชีเดียวกับบัญชีหลัก",
  *     JS now POSTs {bucket:'walkin', clear:true} and server WIPES all 7 walkin wp_options
@@ -5260,34 +5280,64 @@ if ( ! function_exists( 'dinoco_claim_bank_maybe_migrate_constants' ) ) {
         if ( get_option( 'dinoco_claim_bank_seeded_from_constants', '' ) === '1' ) {
             return; // already ran
         }
-        $touched = 0;
-        foreach ( array( 'default', 'walkin' ) as $bucket ) {
-            $keys = dinoco_claim_bank_field_keys( $bucket );
-            foreach ( $keys['options'] as $field => $opt_key ) {
-                $const_name = $keys['constants'][ $field ];
-                if ( ! defined( $const_name ) ) continue;
-                $current = get_option( $opt_key, '' );
-                if ( $current !== '' && $current !== false ) continue;
-                $val = constant( $const_name );
-                if ( ! is_string( $val ) || trim( $val ) === '' ) continue;
-                update_option( $opt_key, sanitize_text_field( $val ), false );
-                $touched++;
-            }
+        // V.33.2 MED-1 fix (Sprint 11) — fast-path short-circuit when NO constants
+        // defined. V.33.1 HIGH-3 made the flag conditional so this function would
+        // re-run on every admin_init for UI-only admins. ~14 get_option() calls
+        // per admin request × N admins = real perf bleed at fleet scale. Cheap
+        // defined() check exits BEFORE option lookups.
+        $any_const_defined = false;
+        foreach ( array( 'DINOCO_CLAIM_BANK_NAME', 'DINOCO_CLAIM_BANK_ACCOUNT',
+            'DINOCO_CLAIM_BANK_HOLDER', 'DINOCO_CLAIM_BANK_CODE',
+            'DINOCO_CLAIM_WALKIN_BANK_NAME', 'DINOCO_CLAIM_WALKIN_BANK_ACCOUNT' ) as $c ) {
+            if ( defined( $c ) ) { $any_const_defined = true; break; }
         }
-        // V.33.1 HIGH-3 fix — flag only set when at least one seed happened.
-        // Otherwise, future admin defining DINOCO_CLAIM_BANK_* constants AFTER
-        // first admin_init (e.g., wp-config.php edit) would be silently ignored
-        // because flag was prematurely set on zero-touched first run.
-        if ( $touched > 0 ) {
-            update_option( 'dinoco_claim_bank_seeded_from_constants', '1', true );
-            if ( function_exists( 'dinoco_audit_log' ) ) {
-                dinoco_audit_log( array(
-                    'event_type'  => 'claim_bank_seeded_from_constants',
-                    'actor_type'  => 'system',
-                    'target_type' => 'wp_option',
-                    'context'     => array( 'fields_seeded' => $touched ),
-                ) );
+        if ( ! $any_const_defined ) return;
+
+        // V.33.2 MED-1 fix — serialize concurrent admin_init runs via non-blocking
+        // GET_LOCK (timeout=0 → skip if another worker already migrating). Without
+        // this, cron tick + admin AJAX firing simultaneously could both pass the
+        // flag-check, both INSERT into wp_options, both write audit rows.
+        global $wpdb;
+        $lock = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT GET_LOCK(%s, 0)", 'dinoco_claim_bank_migrate'
+        ) );
+        if ( $lock !== 1 ) return; // another process is migrating — defer
+
+        try {
+            // Re-check flag inside lock (TOCTOU defense)
+            if ( get_option( 'dinoco_claim_bank_seeded_from_constants', '' ) === '1' ) {
+                return;
             }
+
+            $touched = 0;
+            foreach ( array( 'default', 'walkin' ) as $bucket ) {
+                $keys = dinoco_claim_bank_field_keys( $bucket );
+                foreach ( $keys['options'] as $field => $opt_key ) {
+                    $const_name = $keys['constants'][ $field ];
+                    if ( ! defined( $const_name ) ) continue;
+                    $current = get_option( $opt_key, '' );
+                    if ( $current !== '' && $current !== false ) continue;
+                    $val = constant( $const_name );
+                    if ( ! is_string( $val ) || trim( $val ) === '' ) continue;
+                    update_option( $opt_key, sanitize_text_field( $val ), false );
+                    $touched++;
+                }
+            }
+            // V.33.1 HIGH-3 — flag only set when at least one seed happened so
+            // future constant additions still trigger migration on next admin_init.
+            if ( $touched > 0 ) {
+                update_option( 'dinoco_claim_bank_seeded_from_constants', '1', true );
+                if ( function_exists( 'dinoco_audit_log' ) ) {
+                    dinoco_audit_log( array(
+                        'event_type'  => 'claim_bank_seeded_from_constants',
+                        'actor_type'  => 'system',
+                        'target_type' => 'wp_option',
+                        'context'     => array( 'fields_seeded' => $touched ),
+                    ) );
+                }
+            }
+        } finally {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", 'dinoco_claim_bank_migrate' ) );
         }
     }
 }
@@ -5429,18 +5479,38 @@ if ( ! function_exists( 'dinoco_claim_bank_rest_get' ) ) {
 
 if ( ! function_exists( 'dinoco_claim_bank_rest_save' ) ) {
     function dinoco_claim_bank_rest_save( $req ) {
+        global $wpdb;
         $body = $req->get_json_params();
         if ( ! is_array( $body ) ) $body = $req->get_params();
 
         $bucket = isset( $body['bucket'] ) && $body['bucket'] === 'walkin'
             ? 'walkin' : 'default';
 
-        // V.33.1 CRIT-1 fix — walkin bucket explicit clear semantic:
-        // When admin checks "ใช้บัญชีเดียวกับบัญชีหลัก" the JS now POSTs
-        // {bucket:'walkin', clear:true} so server WIPES all 7 walkin wp_options
-        // (audited via dual-channel). Without this, Phase 2 charge handler would
-        // resolve walkin → stale wp_options → wrong bank snapshot on customer Flex.
-        // 'default' bucket cannot be cleared (no resolver fallback chain protects it).
+        // V.33.2 HIGH-2 fix — serialize concurrent saves via MySQL GET_LOCK.
+        // Two parallel REST calls (clear from Admin A + save from Admin B) could
+        // produce non-deterministic final state. GET_LOCK with 5s timeout matches
+        // b2b_rate_limit / b2b_debt_add patterns. try/finally guarantees RELEASE.
+        $lock_key = 'dnc_claim_bank_save';
+        $lock_acquired = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, %d)", $lock_key, 5 ) );
+        if ( $lock_acquired !== 1 ) {
+            return new WP_Error(
+                'claim_bank_save_busy',
+                'ระบบกำลังบันทึกการเปลี่ยนแปลงอื่นอยู่ กรุณาลองอีกครั้ง',
+                array( 'status' => 503, 'retry_after' => 5 )
+            );
+        }
+
+        try {
+            return _dinoco_claim_bank_rest_save_inner( $body, $bucket );
+        } finally {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+        }
+    }
+}
+
+if ( ! function_exists( '_dinoco_claim_bank_rest_save_inner' ) ) {
+    function _dinoco_claim_bank_rest_save_inner( $body, $bucket ) {
+        // V.33.1 CRIT-1 fix — walkin bucket explicit clear semantic.
         $clear = ! empty( $body['clear'] ) && $bucket === 'walkin';
 
         if ( $clear ) {
@@ -5779,8 +5849,18 @@ if ( ! function_exists( 'dinoco_claim_bank_settings_render' ) ) {
             }
 
             // V.33.1 MED-5 fix — full HTML escape for Flex preview (was single-char only).
-            // Prevents stored XSS via bank fields when admin views Flex JSON in preview.
+            // V.33.2 LOW-2 fix (Sprint 11) — 200-char cap on output. Network errors
+            // can produce multi-MB strings from misbehaving servers — capping
+            // prevents toast UI from rendering megabytes of escaped chars.
             function escFull(s){
+                s = String(s == null ? '' : s);
+                if (s.length > 200) s = s.slice(0, 200) + '…';
+                return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                        .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+            }
+            // Unbounded variant for trusted JSON.stringify(data.flex) output —
+            // backend-controlled content + already JSON.stringify'd → no length surprises.
+            function escFullUnbounded(s){
                 s = String(s == null ? '' : s);
                 return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
                         .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -5791,11 +5871,18 @@ if ( ! function_exists( 'dinoco_claim_bank_settings_render' ) ) {
             // this guard, every save silently fails. One-shot dialog → reload page →
             // fresh nonce + restart clean. Whitelist exact error codes only (Sprint 7
             // MED-2 precedent — don't catch unrelated 403s like rate_limit).
+            //
+            // V.33.2 MED-2 (Sprint 11) — added rest_user_invalid_session (WP core
+            // emits this when session_tokens table row disappears) + TODO note.
+            // NOTE: guard depends on native confirm() blocking the event loop.
+            // Migration to async dinocoModal.confirm() will require explicit
+            // serialization (e.g., shared Promise lock) to preserve one-shot behavior.
             var _claimBankNonceReloadShown = false;
             function _claimBankHandleAuthError(status, errCode){
                 if (status !== 403 && status !== 401) return false;
                 var nonceCodes = {
                     'rest_cookie_invalid_nonce': 'nonce',
+                    'rest_user_invalid_session': 'logout',
                     'rest_forbidden': 'logout',
                     'rest_not_logged_in': 'logout',
                 };
@@ -5877,8 +5964,11 @@ if ( ! function_exists( 'dinoco_claim_bank_settings_render' ) ) {
                     }
                     // V.33.1 MED-5 fix — full HTML escape (was &lt; only). Bank fields
                     // can contain user-controlled strings that flow into JSON preview.
+                    // V.33.2 LOW-2 (Sprint 11) — JSON.stringify output may legitimately
+                    // exceed 200 chars (Flex bubble JSON ~500-2000 chars). Use the
+                    // unbounded variant — backend-controlled + already JSON.stringify'd.
                     showResult('🧪 Flex Preview (Phase 1 — ไม่ได้ส่งจริง):<br><pre>' +
-                        escFull(JSON.stringify(data.flex, null, 2)) + '</pre>', true);
+                        escFullUnbounded(JSON.stringify(data.flex, null, 2)) + '</pre>', true);
                 } catch (e) {
                     showResult('Network error: ' + escFull(e.message), false);
                 }

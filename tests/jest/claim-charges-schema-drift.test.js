@@ -125,7 +125,8 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
         expect(matches.length).toBe(1);
     });
 
-    // ─── dbDelta DDL — 24 column definitions ──────────────────────────
+    // ─── dbDelta DDL — 26 column definitions ──────────────────────────
+    // (Sprint 11 MED-4 fix — V.0.1 comment said 24, expectedColumns has 26)
 
     test('CREATE TABLE block exists in snippet', () => {
         expect(SRC).toMatch(/\$sql\s*=\s*"CREATE TABLE\s+\{?\$?table\}?/);
@@ -271,8 +272,8 @@ describe('Claim Charges Schema — Phase 2.1 drift detector', () => {
         expect(SRC).toMatch(/update_option\(\s*'dinoco_cron_claim_charges_cleanup_last_run'\s*,\s*current_time\(\s*'mysql'\s*\)\s*,\s*false\s*\)/);
     });
 
-    test('retention cron scheduled daily at 03:30 (offset from idempotency 03:15)', () => {
-        expect(SRC).toMatch(/strtotime\(\s*'tomorrow 03:30'\s*\)/);
+    test('Sprint 11 HIGH-1 — retention cron moved to 03:45 (avoid 03:30 contention)', () => {
+        expect(SRC).toMatch(/strtotime\(\s*'tomorrow 03:45'\s*\)/);
         expect(SRC).toMatch(/wp_schedule_event\(\s*\$first_run\s*,\s*'daily'\s*,\s*'dinoco_claim_charges_cleanup_cron'\s*\)/);
     });
 

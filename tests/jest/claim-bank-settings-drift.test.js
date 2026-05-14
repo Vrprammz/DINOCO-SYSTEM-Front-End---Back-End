@@ -27,12 +27,50 @@ describe('Claim Bank Settings — Sprint 9 Phase 1 Task 1.9 drift detector', () 
 
     // ─── Version + DB_ID integrity ────────────────────────────────────
 
-    test('Service Center version bumped to V.33.1 (Sprint 10 remediation)', () => {
-        expect(SC).toMatch(/Version: V\.33\.1 \(2026-05-14\)/);
+    test('Service Center version bumped to V.33.2 (Sprint 11 remediation)', () => {
+        expect(SC).toMatch(/Version: V\.33\.2 \(2026-05-14\)/);
     });
 
-    test('V.33.0 baseline pin retained in header chain', () => {
+    test('V.33.1 + V.33.0 lineage retained in header chain', () => {
+        expect(SC).toMatch(/Version: V\.33\.1 \(2026-05-14\)/);
         expect(SC).toMatch(/Version: V\.33\.0 \(2026-05-13\)/);
+    });
+
+    // ─── Sprint 11 remediation pins ─────────────────────────────────
+
+    test('Sprint 11 HIGH-2 — REST save wraps in GET_LOCK with try/finally', () => {
+        // Outer dispatcher acquires lock + delegates to _inner via try/finally
+        expect(SC).toMatch(/function dinoco_claim_bank_rest_save\([\s\S]*?\$lock_key\s*=\s*'dnc_claim_bank_save'[\s\S]*?GET_LOCK[\s\S]*?\$lock_key[\s\S]*?,\s*5/);
+        expect(SC).toMatch(/function _dinoco_claim_bank_rest_save_inner/);
+        // try/finally with RELEASE_LOCK
+        expect(SC).toMatch(/try\s*\{[\s\S]*?return _dinoco_claim_bank_rest_save_inner[\s\S]*?\}\s*finally\s*\{[\s\S]*?RELEASE_LOCK/);
+        // 503 + retry_after on acquire fail
+        expect(SC).toMatch(/'claim_bank_save_busy'[\s\S]*?'status'\s*=>\s*503[\s\S]*?'retry_after'\s*=>\s*5/);
+    });
+
+    test('Sprint 11 MED-1 — migration short-circuit + GET_LOCK guard', () => {
+        // Early fast-path: scan 6 sentinel constants before doing any get_option work
+        expect(SC).toMatch(/\$any_const_defined\s*=\s*false/);
+        expect(SC).toMatch(/if\s*\(\s*!\s*\$any_const_defined\s*\)\s*return/);
+        // Non-blocking GET_LOCK with timeout=0
+        expect(SC).toMatch(/GET_LOCK\([\s\S]*?'dinoco_claim_bank_migrate'[\s\S]*?0/);
+        // TOCTOU re-check inside lock
+        expect(SC).toMatch(/Re-check flag inside lock/);
+    });
+
+    test('Sprint 11 MED-2 — rest_user_invalid_session in nonce whitelist', () => {
+        expect(SC).toMatch(/'rest_user_invalid_session'\s*:\s*'logout'/);
+        // TODO comment documenting native confirm() blocking dependency
+        expect(SC).toMatch(/guard depends on native confirm\(\) blocking/);
+    });
+
+    test('Sprint 11 LOW-2 — escFull length cap + escFullUnbounded variant', () => {
+        // escFull caps at 200 chars + ellipsis
+        expect(SC).toMatch(/s\.length\s*>\s*200[\s\S]{0,80}\.slice\(\s*0\s*,\s*200\s*\)\s*\+\s*'…'/);
+        // Separate escFullUnbounded for trusted JSON.stringify output
+        expect(SC).toMatch(/function escFullUnbounded\(s\)/);
+        // Flex preview uses unbounded variant
+        expect(SC).toMatch(/escFullUnbounded\(\s*JSON\.stringify\(\s*data\.flex/);
     });
 
     // ─── Sprint 10 remediation pins (V.33.1) ─────────────────────────
