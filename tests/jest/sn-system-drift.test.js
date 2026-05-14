@@ -2793,37 +2793,44 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toContain('/warranty/activate');
         });
 
-        test('W7.1 V.31.15 — 3-card action row RESTORED + notif relocated', () => {
-            // V.31.15 boss restored ลงทะเบียน + แจ้งเคลม + โอนสิทธิ์ row
-            // (V.31.14 had deleted all). Notif still at Edit Profile.
+        test('W7.1 V.32.0 — 3-card action row REMOVED (bottom nav canonical) + notif still in Profile only', () => {
+            // V.32.0 FULL REDESIGN: row deleted; bottom nav (Global App Menu) is
+            // the canonical scan/claim/transfer surface. Empty-state green hero
+            // handles new-user onboarding. Triple-duplication eliminated.
             const code = readByPath(HEADER_PATH);
             const stripped = code
                 .replace(/<!--[\s\S]*?-->/g, '')
                 .replace(/<\?php[\s\S]*?\?>/g, '')
                 .replace(/\/\*[\s\S]*?\*\//g, '');
             expect(stripped).not.toMatch(/class="action-grid dnc-sn-action-grid-4"/);
-            expect(stripped).not.toMatch(/btn-reg(?!ister)/);  // old class gone, new --register OK
-            expect(stripped).toMatch(/<div class="dnc-dash-quick-actions"/);
-            expect(stripped).toMatch(/dnc-dash-quick-card--register/);
-            expect(stripped).toMatch(/dnc-dash-quick-card--claim/);
-            expect(stripped).toMatch(/dnc-dash-quick-card--transfer/);
+            expect(stripped).not.toMatch(/btn-reg(?!ister)/);  // old class gone
+            // V.32.0 — row REMOVED
+            expect(stripped).not.toMatch(/<div class="dnc-dash-quick-actions"/);
+            expect(stripped).not.toMatch(/dnc-dash-quick-card--register/);
+            expect(stripped).not.toMatch(/dnc-dash-quick-card--claim/);
+            expect(stripped).not.toMatch(/dnc-dash-quick-card--transfer/);
             expect(stripped).not.toMatch(/<div class="dnc-sn-notif-settings"/);
             // V.31.16 — notif link removed (settings ONLY in Profile)
             expect(stripped).not.toMatch(/href="\/edit-profile\/#sec-notif"/);
         });
 
-        test('W7.1 V.31.16 — logo CSS specificity boost + !important (10+ rounds bug fix)', () => {
+        test('W7.1 V.32.0 — logo inline SVG wordmark replaces PNG (11-round cascade war ended)', () => {
             const code = readByPath(HEADER_PATH);
             const stripped = code
                 .replace(/<!--[\s\S]*?-->/g, '')
                 .replace(/<\?php[\s\S]*?\?>/g, '')
                 .replace(/\/\*[\s\S]*?\*\//g, '')
                 .replace(/^\s*\/\/.*$/gm, '');
-            expect(stripped).toMatch(/src="https:\/\/www\.dinoco\.in\.th\/wp-content\/uploads\/2026\/01\/sss\.png"/);
-            expect(stripped).toMatch(/class="card-title-mark"/);
+            // V.32.0 — PNG GONE
+            expect(stripped).not.toMatch(/src="https:\/\/www\.dinoco\.in\.th\/wp-content\/uploads\/2026\/01\/sss\.png"/);
+            expect(stripped).not.toMatch(/<img[^>]*class="card-title-mark"/);
             expect(stripped).not.toMatch(/<span class="card-title-wordmark">/);
-            // V.31.15: 7px / 40px (half of V.31.14)
-            expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*10px/);
+            // V.32.0 — SVG present with brand attributes
+            expect(stripped).toMatch(/<svg class="card-title-mark"[\s\S]*?aria-label="DINOCO"/);
+            expect(stripped).toMatch(/width="64"[^>]*height="11"/);
+            expect(stripped).toMatch(/<text[^>]*>DINOCO<\/text>/);
+            // V.32.0 — !important specificity war rules REMOVED (SVG bypasses cascade)
+            expect(code).not.toMatch(/\.card-title-mark[\s\S]{0,200}?height:\s*10px\s*!important/);
         });
 
         test('W7 SnTierBadgeTest helper test file exists with required cases', () => {
