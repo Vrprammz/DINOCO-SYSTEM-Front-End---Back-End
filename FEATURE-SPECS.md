@@ -4273,3 +4273,71 @@ npm run build:liff
 4. **Phase 4**: Cleanup — drop inline blocks + fallback flag
 
 **Rollback**: flip flag OFF → instant revert to inline rendering.
+
+---
+
+## Claim Lifecycle (Sprint 13-35, 2026-05-13 → 2026-05-14)
+
+### Overview
+
+19-sprint campaign collapsing claim payment + history standalone LIFF pages into the Member Dashboard hub. Spans charge FSM design (Sprint 13) through Flash dispatcher integration (Sprint 23-28), Phase 4 polish (Sprint 29-31), Sprint 32 deprecation + redirect, Sprint 33 dual UX audit, Sprint 34 visual polish, and Sprint 35 notification settings relocation.
+
+### Sprint 13 — Charge FSM + Schema (Phase 2.5)
+
+NEW `wp_dinoco_claim_charges` schema. FSM: `pending → notified → slip_uploaded → verified → paid → refund_requested → refunded / cancelled`. Audit log `wp_dinoco_claim_charge_audit`. 5 REST endpoints (charge-create, charge-get, slip-upload, refund, list). Flex dispatch on FSM transitions.
+
+### Sprint 14-22 — Iterative remediation (10 sprints)
+
+8 CRIT + 14 HIGH from code-reviewer agents closed across 10 sprints. Sprint 15 added amount snapshot + consent token. Sprint 17 charge-create modal trigger in Service Center. Sprint 19 code-reviewer remediation (1 CRIT + 4 HIGH + 2 MED). Sprint 20 Phase 2.7 customer LIFF + Slip2Go verify + slip viewer + transfer hook. Sprint 22 boss DB_ID 1214 + audit remediation.
+
+### Sprint 23-28 — Flash Dispatcher (Phase 3.1-3.6)
+
+Sprint 23: Flash Dispatcher live (DB_ID 1213). Routes through `b2b_flash_dispatch_create_all()` (V.42 hardening reuse). Sprint 25-27: code-reviewer remediation (2 CRIT + 3 HIGH + audit polish 3 items). Sprint 28 Phase 3.3+3.6: Service Center admin UI section + RPi print queue enqueue + Customer-facing Notifier (Lifecycle Notifier V.0.9).
+
+### Sprint 29-31 — Phase 4 Polish (3 batches)
+
+- **Batch A (Sprint 29, commit `42ebfdc`)**: CSV export `/charges/export` + notif-log filter dashboard + Health Monitor claim cards
+- **Batch B (Sprint 30, commit `3e2a113`)**: Refund audit dashboard + multi-shipment grouping (Flash dispatcher supports multiple replacement parts grouped per claim) + pickup-at-warehouse opt-in
+- **Batch C (Sprint 31, commit `55ff312`)**: Customer LIFF history endpoints `/my-charges` + `/my-flash` (inline rendering in Assets List)
+
+### Sprint 32 — Standalone LIFF deprecation (2026-05-14, commit `470cd63`)
+
+`[dinoco_claim_pay]` V.0.10 → V.0.11: now serves redirect-only behavior. Flex deep-links `/claim-pay/?claim_id=X&charge_id=Y` 301 → `/dashboard/?action=pay&claim_id=X&charge_id=Y#claim-card-{id}` (Member Dashboard hub anchor).
+
+Assets List V.32.0: NEW helper `dinoco_dashboard_get_pending_charge_for_claim($claim_id)` reads `wp_dinoco_claim_charges` → surfaces unpaid charge per claim card → inline "ชำระเงิน" CTA + modal trigger. Same hub, same session = canonical surface.
+
+### Sprint 33 — Dual UX audit (2026-05-14, commit `4f9584a`)
+
+5 BLOCKERs + 7 SHOULD-FIX closed via dual UX audit agent dispatch. Inline payment modal accessibility (focus trap + ESC), refund consent prompt, slip-upload progress feedback, error states.
+
+### Sprint 34 — Member Card visual polish (2026-05-14, 5 commits `e3193a7..ec3da53`)
+
+Boss screenshot iteration loop (5 commits in one day):
+
+1. `e3193a7` V.31.8 — Member Card text "DINOCO THAILAND" → logo image
+2. `8ca1a64` V.31.9 — logo shrink #1 (match original text size)
+3. `b59e649` V.32.2 — legacy plastic-card migration card redesign (amber warning via Design Tokens V.1.3)
+4. `89fc55e` V.31.10 + V.31.11 — remove 3-button row + logo shrink #2 (absolute cap)
+5. `ec3da53` V.31.12 — restore claim+transfer cards (boss "เมนูสำคัญหายไป") + logo shrink #3
+
+**Lesson**: over-deletion is worse than over-design. When removing "duplicates", verify each is truly redundant. ลงทะเบียน was scan dupe (correct delete) but แจ้งเคลม + โอนสิทธิ์ were primary actions (wrong delete, restored in V.31.12).
+
+### Sprint 35 — A1 + A2 parallel agents (in flight, 2026-05-14)
+
+- **A1 — Header & Forms V.31.13**: 3-col action row (claim / SCAN / transfer) + logo wordmark pivot finalized (image → text wordmark, more controllable at low DPI on LIFF) + notif accordion removed from Home
+- **A2 — Edit Profile V.35.0**: NEW "🔔 การแจ้งเตือน" section — notification settings relocated from Home (Member Dashboard Main) to centralized profile edit page per boss UX directive 2026-05-14
+- **A3 — Documentation sync (this entry)**: SYSTEM-REFERENCE.md + WORKFLOW-REFERENCE.md + FEATURE-SPECS.md + `.second-brain/log.md` + CHANGELOG.md updated
+
+### Files affected (Sprint 32-35)
+
+- `[System] Dashboard - Header & Forms` V.31.7 → V.31.13 (pending A1)
+- `[System] Dashboard - Assets List` V.32.0 → V.32.2
+- `[System] Member Dashboard Main` V.31.8 → V.32.1
+- `[System] DINOCO Edit Profile` V.34.3 → V.35.0 (pending A2)
+- `[System] DINOCO Claim Payment LIFF` V.0.9 → V.0.11 (DEPRECATED redirect)
+- `[Admin System] DINOCO Claim Lifecycle Notifier` V.0.8 → V.0.9
+- `[Admin System] DINOCO Service Center & Claims` V.30.3 → V.31.7
+
+### Rollback strategy
+
+Standalone LIFF `/claim-pay/` deprecation: 60-day customer cache TTL window before full removal. During window, Flex payloads from pre-Sprint-32 LINE messages still route via 301 redirect. Member Dashboard inline rendering is additive (does not break old code paths).

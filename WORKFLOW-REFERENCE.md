@@ -3888,3 +3888,80 @@ graph TB
 ```
 
 All 6 helpers `function_exists()` guarded — Member Dashboard renders empty/zero when SN system not active (Phase 2 W7 atomic deploy gate). PHPUnit `tests/helpers/SnMemberHelpersTest.php` covers status whitelist sanitization + days_window clamping + member_years math + user_id validation.
+
+---
+
+## 16. Claim Lifecycle — Customer Payment Journey (Sprint 13-32, 2026-05-13/14)
+
+### 16.1 Old flow (DEPRECATED, pre-Sprint 32)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Customer (LINE)
+    participant LB as LINE Bot
+    participant CP as /claim-pay/?...<br/>[dinoco_claim_pay] (STANDALONE)
+    participant S2G as Slip2Go API
+    participant AD as Admin (Service Center)
+
+    AD->>LB: charge-create → Flex push customer
+    LB->>C: "ค่าซ่อม ฿X — ชำระเลย"
+    C->>CP: tap Flex CTA → standalone LIFF page
+    Note over CP: Disconnected from Member Dashboard<br/>(separate session, separate UX)
+    C->>CP: upload slip
+    CP->>S2G: verify
+    S2G-->>CP: ok
+    CP-->>AD: charge.status=paid
+```
+
+**Pain points**: customer ออกจาก Member Dashboard hub → standalone page → กลับมาดูประวัติเคลม ก็ไปอีกหน้า `/claim-history/` → 3 surfaces ต้อง maintain.
+
+### 16.2 New flow (Sprint 32+33, 2026-05-14)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Customer (LINE)
+    participant LB as LINE Bot
+    participant MD as Member Dashboard<br/>[dinoco_dashboard]
+    participant AL as Assets List V.32.2<br/>[dinoco_dashboard_assets]
+    participant S2G as Slip2Go API
+    participant AD as Admin
+
+    AD->>LB: charge-create (dinoco-claim/v1)
+    LB->>C: Flex "ค่าซ่อม ฿X" → deep-link<br/>/dashboard/?action=pay&claim_id=X&charge_id=Y
+    C->>MD: tap Flex CTA
+    MD->>AL: render assets list
+    AL->>AL: anchor scroll #claim-card-{id}
+    AL->>AL: auto-open inline payment modal
+    Note over AL: Same hub, same session<br/>(canonical surface)
+    C->>AL: upload slip → POST /charge/{id}/slip-upload
+    AL->>S2G: verify
+    S2G-->>AL: ok → charge.status=paid
+    AL-->>AD: notify (Phase 3.6 Notifier)
+    AL->>AL: claim history visible inline (Phase 4 Batch C)
+```
+
+**Sprint 32 deprecation**: `[dinoco_claim_pay]` shortcode V.0.11 returns 301 redirect to canonical Dashboard URL. Standalone `/claim-pay/` + `/claim-history/` LIFF pages collapsed → ONE surface (Member Dashboard hub pattern).
+
+**Helper `dinoco_dashboard_get_pending_charge_for_claim($claim_id)`** in Assets List V.32.2 — reads `wp_dinoco_claim_charges` (Sprint 13 schema) → surfaces unpaid charge per claim card → inline "ชำระเงิน" CTA + modal trigger.
+
+**Sprint 33 dual UX audit** closed 5 BLOCKERs + 7 SHOULD-FIX (boss screenshot iteration loop). **Sprint 34** polished Member Card 4 logo-shrink iterations → text wordmark pivot. **Sprint 35 A1** (in flight): 3-col action row (claim/SCAN/transfer) + notif accordion removed (relocated to Edit Profile A2 V.35.0 NEW "🔔 การแจ้งเตือน" section).
+
+### 16.3 Charge FSM (Sprint 13)
+
+```text
+pending → notified → slip_uploaded → verified → paid
+                                       ↓
+                              refund_requested → refunded
+                                       ↓
+                                   cancelled
+```
+
+Audit log `wp_dinoco_claim_charge_audit` records all transitions with `actor_user_id`. Idempotency-Key wrapper on `/charge-create` + `/charge/{id}/refund` prevents double-charge under retry (Round 30+ pattern).
+
+### 16.4 Phase 4 Polish endpoints (Sprint 29-31)
+
+- **Batch A (Sprint 29)**: CSV export `/charges/export` + notif-log filter dashboard + Health Monitor claim cards
+- **Batch B (Sprint 30)**: Refund audit dashboard + multi-shipment grouping (Flash dispatcher) + pickup-at-warehouse opt-in
+- **Batch C (Sprint 31)**: Customer LIFF history `/my-charges` + `/my-flash` (inline rendering in Assets List)

@@ -96,16 +96,16 @@
 |------|---------|-------|-----------|-------------|
 | [System] DINOCO Gateway | V.30.2 | 9 | `[dinoco_login_button]` | LINE Login card UI |
 | [System] LINE Callback | V.30.3 | 10 | `[dinoco_gateway]` | OAuth callback + warranty registration + login_error UI |
-| [System] Member Dashboard Main | V.30.2 | 11 | `[dinoco_dashboard]` | Main controller, routing, rate limiting |
+| [System] Member Dashboard Main | V.32.1 | 11 | `[dinoco_dashboard]` | Main controller, routing, rate limiting. **Sprint 32 (2026-05-14)**: hosts inline claim payment + claim history sections (anchors `#claim-card-{id}` for deep-link from LINE Flex `?action=pay&claim_id=X&charge_id=Y`). Sprint 33 closed 5 BLOCKERs + 7 SHOULD-FIX from dual UX audit. |
 | [System] author profile line | V.30.3 | 12 | -- | LINE profile picture (WP default avatar fallback) |
 | [System] Dinoco Custom Header | V.30.2 | 13 | -- | Hide admin bar for non-admin users |
 | [System] Transfer Warranty Page | V.30.2 | 15 | `[dinoco_transfer_sys]` / `[dinoco_transfer_v3]` | Warranty ownership transfer |
 | [System] DINOCO Claim System | V.30.2 | 16 | `[dinoco_claim_page]` | Claim submission + PDF generation |
 | [System] DINOCO Global App Menu | V.31.1 | 17 | -- | Bottom navigation bar (native app style) |
-| [System] DINOCO Edit Profile | V.34.3 | 18 | `[dinoco_edit_profile]` | User profile edit (Facebook-style view/edit toggle) |
+| [System] DINOCO Edit Profile | V.34.3 (V.35.0 pending Sprint 35 A2) | 18 | `[dinoco_edit_profile]` | User profile edit (Facebook-style view/edit toggle). **Sprint 35 A2 (in flight)**: NEW "🔔 การแจ้งเตือน" section — notification settings relocated from Home (Member Dashboard Main) → centralized here per boss UX directive 2026-05-14. |
 | [System] Legacy Migration Logic | V.30.2 | 19 | `[dinoco_legacy_migration]` | Legacy warranty migration (admin-ajax) |
-| [System] Dashboard - Header & Forms | V.30.3 | 28 | `[dinoco_dashboard_header]` | Sidebar, profile card, PDPA, registration forms |
-| [System] Dashboard - Assets List | V.30.2 | 29 | `[dinoco_dashboard_assets]` | Assets list with bundle support |
+| [System] Dashboard - Header & Forms | V.31.12 (V.31.13 pending Sprint 35 A1) | 28 | `[dinoco_dashboard_header]` | Sidebar, profile card, PDPA, registration forms. **Sprint 34 (2026-05-14)**: Member Card text "DINOCO THAILAND" → logo image (V.31.8) → 4 shrink iterations → text wordmark pivot. V.31.10 removed 3-button row → V.31.12 restored 2 cards (แจ้งเคลม + โอนสิทธิ์) after boss "เมนูสำคัญหายไป" feedback. **Sprint 35 A1 (in flight)**: V.31.13 — 3-col action row (claim/SCAN/transfer), logo wordmark pivot finalized, notif accordion removed (moved to Edit Profile A2). |
+| [System] Dashboard - Assets List | V.32.2 | 29 | `[dinoco_dashboard_assets]` | Assets list with bundle support. **Sprint 32 (2026-05-14)**: claimed-state cards render inline payment section when `?action=pay&claim_id=X&charge_id=Y` matches — replaces standalone `/claim-pay/` LIFF. **Sprint 33**: dual UX audit fixes. **V.32.2 (2026-05-14)**: legacy plastic-card migration CTA redesign — amber warning card via Design Tokens V.1.3. NEW helper `dinoco_dashboard_get_pending_charge_for_claim($claim_id)` reads `wp_dinoco_claim_charges` to surface unpaid charge per claim. |
 | [System] DINOCO MCP Bridge | V.2.2 | 1050 | -- | REST API Bridge for OpenClaw (32 endpoints, per-lead storage) |
 | [System] DINOCO GDPR Data Requests | V.1.0 | pending | -- | **NEW (Phase 5, 2026-04-17)** — Thai PDPA compliance stubs. 3 endpoints `/wp-json/dinoco-gdpr/v1/{my-data-export,my-data-delete,my-data-status}`. Flag `dinoco_gdpr_enabled` default OFF → returns 503. Schema `wp_dinoco_gdpr_requests` (id, user_id, type, status, created_at, processed_at, notes) lazy-install via `dbDelta` on first use. Data scope: wp_users + wp_usermeta + distributor CPT + warranties + claims + B2B orders + LINE messages (via agent:3000). Full impl + admin review UI deferred to Phase 6. |
 | [System] DINOCO LIFF Asset Loader | V.1.0 | pending | -- | **NEW (Phase 6, 2026-04-17)** — Manifest-based Vite build enqueue helper. `dinoco_liff_enqueue($entry_name)` reads `dist/liff/manifest.json` and enqueues the hashed JS + CSS assets. **Scaffold only** — no active call yet (inline rendering in Snippet 4 intact as fallback). Future: Snippet 4 migration will call `dinoco_liff_enqueue('b2b-catalog')` + drop inline blocks. Goal: address PERF-H6 (155KB inline → <10KB shell). |
@@ -113,6 +113,10 @@
 | [System] DINOCO Warranty Activation LIFF | V.0.1 | 1197 | `[dinoco_warranty_activate]` | **NEW (v2.13 Phase 1, 2026-05-04)** — Customer-facing LIFF route `/warranty/activate?sn=...`. 5 UX states (landing/form/already_registered/not_yet_shipped/error). D11 fix: LINE OAuth + WP session reuse (NO new JWT). Atomic activate handler: SELECT FOR UPDATE + flip status=registered + create warranty_registration CPT + mirror serial_code ACF backward compat. |
 | [System] DINOCO SN Quick Lookup | V.0.2 | 1198 | `[dinoco_sc_quick_lookup]` | **NEW (v2.13 Phase 3 W8.5, 2026-05-04)** — Mobile-first read-only verify shortcode for Service Center walk-in lookup. Permission: `dinoco_sn_warehouse` OR `manage_options`. 48px touch targets, USB barcode scanner support, status-aware action hints. Wires to `/sc-lookup/{sn}` (warehouse cap) instead of admin-only `/sn/{sn}`. |
 | [System] DINOCO Stolen Plate Public Verify | V.0.1 | 1199 | `[dinoco_stolen_check]` | **NEW (v2.13 Phase 3 W11 F#14, 2026-05-05)** — Public-facing verify shortcode for police/insurance/dealer to check plate before second-hand resale. Wires to `/dinoco-sn/v1/stolen/verify/{sn}` (boolean only — no PII oracle leak, 5-min cache, 30/min/IP rate limit). REG-082 alignment: uses "มีรายงานในระบบ" never "ถูกแจ้งหาย" (anti social-engineering). Self-contained CSS+JS scoped `.dnc-sn-stolen-*`. |
+| [System] DINOCO Claim Payment LIFF | V.0.11 **DEPRECATED** | 1212 | `[dinoco_claim_pay]` | **DEPRECATED (Sprint 32, 2026-05-14)** — Standalone `/claim-pay/?claim_id=X&charge_id=Y` LIFF page collapsed into Member Dashboard. Now serves redirect-only behavior: incoming Flex deep-links 301 → `/dashboard/?action=pay&claim_id=X&charge_id=Y#claim-card-{id}` (Sprint 33 closed 5 BLOCKERs from dual UX audit). Standalone slip-upload + Slip2Go verify logic still hot for legacy LINE Flex payloads pre-2026-05-14. Removal pending 60-day customer cache TTL. |
+| [Admin System] DINOCO Claim Charges Schema | V.0.1 | (Phase 2.5) | -- | **NEW (Claim Lifecycle Sprint 13-22, 2026-05-13/14)** — `wp_dinoco_claim_charges` schema (charge FSM: pending → notified → slip_uploaded → verified → paid → refund_requested → refunded / cancelled). Atomic helper `dinoco_claim_charge_*`. Idempotency-Key wrappers on create + refund. Audit log `wp_dinoco_claim_charge_audit`. Sprint 13-22 closed 8 CRIT + 14 HIGH from code-reviewer agents across 10 sprints. |
+| [Admin System] DINOCO Claim Flash Dispatcher | V.0.4 | 1213 | -- | **NEW (Claim Lifecycle Phase 3.1-3.3, Sprint 23-27, 2026-05-13/14)** — Flash shipping integration for claim replacement parts. Routes through `b2b_flash_dispatch_create_all()` (V.42 hardening reuse). **Phase 3.3 (Sprint 28, 2026-05-14)**: Service Center admin UI section + RPi print queue enqueue. Multi-shipment grouping (Phase 4 Batch B, Sprint 30). Pickup-at-warehouse opt-in. |
+| [Admin System] DINOCO Claim Lifecycle Notifier | V.0.9 | -- | -- | **NEW (Phase 3.6, Sprint 28, 2026-05-14)** — Customer-facing notifications for claim status changes. **Phase 4 Batch A (Sprint 29, 2026-05-14)**: notif-log filter dashboard. Hooks fire on charge FSM transitions + flash dispatch + refund issued. LINE push via shared `b2b_line_push` helper. |
 
 ### 2.2 [Admin System] -- Admin/Management
 
@@ -123,7 +127,7 @@
 | [Admin System] DINOCO Legacy Migration Requests | V.30.2 | 23 | `[dinoco_admin_legacy]` | Admin legacy migration manager |
 | [Admin System] DINOCO User Management | V.30.2 | 25 | `[dinoco_admin_users]` | CRM + full analytics |
 | [Admin System] DINOCO Manual Transfer Tool | V.30.2 | 26 | `[dinoco_admin_transfer]` | Force transfer warranty ownership |
-| [Admin System] DINOCO Service Center & Claims | V.30.3 | 27 | `[dinoco_admin_claims]` | Claims management + auto-close 3 statuses (30d) |
+| [Admin System] DINOCO Service Center & Claims | V.31.7 | 27 | `[dinoco_admin_claims]` | Claims management + auto-close 3 statuses (30d). **Sprint 17+23+28 (2026-05-13/14)**: charge-create modal trigger (Sprint 17 Phase 2.6) + Flash shipping UI (Phase 3.3, Sprint 28) + Phase 4 Batch A CSV export + Phase 4 Batch B refund audit dashboard + multi-shipment grouping + pickup-at-warehouse opt-in. |
 | [Admin System] AI Control Module | V.30.2 | 35 | `[dinoco_admin_ai_control]` | AI Command Center (Gemini v22.0 function calling) |
 | [Admin System] KB Trainer Bot v2.0 | V.30.3 | 62 | -- | Knowledge Base trainer (Gemini, limit 200 entries) |
 | [Admin System] DINOCO Manual Invoice System | V.34.10 | 598 | `[dinoco_manual_invoice]` | Manual billing for B2B distributors |
@@ -600,6 +604,28 @@ Partner types: dealer / insurance / government / other. Token format: `pk_<32hex
 ### 3.12 MCP Bridge S/N integration (`/wp-json/dinoco-mcp/v1/sn-lookup`)
 
 Added in `[System] DINOCO MCP Bridge` V.2.9 (V.2.13 Phase 4 W14 prep) — chatbot-bound endpoint. PII-stripped output. Used by OpenClaw `dinoco-tools.js` 3 tools post-refactor: `dinoco_warranty_check` (extended return shape) + `dinoco_serial_lookup` (NEW canonical) + `dinoco_create_claim` (validates against sn_pool before insert). Section 15 chatbot rules govern usage.
+
+### 3.13 Claim Lifecycle (`/wp-json/dinoco-claim/v1/`) — Sprint 13-31 (2026-05-13/14)
+
+NEW namespace introduced across 19 sprints (Sprint 13 Phase 2.5 → Sprint 31 Phase 4 closure). Permission matrix: customer endpoints (WP login + ownership check) / admin endpoints (`manage_options` + nonce) / Service Center subset (`dinoco_sn_warehouse` cap).
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/charge-create` | manage_options + Idem-Key | Admin creates pending charge on claim (Sprint 17 Phase 2.6). Body: `{claim_id, amount, reason, consent_token}`. Triggers customer LINE Flex with deep-link `/dashboard/?action=pay&claim_id=X&charge_id=Y`. |
+| GET | `/charge/{id}` | WP login + ownership OR manage_options | Charge detail + FSM state (Sprint 17). |
+| POST | `/charge/{id}/slip-upload` | WP login + ownership | Customer uploads payment slip → Slip2Go verify (Sprint 20 Phase 2.7). |
+| POST | `/charge/{id}/refund` | manage_options + Idem-Key + 4-eyes ≥฿5K | Admin issues refund. Phase 4 Batch B (Sprint 30): audit dashboard surfaces refund history. |
+| GET | `/charges/export` | manage_options | CSV export with date range + status filter (Phase 4 Batch A, Sprint 29). |
+| GET | `/my-charges` | WP login | Customer's own charges list (Sprint 32 — inline rendering in Member Dashboard via `dinoco_dashboard_get_pending_charge_for_claim()` helper). |
+| GET | `/my-flash` | WP login | Customer's Flash tracking for claim replacement parts (Phase 4 Batch C, Sprint 31). |
+| POST | `/pickup-at-warehouse` | WP login + ownership | Customer opt-in: pickup at warehouse instead of Flash ship (Phase 4 Batch B, Sprint 30). |
+| GET | `/notif-log` | manage_options | Notification audit log with status × type × date filters (Phase 4 Batch A, Sprint 29). |
+| POST | `/flash-dispatch` | manage_options + Idem-Key | Trigger Flash secondary order for claim replacement (Sprint 23 Phase 3.1, DB_ID 1213). Routes through `b2b_flash_dispatch_create_all()`. |
+| POST | `/flash-print-enqueue` | manage_options | Enqueue Flash label to RPi print queue (Phase 3.3, Sprint 28). |
+
+**Sprint 32 deprecation**: `[dinoco_claim_pay]` standalone shortcode now serves redirect only. All payment + history UX collapsed into `[dinoco_dashboard_assets]` claimed-state cards (anchor `#claim-card-{id}` from LINE Flex deep-link).
+
+**Idempotency wrappers (Sprint 13-22)**: `charge-create` + `refund` + `flash-dispatch` integrated with Round 30+ pattern (`actor_user_id` included in hash).
 
 ---
 

@@ -10,6 +10,41 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Refactor — Sprint 32-35 Claim Lifecycle UX consolidation (2026-05-14)
+
+19-sprint Claim Lifecycle campaign culminated in Sprint 32 deprecation of standalone `/claim-pay/` + `/claim-history/` LIFF pages → collapsed into Member Dashboard hub (canonical surface pattern).
+
+**Commits (12+ session)**:
+
+- `a00f19e` Phase 3.3+3.6 — Service Center Flash UI + RPi enqueue + Customer Notifier V.0.9
+- `42ebfdc` Phase 4 Batch A — CSV export `/charges/export` + notif-log filter dashboard + Health Monitor claim cards
+- `3e2a113` Phase 4 Batch B — Refund audit dashboard + multi-shipment grouping + pickup-at-warehouse opt-in
+- `55ff312` Phase 4 Batch C — Customer LIFF history `/my-charges` + `/my-flash` (inline rendering)
+- `470cd63` Sprint 32 — Claim Pay + History → Member Dashboard integration (standalone LIFF DEPRECATED, redirect-only)
+- `4f9584a` Sprint 33 — 5 BLOCKERs + 7 SHOULD-FIX dual UX audit
+- `e3193a7` V.31.8 — Member Card text → logo image (Sprint 34 start)
+- `8ca1a64` V.31.9 — logo shrink #1
+- `b59e649` V.32.2 — legacy plastic-card migration card redesign (amber via Design Tokens V.1.3)
+- `89fc55e` V.31.10+V.31.11 — remove 3-button row + logo shrink #2 (absolute cap)
+- `ec3da53` V.31.12 — restore claim+transfer cards (boss "เมนูสำคัญหายไป") + logo shrink #3
+- (pending) Sprint 35 A1 V.31.13 — 3-col action row + logo wordmark pivot + notif accordion removed
+- (pending) Sprint 35 A2 Edit Profile V.35.0 — NEW "🔔 การแจ้งเตือน" section relocation
+- (this commit) Sprint 35 A3 — Documentation sync: SYSTEM-REFERENCE + WORKFLOW-REFERENCE + FEATURE-SPECS + log.md + CHANGELOG
+
+**Files affected**:
+
+- `[System] Dashboard - Header & Forms` V.31.7 → V.31.13 (pending A1)
+- `[System] Dashboard - Assets List` V.32.0 → V.32.2 (NEW helper `dinoco_dashboard_get_pending_charge_for_claim()`)
+- `[System] Member Dashboard Main` V.31.8 → V.32.1 (hosts inline claim payment + history sections, anchor `#claim-card-{id}`)
+- `[System] DINOCO Edit Profile` V.34.3 → V.35.0 (pending A2)
+- `[System] DINOCO Claim Payment LIFF` V.0.9 → V.0.11 (DEPRECATED redirect 301 → `/dashboard/?action=pay&...`)
+- `[Admin System] DINOCO Claim Lifecycle Notifier` V.0.8 → V.0.9
+- `[Admin System] DINOCO Service Center & Claims` V.30.3 → V.31.7
+
+**REST endpoints added (`/wp-json/dinoco-claim/v1/`)**: charge-create, charge/{id}, slip-upload, refund, charges/export, my-charges, my-flash, pickup-at-warehouse, notif-log, flash-dispatch, flash-print-enqueue.
+
+**Lessons**: Over-deletion is worse than over-design — when removing "duplicates", verify each is truly redundant. Image logos at low DPI scale poorly on LIFF → text wordmark wins. Boss screenshot feedback = highest-fidelity UX signal (3-4 iterations normal).
+
 ### Feature — Vite LIFF AI Frontend (Snippet 2) code port Round 4 — inline-bridge cleanup — ALL 4 LIFF SURFACES R4 COMPLETE (2026-05-02)
 
 Final Round 4 of the four LIFF surfaces (b2b-catalog / b2f-maker / b2f-catalog / liff-ai). Drops the V.0.4 legacy `window.*` bridge globals (13 dropped) and replaces inline `onclick=` in `pages/agentChat.js` with a declarative `data-action="..."` taxonomy consumed by a single click + change + submit listener on the root mount. Inline `[LIFF AI] Snippet 2: Frontend` V.3.10 stays untouched — REG-029 byte-identical preserved until Round 5 destructive cut-over (drop inline JS blocks pending user confirmation + 1-week canary).
