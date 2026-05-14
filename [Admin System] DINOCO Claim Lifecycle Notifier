@@ -1,6 +1,28 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Claim Lifecycle Notifier                  ║
+ * ║  Version: V.0.5 (2026-05-14) — Sprint 13 Phase 2.5 charge state  ║
+ * ║    dispatch + 2 crons (per orchestrator FINAL bindings B3+B4).    ║
+ * ║    • NEW DINOCO_CLAIM_NOTIF_CHARGE_DISPATCH_TABLE constant       ║
+ * ║      (6 schema-state → builder map; cancelled omitted by         ║
+ * ║      design — admin-initiated, no customer notify).              ║
+ * ║    • NEW listener dinoco_claim_notify_charge_state_changed at    ║
+ * ║      priority 20 on `dinoco/claim/charge_state_changed`. Mirrors ║
+ * ║      status-listener defenses: idempotency wrap (namespace       ║
+ * ║      `claim-charge-notif`, body hash {charge_id, to_state,       ║
+ * ║      actor_user_id}) + separate 60s minute-bucket dedup keyed on ║
+ * ║      (charge_id, to_state) per PERF-H2 pattern.                  ║
+ * ║    • NEW dinoco_claim_notif_charge_dispatch core. Resolves       ║
+ * ║      builder via DISPATCH_TABLE, pulls charge row context        ║
+ * ║      (amount/bank snapshot/payment_ref/pay_url), pushes via      ║
+ * ║      b2b_line_push_raw, governance-gates, audits, observability. ║
+ * ║    • 2 cron registrations (helper hooks; actual sweep logic      ║
+ * ║      lives in Claim Payment LIFF V.0.2):                         ║
+ * ║       - dinoco_claim_charge_expire_cron daily 02:25 ICT          ║
+ * ║       - dinoco_claim_charge_pending_review_sweep_cron hourly     ║
+ * ║    • PII guard — slip_image_url NEVER included in Flex context;  ║
+ * ║      only payment_ref + amount + bank snapshot surface to LINE.  ║
+ * ║                                                                  ║
  * ║  Version: V.0.4 (2026-05-14) — Sprint 12 multi-agent audit:       ║
  * ║    • SEC-M1: LINE error body truncate 200→80 chars + scrub UID/  ║
  * ║      email/phone before persist to obs context (PDPA).            ║
@@ -110,7 +132,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // Sentinel marker so Phase 1.3 work knows this snippet is live.
 if ( ! defined( 'DINOCO_CLAIM_LIFECYCLE_NOTIFIER_LOADED' ) ) {
-    define( 'DINOCO_CLAIM_LIFECYCLE_NOTIFIER_LOADED', '0.3' );
+    define( 'DINOCO_CLAIM_LIFECYCLE_NOTIFIER_LOADED', '0.5' );
 }
 
 // Feature flag (default OFF). Stub-like behavior when OFF — pure helpers
@@ -678,10 +700,430 @@ if ( ! function_exists( 'dinoco_claim_notif_rest_resend' ) ) {
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * 4b. CHARGE STATE NOTIFICATIONS (V.0.5 — Sprint 13 Phase 2.5 blocker B3+B4)
+ *
+ * Separate dispatch path from status-listener (different event semantics):
+ *   - Status listener listens `dinoco/claim/state_changed` (11-status claim FSM)
+ *   - Charge listener listens `dinoco/claim/charge_state_changed` (7-state
+ *     financial FSM per DINOCO_CLAIM_CHARGES_STATUS_WHITELIST)
+ *
+ * Builders + dedup transients + idempotency are scoped to their own namespace
+ * so neither flow can starve the other under load.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! defined( 'DINOCO_CLAIM_NOTIF_CHARGE_DISPATCH_TABLE' ) ) {
+    /**
+     * Schema state → Flex builder function name. Per orchestrator B2 binding.
+     *
+     *   pending_payment → b2b_build_flex_claim_charge_request   (initial — "please pay")
+     *   pending_review  → b2b_build_flex_claim_slip_received    (NEW V.34.38 — "got slip, verifying")
+     *   verified        → b2b_build_flex_claim_charge_paid      (success — "paid")
+     *   rejected        → b2b_build_flex_claim_charge_rejected  (critical — "re-upload")
+     *   refunded        → b2b_build_flex_claim_charge_refunded  (V.34.38 red — "refunded")
+     *   expired         → b2b_build_flex_claim_charge_expired   (info — "expired, request new")
+     *   cancelled       → NO Flex (admin-initiated abort; customer notified verbally)
+     *
+     * Constant (not array) — PHP < 7 array-constant restriction safe. Read via
+     * dinoco_claim_notif_charge_builder_for( $state ) helper which decodes.
+     */
+    define( 'DINOCO_CLAIM_NOTIF_CHARGE_DISPATCH_TABLE',
+        'pending_payment=b2b_build_flex_claim_charge_request,' .
+        'pending_review=b2b_build_flex_claim_slip_received,' .
+        'verified=b2b_build_flex_claim_charge_paid,' .
+        'rejected=b2b_build_flex_claim_charge_rejected,' .
+        'refunded=b2b_build_flex_claim_charge_refunded,' .
+        'expired=b2b_build_flex_claim_charge_expired'
+    );
+}
+
+if ( ! function_exists( 'dinoco_claim_notif_charge_builder_for' ) ) {
+    /**
+     * Decode DISPATCH_TABLE constant. Returns builder fn name or '' for states
+     * not in the dispatch table (e.g. 'cancelled' by design).
+     *
+     * @param string $state Schema state from DINOCO_CLAIM_CHARGES_STATUS_WHITELIST
+     * @return string Builder function name, or '' if no dispatch.
+     */
+    function dinoco_claim_notif_charge_builder_for( $state ) {
+        $state = trim( (string) $state );
+        if ( $state === '' ) return '';
+        static $cache = null;
+        if ( $cache === null ) {
+            $cache = array();
+            foreach ( explode( ',', DINOCO_CLAIM_NOTIF_CHARGE_DISPATCH_TABLE ) as $pair ) {
+                $kv = explode( '=', $pair, 2 );
+                if ( count( $kv ) === 2 ) {
+                    $cache[ trim( $kv[0] ) ] = trim( $kv[1] );
+                }
+            }
+        }
+        return isset( $cache[ $state ] ) ? $cache[ $state ] : '';
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_notif_charge_dedup_key' ) ) {
+    /**
+     * Per-(charge, state) dedup transient key. 60s window — mirror PERF-H2.
+     * Distinct namespace from status flow (claim-level) to avoid collision.
+     */
+    function dinoco_claim_notif_charge_dedup_key( $charge_id, $to_state ) {
+        return 'dnc_claim_charge_notif_dedup_' . (int) $charge_id . '_' . preg_replace( '/[^a-z0-9_]/', '', strtolower( (string) $to_state ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_notif_charge_load_row' ) ) {
+    /**
+     * Read charge row. Defensive — returns null when schema not installed
+     * (snippet ordering) or row missing.
+     */
+    function dinoco_claim_notif_charge_load_row( $charge_id ) {
+        global $wpdb;
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            return null;
+        }
+        $table = dinoco_claim_charges_table_name();
+        $row   = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, claim_id, user_id, amount_thb, status, bank_code, bank_account, bank_holder, bank_name, payment_ref, expires_at FROM {$table} WHERE id = %d",
+            (int) $charge_id
+        ), ARRAY_A );
+        return is_array( $row ) ? $row : null;
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_notif_charge_dispatch' ) ) {
+    /**
+     * Core charge-event dispatcher. Mirrors dinoco_claim_notif_dispatch flow
+     * but operates on a charge row + schema state (not 11-status FSM).
+     *
+     * @param int    $claim_id   parent claim_ticket ID
+     * @param int    $charge_id  wp_dinoco_claim_charges.id
+     * @param string $to_state   target schema state (from whitelist)
+     * @param array  $context    actor / amount_thb / reason / verify_method
+     * @return array{sent:bool, reason:string, msg_id:string|null}
+     */
+    function dinoco_claim_notif_charge_dispatch( $claim_id, $charge_id, $to_state, $context = array() ) {
+        $cid  = (int) $claim_id;
+        $chid = (int) $charge_id;
+        if ( $cid <= 0 || $chid <= 0 ) {
+            return array( 'sent' => false, 'reason' => 'invalid_ids', 'msg_id' => null );
+        }
+
+        // 1. Builder gate — cancelled has no builder by design
+        $builder = dinoco_claim_notif_charge_builder_for( $to_state );
+        if ( $builder === '' ) {
+            return array( 'sent' => false, 'reason' => 'no_builder_for_state', 'msg_id' => null );
+        }
+
+        // 2. Dedup (60s)
+        $dedup_key = dinoco_claim_notif_charge_dedup_key( $chid, $to_state );
+        if ( get_transient( $dedup_key ) ) {
+            return array( 'sent' => false, 'reason' => 'dedup_window', 'msg_id' => null );
+        }
+
+        // 3. Load charge row for amount + bank snapshot
+        $row = dinoco_claim_notif_charge_load_row( $chid );
+        if ( $row === null ) {
+            return array( 'sent' => false, 'reason' => 'charge_row_missing', 'msg_id' => null );
+        }
+
+        // 4. Resolve customer user_id — prefer row.user_id, fall back to post_author
+        $user_id = (int) ( isset( $row['user_id'] ) ? $row['user_id'] : 0 );
+        if ( $user_id <= 0 ) {
+            $user_id = (int) get_post_field( 'post_author', $cid );
+        }
+        if ( $user_id <= 0 ) {
+            return array( 'sent' => false, 'reason' => 'no_user', 'msg_id' => null );
+        }
+
+        // 5. Resolve LINE UID
+        $line_uid = (string) get_user_meta( $user_id, 'dinoco_line_uid', true );
+        if ( $line_uid === '' ) {
+            dinoco_claim_notif_append_log( $cid, array(
+                'status'    => 'charge:' . $to_state,
+                'channel'   => 'line_flex',
+                'success'   => false,
+                'error'     => 'no_line_uid',
+                'charge_id' => $chid,
+            ) );
+            return array( 'sent' => false, 'reason' => 'no_line_uid', 'msg_id' => null );
+        }
+
+        // 6. Governance — same `claim_status` bucket per V.1.7 (charge events
+        //    are still claim lifecycle from customer perspective)
+        if ( function_exists( 'dinoco_line_can_push' ) ) {
+            $gate = dinoco_line_can_push( $line_uid, 'claim_status' );
+            if ( ! empty( $gate ) && empty( $gate['allowed'] ) ) {
+                dinoco_claim_notif_append_log( $cid, array(
+                    'status'    => 'charge:' . $to_state,
+                    'channel'   => 'line_flex',
+                    'success'   => false,
+                    'error'     => 'gov_blocked_' . ( isset( $gate['reason'] ) ? $gate['reason'] : 'unknown' ),
+                    'charge_id' => $chid,
+                ) );
+                return array( 'sent' => false, 'reason' => 'gov_blocked', 'msg_id' => null );
+            }
+        }
+
+        // 7. Build Flex — pass charge row context + LIFF pay URL
+        //    PII guard: slip_image_url NEVER passed (would echo customer slip
+        //    image into Flex altText — PDPA). Only amount + bank + ref surface.
+        if ( ! function_exists( $builder ) ) {
+            return array( 'sent' => false, 'reason' => 'builder_missing:' . $builder, 'msg_id' => null );
+        }
+        $flex_ctx = array(
+            'amount_thb'   => isset( $row['amount_thb'] ) ? (float) $row['amount_thb'] : 0.0,
+            'bank_name'    => isset( $row['bank_name'] )    ? (string) $row['bank_name'] : '',
+            'bank_account' => isset( $row['bank_account'] ) ? (string) $row['bank_account'] : '',
+            'bank_holder'  => isset( $row['bank_holder'] )  ? (string) $row['bank_holder'] : '',
+            'payment_ref'  => isset( $row['payment_ref'] )  ? (string) $row['payment_ref'] : '',
+            'pay_url'      => home_url( '/claim-pay/?cid=' . $cid . '&charge=' . $chid ),
+            'reason'       => isset( $context['reason'] ) ? (string) $context['reason'] : '',
+        );
+        $flex = null;
+        try {
+            $flex = call_user_func( $builder, $cid, $flex_ctx );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_charge_notif_builder_threw', array(
+                    'claim_id'  => $cid,
+                    'charge_id' => $chid,
+                    'to_state'  => (string) $to_state,
+                    'builder'   => $builder,
+                    'exception' => $e->getMessage(),
+                ) );
+            }
+            return array( 'sent' => false, 'reason' => 'builder_threw', 'msg_id' => null );
+        }
+        if ( ! is_array( $flex ) || empty( $flex ) ) {
+            return array( 'sent' => false, 'reason' => 'builder_empty', 'msg_id' => null );
+        }
+
+        // 8. Push (same response-shape handling as status listener)
+        $msg_id = null;
+        $push_err = '';
+        try {
+            if ( function_exists( 'b2b_line_push_raw' ) ) {
+                $resp = b2b_line_push_raw( $line_uid, array( $flex ) );
+                if ( $resp === false ) {
+                    $push_err = 'push_helper_unavailable';
+                } elseif ( is_array( $resp ) && isset( $resp['code'] ) ) {
+                    $code = (int) $resp['code'];
+                    if ( $code === 200 ) {
+                        $msg_id = null;
+                    } else {
+                        $raw_body = isset( $resp['body'] ) ? (string) $resp['body'] : '';
+                        if ( $raw_body !== '' ) {
+                            $raw_body = preg_replace( '/U[0-9a-fA-F]{32}/', 'U[REDACTED]', $raw_body );
+                            $raw_body = preg_replace( '/\b[\w.\-+]+@[\w\-]+\.[\w\-.]+\b/', '[EMAIL]', $raw_body );
+                            $raw_body = preg_replace( '/\b0\d{8,9}\b/', '[PHONE]', $raw_body );
+                        }
+                        $body_preview = substr( $raw_body, 0, 80 );
+                        $push_err = 'http_' . $code . ( $body_preview !== '' ? ':' . $body_preview : '' );
+                    }
+                } else {
+                    $push_err = 'unknown_push_response_shape';
+                }
+            } else {
+                $push_err = 'no_line_push_helper';
+            }
+        } catch ( \Throwable $e ) {
+            $push_err = 'exception:' . $e->getMessage();
+        }
+
+        $success = ( $push_err === '' );
+
+        // 9. Push gov log
+        if ( function_exists( 'dinoco_line_log_push' ) ) {
+            try {
+                $gov_reason = $success ? '' : mb_substr( $push_err, 0, 60 );
+                dinoco_line_log_push( (int) $user_id, 'claim_status',
+                    'charge_' . preg_replace( '/[^a-z0-9_]/', '', strtolower( (string) $to_state ) ),
+                    $success, $gov_reason );
+            } catch ( \Throwable $e ) { /* best-effort */ }
+        }
+
+        // 10. Audit
+        dinoco_claim_notif_append_log( $cid, array(
+            'status'    => 'charge:' . $to_state,
+            'channel'   => 'line_flex',
+            'success'   => $success,
+            'msg_id'    => $msg_id,
+            'error'     => $push_err,
+            'charge_id' => $chid,
+        ) );
+
+        if ( ! $success && function_exists( 'dinoco_obs_capture' ) ) {
+            dinoco_obs_capture( 'error', 'claim_charge_notif_push_fail', array(
+                'claim_id'  => $cid,
+                'charge_id' => $chid,
+                'to_state'  => (string) $to_state,
+                'error'     => $push_err,
+            ) );
+        }
+
+        if ( $success ) {
+            set_transient( $dedup_key, 1, 60 );
+        }
+
+        return array(
+            'sent'   => $success,
+            'reason' => $success ? 'ok' : $push_err,
+            'msg_id' => $msg_id,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_notify_charge_state_changed' ) ) {
+    /**
+     * Hook listener for `dinoco/claim/charge_state_changed` action.
+     * Fires POST-COMMIT from REST handlers (Claim Payment LIFF V.0.2).
+     *
+     * Action contract:
+     *   do_action( 'dinoco/claim/charge_state_changed',
+     *       $claim_id, $charge_id, $from_state, $to_state, $context );
+     *
+     * @param int    $claim_id
+     * @param int    $charge_id
+     * @param string $from_state
+     * @param string $to_state
+     * @param array  $context  actor / amount_thb / reason / verify_method
+     */
+    function dinoco_claim_notify_charge_state_changed( $claim_id, $charge_id, $from_state, $to_state, $context = array() ) {
+        // Idempotency wrap per orchestrator B3 binding: body hash {charge_id,
+        // to_state, actor_user_id}. Namespace `claim-charge-notif` distinct
+        // from `claim-notif` (status listener).
+        $idem_key      = '';
+        $actor_uid     = 0;
+        if ( is_array( $context ) && isset( $context['actor_user_id'] ) ) {
+            $actor_uid = (int) $context['actor_user_id'];
+        } elseif ( function_exists( 'get_current_user_id' ) ) {
+            $actor_uid = (int) get_current_user_id();
+        }
+        $body_for_hash = array(
+            'charge_id'     => (int) $charge_id,
+            'to_state'      => (string) $to_state,
+            'actor_user_id' => $actor_uid,
+        );
+        if ( function_exists( 'dinoco_idempotency_hash' ) && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_key = 'claim-charge-notif:' . dinoco_idempotency_hash( $body_for_hash );
+            $cached   = dinoco_idempotency_check( $idem_key, 'claim-charge-notif', $body_for_hash );
+            if ( is_wp_error( $cached ) ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'warning', 'claim_charge_notif_idempotency_conflict', array(
+                        'charge_id' => (int) $charge_id,
+                        'to_state'  => (string) $to_state,
+                    ) );
+                }
+                return;
+            }
+            if ( $cached ) {
+                return;  // already dispatched
+            }
+        }
+
+        try {
+            $result = dinoco_claim_notif_charge_dispatch( (int) $claim_id, (int) $charge_id, (string) $to_state, (array) $context );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_charge_notif_listener_threw', array(
+                    'claim_id'  => (int) $claim_id,
+                    'charge_id' => (int) $charge_id,
+                    'to_state'  => (string) $to_state,
+                    'exception' => $e->getMessage(),
+                ) );
+            }
+            return;
+        }
+
+        if ( $idem_key !== '' && ! empty( $result['sent'] )
+            && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, 'claim-charge-notif',
+                $body_for_hash, $result, 200 );
+        }
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4c. CRON STUBS (V.0.5) — actual sweep logic in Claim Payment LIFF V.0.2.
+ *     Registered here so cron schedule is discoverable from notifier audit UI
+ *     + heartbeat option lands in canonical `dinoco_cron_*_last_run` namespace.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_charge_expire_cron_handler' ) ) {
+    /**
+     * Daily 02:25 ICT sweep — flip `pending_payment` → `expired` where
+     * expires_at < NOW(). Real implementation lives in Claim Payment LIFF;
+     * here we provide hook + heartbeat fallback for boss visibility.
+     */
+    function dinoco_claim_charge_expire_cron_handler() {
+        update_option( 'dinoco_cron_claim_charge_expire_last_run', current_time( 'mysql' ), false );
+        if ( function_exists( 'dinoco_claim_payment_run_expire_sweep' ) ) {
+            try {
+                dinoco_claim_payment_run_expire_sweep();
+            } catch ( \Throwable $e ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'error', 'claim_charge_expire_sweep_threw', array(
+                        'exception' => $e->getMessage(),
+                    ) );
+                }
+            }
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_charge_pending_review_sweep_handler' ) ) {
+    /**
+     * Hourly nudge — alert admin when a charge sits in `pending_review` past
+     * 24h SLA. Real logic in Claim Payment LIFF.
+     */
+    function dinoco_claim_charge_pending_review_sweep_handler() {
+        update_option( 'dinoco_cron_claim_charge_pending_review_last_run', current_time( 'mysql' ), false );
+        if ( function_exists( 'dinoco_claim_payment_run_pending_review_sweep' ) ) {
+            try {
+                dinoco_claim_payment_run_pending_review_sweep();
+            } catch ( \Throwable $e ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'error', 'claim_charge_pending_review_sweep_threw', array(
+                        'exception' => $e->getMessage(),
+                    ) );
+                }
+            }
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_charge_register_crons' ) ) {
+    /**
+     * Schedule both crons on init. Idempotent — wp_next_scheduled guard.
+     */
+    function dinoco_claim_charge_register_crons() {
+        if ( ! wp_next_scheduled( 'dinoco_claim_charge_expire_cron' ) ) {
+            // 02:25 ICT — staggered after SN crons (per CLAUDE.md cron stagger rule)
+            $first_run = strtotime( 'tomorrow 02:25:00' );
+            if ( $first_run !== false ) {
+                wp_schedule_event( $first_run, 'daily', 'dinoco_claim_charge_expire_cron' );
+            }
+        }
+        if ( ! wp_next_scheduled( 'dinoco_claim_charge_pending_review_sweep_cron' ) ) {
+            wp_schedule_event( time() + 600, 'hourly', 'dinoco_claim_charge_pending_review_sweep_cron' );
+        }
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * 5. WIRE-UP (only when feature flag enabled)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 if ( $dinoco_claim_notif_enabled ) {
     add_action( 'dinoco/claim/state_changed', 'dinoco_claim_notify_status_changed', 20, 4 );
+    // V.0.5 — charge state listener (separate from claim status listener)
+    add_action( 'dinoco/claim/charge_state_changed', 'dinoco_claim_notify_charge_state_changed', 20, 5 );
     add_action( 'rest_api_init', 'dinoco_claim_notif_register_rest' );
+
+    // V.0.5 — cron registration + handlers
+    add_action( 'init', 'dinoco_claim_charge_register_crons', 20 );
+    add_action( 'dinoco_claim_charge_expire_cron', 'dinoco_claim_charge_expire_cron_handler' );
+    add_action( 'dinoco_claim_charge_pending_review_sweep_cron', 'dinoco_claim_charge_pending_review_sweep_handler' );
 }

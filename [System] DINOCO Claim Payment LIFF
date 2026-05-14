@@ -1,6 +1,33 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO Claim Payment LIFF                              ║
+ * ║  Version: V.0.2 (2026-05-14) — Sprint 13 Phase 2.5 implementation: ║
+ * ║    FSM helper + 5 REST mutation endpoints + action contract.    ║
+ * ║    Per orchestrator FINAL bindings B1+B3+B4:                    ║
+ * ║      - 7-state FSM (schema authoritative) with 11 transitions   ║
+ * ║      - Transition matrix as constant for PHPUnit determinism    ║
+ * ║      - All mutations atomic: GET_LOCK + START TRANSACTION +     ║
+ * ║        FOR UPDATE + COMMIT/ROLLBACK + finally RELEASE_LOCK      ║
+ * ║      - Idempotency wrap on all POST (Round 30+ pattern)         ║
+ * ║      - Rate limit b2b_rate_limit() per-mutation                 ║
+ * ║      - Post-COMMIT action fire: dinoco/claim/charge_state_changed║
+ * ║        with $context = {actor, amount_thb, reason, verify_method}║
+ * ║    REST endpoints landed (per orchestrator scope = 5 new):      ║
+ * ║      1. POST /charge/{id}/upload-slip  (customer)               ║
+ * ║      2. POST /charge/{id}/verify       (admin/system)           ║
+ * ║      3. POST /charge/{id}/reject       (admin)                  ║
+ * ║      4. POST /charge/{id}/refund       (admin + 4-eyes ≥฿5K)    ║
+ * ║      5. POST /charge/{id}/cancel       (admin)                  ║
+ * ║    Existing in Service Center [#27]: bank-settings GET/POST,     ║
+ * ║    bank-settings/test. Charge create + GET /charge/{id} will be ║
+ * ║    landed in Sprint 13 Phase 2.6 (separate task).                ║
+ * ║                                                                  ║
+ * ║    Sweep helpers used by Notifier crons (V.0.5):                ║
+ * ║      - dinoco_claim_payment_run_expire_sweep — flip pending_    ║
+ * ║        payment → expired where expires_at < NOW().              ║
+ * ║      - dinoco_claim_payment_run_pending_review_sweep — Telegram ║
+ * ║        admin alert on charges stuck > 24h in pending_review.    ║
+ * ║                                                                  ║
  * ║  Version: V.0.1 (2026-05-13) — Stub, Phase 2 implementation      ║
  * ║    pending. Source assignment for sync engine.                   ║
  * ║  DB_ID: 1212 (WP-assigned 2026-05-13 by boss)                    ║
@@ -73,19 +100,497 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-// V.0.1 stub — Phase 2 will replace with REST endpoints + LIFF UI + bank settings admin.
-if ( ! get_option( 'dinoco_claim_payment_enabled', false ) ) {
-    return;
+// V.0.2 — Feature flag gates route registration. Helpers are always defined
+// (pure-logic FSM + transition matrix are unit-testable independent of flag).
+$dinoco_claim_payment_enabled = (bool) get_option( 'dinoco_claim_payment_enabled', false );
+
+if ( ! defined( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED' ) ) {
+    define( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED', '0.2' );
 }
 
-if ( ! defined( 'DINOCO_CLAIM_PAYMENT_LIFF_STUB' ) ) {
-    define( 'DINOCO_CLAIM_PAYMENT_LIFF_STUB', true );
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. FSM HELPER (pure logic — unit-testable, no WP/DB side effects)
+ *
+ *    Schema is authoritative (per orchestrator B1 binding). 7 states + 11
+ *    transitions. Spec aliases mapped:
+ *      spec `slip_uploaded`   → schema `pending_review`
+ *      spec `verify_rejected` → schema `rejected`
+ *      spec `completed`       → DROPPED (verified is success terminal)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! defined( 'DINOCO_CLAIM_CHARGE_FSM_TABLE' ) ) {
+    /**
+     * Transition matrix. Format: "from->to:actor[|actor]" pipe-separated for
+     * actors (so the rule-level comma separator is unambiguous), rules
+     * comma-separated. Encoded as constant string so PHPUnit fixtures can pin
+     * determinism without depending on PHP < 7 array-constant restrictions.
+     */
+    define( 'DINOCO_CLAIM_CHARGE_FSM_TABLE',
+        'pending_payment->pending_review:customer,' .
+        'pending_payment->expired:system,' .
+        'pending_payment->cancelled:admin,' .
+        'pending_review->verified:system|admin,' .
+        'pending_review->rejected:system|admin,' .
+        'pending_review->pending_payment:admin,' .
+        'pending_review->cancelled:admin,' .
+        'verified->refunded:admin,' .
+        'rejected->pending_review:customer,' .
+        'expired->pending_payment:admin,' .
+        'pending_payment->verified:system|admin'  // legacy fast-path (admin manual verify pre-slip, rare)
+    );
 }
 
-// TODO Phase 2 (per FEATURE-SPEC-CLAIM-LIFECYCLE-2026-05-13.md V.2.3 §7):
-//   add_shortcode( 'dinoco_claim_pay', 'dinoco_claim_pay_render' );
-//   add_shortcode( 'dinoco_claim_bank_settings', 'dinoco_claim_bank_settings_render' );
-//   register_rest_route( 'dinoco-claim/v1', '/charge/(?P<id>\\d+)', ... );
-//   register_rest_route( 'dinoco-claim/v1', '/bank-settings', ... );
-//   function dinoco_claim_bank_resolve( $use_walkin = false ) { /* 3-tier */ }
-//   function dinoco_verify_slip_for_claim( $img, $amt, $expected_bank, $expected_acct, $charge_id ) { /* §6.4.1 */ }
+if ( ! function_exists( 'dinoco_claim_charge_fsm_allowed' ) ) {
+    /**
+     * Determine if a transition (from → to) is allowed for an actor.
+     *
+     * @param string $from   schema state (one of DINOCO_CLAIM_CHARGES_STATUS_WHITELIST)
+     * @param string $to     schema state
+     * @param string $actor  one of {customer, admin, system}
+     * @return array{allowed:bool, reason:string}
+     */
+    function dinoco_claim_charge_fsm_allowed( $from, $to, $actor ) {
+        $from  = trim( (string) $from );
+        $to    = trim( (string) $to );
+        $actor = trim( (string) $actor );
+
+        // Schema parity check — verify both states present in whitelist
+        // constant. If drift detected, fail loud (per orchestrator B1 binding).
+        if ( defined( 'DINOCO_CLAIM_CHARGES_STATUS_WHITELIST' ) ) {
+            $whitelist = explode( ',', DINOCO_CLAIM_CHARGES_STATUS_WHITELIST );
+            if ( $from !== '' && ! in_array( $from, $whitelist, true ) ) {
+                return array( 'allowed' => false, 'reason' => 'invalid_from_state:' . $from );
+            }
+            if ( ! in_array( $to, $whitelist, true ) ) {
+                return array( 'allowed' => false, 'reason' => 'invalid_to_state:' . $to );
+            }
+        }
+
+        if ( $from === $to ) {
+            return array( 'allowed' => false, 'reason' => 'terminal_state' );
+        }
+
+        // Decode table once (static cache). Rules comma-separated, actors
+        // pipe-separated (so commas inside actor lists never collide with the
+        // rule-level split).
+        static $matrix = null;
+        if ( $matrix === null ) {
+            $matrix = array();
+            foreach ( explode( ',', DINOCO_CLAIM_CHARGE_FSM_TABLE ) as $rule ) {
+                if ( strpos( $rule, '->' ) === false || strpos( $rule, ':' ) === false ) continue;
+                list( $fromto, $actors ) = explode( ':', $rule, 2 );
+                list( $rf, $rt )         = explode( '->', $fromto, 2 );
+                $key = trim( $rf ) . '->' . trim( $rt );
+                if ( ! isset( $matrix[ $key ] ) ) $matrix[ $key ] = array();
+                $matrix[ $key ] = array_merge( $matrix[ $key ], array_map( 'trim', explode( '|', $actors ) ) );
+            }
+        }
+
+        $key = $from . '->' . $to;
+        if ( ! isset( $matrix[ $key ] ) ) {
+            return array( 'allowed' => false, 'reason' => 'transition_not_in_matrix' );
+        }
+        if ( ! in_array( $actor, $matrix[ $key ], true ) ) {
+            return array( 'allowed' => false, 'reason' => 'actor_not_allowed:' . $actor );
+        }
+        return array( 'allowed' => true, 'reason' => 'ok' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_charge_transition' ) ) {
+    /**
+     * Atomic state transition with GET_LOCK + FOR UPDATE + action fire.
+     *
+     * Pattern (Round 30+ orthodoxy):
+     *   1. GET_LOCK('dnc_claim_charge_{id}', 5s)
+     *   2. START TRANSACTION
+     *   3. SELECT ... FOR UPDATE
+     *   4. FSM validate (from current row state)
+     *   5. UPDATE row + populate audit columns (verified_by/refund_approver_id/etc.)
+     *   6. COMMIT
+     *   7. do_action('dinoco/claim/charge_state_changed', ...) POST-COMMIT
+     *   8. RELEASE_LOCK in finally
+     *
+     * @param int    $charge_id
+     * @param string $to_state
+     * @param string $actor    customer|admin|system
+     * @param array  $context  reason / verify_method / refund_approver_id / etc.
+     * @return array|WP_Error  {old_state, new_state, claim_id} on success
+     */
+    function dinoco_claim_charge_transition( $charge_id, $to_state, $actor, $context = array() ) {
+        global $wpdb;
+        $chid = (int) $charge_id;
+        if ( $chid <= 0 ) return new WP_Error( 'invalid_charge_id', 'Invalid charge_id', array( 'status' => 400 ) );
+
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            return new WP_Error( 'schema_missing', 'Charges schema not installed', array( 'status' => 500 ) );
+        }
+        $table = dinoco_claim_charges_table_name();
+
+        $lock_key = 'dnc_claim_charge_' . md5( (string) $chid );
+        $got_lock = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT GET_LOCK(%s, %d)", $lock_key, 5
+        ) );
+        if ( $got_lock !== 1 ) {
+            return new WP_Error( 'lock_timeout', 'Concurrent update — please retry', array( 'status' => 409 ) );
+        }
+
+        try {
+            $wpdb->query( 'START TRANSACTION' );
+
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, claim_id, user_id, amount_thb, status, verified_by FROM {$table} WHERE id = %d FOR UPDATE",
+                $chid
+            ), ARRAY_A );
+
+            if ( ! $row ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'charge_not_found', 'Charge not found', array( 'status' => 404 ) );
+            }
+
+            $from_state = (string) $row['status'];
+            $decision   = dinoco_claim_charge_fsm_allowed( $from_state, $to_state, $actor );
+            if ( ! $decision['allowed'] ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error(
+                    'fsm_denied',
+                    'Transition denied: ' . $decision['reason'],
+                    array( 'status' => 409, 'from' => $from_state, 'to' => $to_state, 'reason' => $decision['reason'] )
+                );
+            }
+
+            // Build UPDATE column set per target state
+            $set       = array( 'status' => $to_state );
+            $where     = array( 'id' => $chid );
+            $set_fmt   = array( '%s' );
+            $where_fmt = array( '%d' );
+
+            $actor_uid = isset( $context['actor_user_id'] ) ? (int) $context['actor_user_id'] : 0;
+            $now_mysql = current_time( 'mysql' );
+
+            if ( $to_state === 'verified' ) {
+                $set['verified_at'] = $now_mysql;
+                $set['verified_by'] = $actor_uid;
+                $set_fmt[] = '%s'; $set_fmt[] = '%d';
+            } elseif ( $to_state === 'refunded' ) {
+                // 4-eyes: refund_approver_id must differ from verified_by ≥฿5K
+                $amount       = (float) $row['amount_thb'];
+                $verified_by  = (int) $row['verified_by'];
+                $approver     = isset( $context['refund_approver_id'] ) ? (int) $context['refund_approver_id'] : 0;
+                if ( $amount >= 5000.0 ) {
+                    if ( $approver <= 0 ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'four_eyes_required', 'Refund ≥฿5,000 requires refund_approver_id', array( 'status' => 422 ) );
+                    }
+                    if ( $approver === $verified_by ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'four_eyes_self_approval', 'Approver must differ from original verifier', array( 'status' => 409 ) );
+                    }
+                }
+                $set['refund_reason']      = isset( $context['reason'] ) ? mb_substr( (string) $context['reason'], 0, 500 ) : '';
+                $set['refund_approver_id'] = $approver;
+                $set['refunded_at']        = $now_mysql;
+                $set['refunded_by']        = $actor_uid;
+                $set_fmt[] = '%s'; $set_fmt[] = '%d'; $set_fmt[] = '%s'; $set_fmt[] = '%d';
+            }
+
+            $upd = $wpdb->update( $table, $set, $where, $set_fmt, $where_fmt );
+            if ( $upd === false ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'db_update_failed', 'Failed to update charge row', array( 'status' => 500 ) );
+            }
+
+            $claim_id = (int) $row['claim_id'];
+            $amount   = (float) $row['amount_thb'];
+
+            $wpdb->query( 'COMMIT' );
+
+            // POST-COMMIT action fire per orchestrator action contract
+            $action_ctx = array(
+                'actor'         => (string) $actor,
+                'actor_user_id' => $actor_uid,
+                'amount_thb'    => $amount,
+                'reason'        => isset( $context['reason'] ) ? (string) $context['reason'] : '',
+            );
+            if ( isset( $context['verify_method'] ) ) {
+                $action_ctx['verify_method'] = (string) $context['verify_method'];
+            }
+            do_action( 'dinoco/claim/charge_state_changed',
+                $claim_id, $chid, $from_state, $to_state, $action_ctx );
+
+            return array(
+                'charge_id' => $chid,
+                'claim_id'  => $claim_id,
+                'old_state' => $from_state,
+                'new_state' => $to_state,
+            );
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_charge_transition_threw', array(
+                    'charge_id' => $chid,
+                    'to_state'  => (string) $to_state,
+                    'actor'     => (string) $actor,
+                    'exception' => $e->getMessage(),
+                ) );
+            }
+            return new WP_Error( 'transition_exception', 'Transition failed: ' . $e->getMessage(), array( 'status' => 500 ) );
+        } finally {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+        }
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. REST ENDPOINTS (5 mutations) — flag-gated
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_payment_register_rest' ) ) {
+    function dinoco_claim_payment_register_rest() {
+        $base = 'dinoco-claim/v1';
+
+        register_rest_route( $base, '/charge/(?P<id>\\d+)/upload-slip', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_claim_payment_rest_upload_slip',
+            'permission_callback' => 'dinoco_claim_payment_perm_customer',
+            'args' => array( 'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ) ),
+        ) );
+
+        register_rest_route( $base, '/charge/(?P<id>\\d+)/verify', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_claim_payment_rest_verify',
+            'permission_callback' => 'dinoco_claim_payment_perm_admin',
+            'args' => array( 'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ) ),
+        ) );
+
+        register_rest_route( $base, '/charge/(?P<id>\\d+)/reject', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_claim_payment_rest_reject',
+            'permission_callback' => 'dinoco_claim_payment_perm_admin',
+            'args' => array( 'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ) ),
+        ) );
+
+        register_rest_route( $base, '/charge/(?P<id>\\d+)/refund', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_claim_payment_rest_refund',
+            'permission_callback' => 'dinoco_claim_payment_perm_admin',
+            'args' => array( 'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ) ),
+        ) );
+
+        register_rest_route( $base, '/charge/(?P<id>\\d+)/cancel', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_claim_payment_rest_cancel',
+            'permission_callback' => 'dinoco_claim_payment_perm_admin',
+            'args' => array( 'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ) ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_perm_admin' ) ) {
+    function dinoco_claim_payment_perm_admin() {
+        return current_user_can( 'manage_options' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_perm_customer' ) ) {
+    function dinoco_claim_payment_perm_customer() {
+        // LINE OAuth + WP session per spec §D11 — must be logged in. Ownership
+        // verified inside handler (charge.user_id === current_user_id).
+        return is_user_logged_in();
+    }
+}
+
+/**
+ * Shared wrapper: rate limit + idempotency + transition.
+ *
+ * @param string $rl_key_prefix  rate-limit bucket id
+ * @param string $idem_namespace short idempotency namespace
+ * @param int    $charge_id
+ * @param string $to_state
+ * @param string $actor
+ * @param array  $context
+ * @param int    $max_per_hour
+ * @return array|WP_Error
+ */
+if ( ! function_exists( 'dinoco_claim_payment_wrapped_transition' ) ) {
+    function dinoco_claim_payment_wrapped_transition( $rl_key_prefix, $idem_namespace, $charge_id, $to_state, $actor, $context, $max_per_hour = 30 ) {
+        // Rate limit per user
+        $uid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( $rl_key_prefix . '_' . $uid, $max_per_hour, 3600 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        // Idempotency wrap (Round 30+ pattern)
+        $body = array(
+            'charge_id'     => (int) $charge_id,
+            'to_state'      => (string) $to_state,
+            'actor_user_id' => $uid,
+        );
+        $idem_key = '';
+        if ( function_exists( 'dinoco_idempotency_hash' ) && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_key = $idem_namespace . ':' . dinoco_idempotency_hash( $body );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( $cached ) return $cached;
+        }
+
+        $context['actor_user_id'] = $uid;
+        $result = dinoco_claim_charge_transition( (int) $charge_id, (string) $to_state, (string) $actor, (array) $context );
+        if ( is_wp_error( $result ) ) return $result;
+
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $body, $result, 200 );
+        }
+        return $result;
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_upload_slip' ) ) {
+    function dinoco_claim_payment_rest_upload_slip( $req ) {
+        $chid = (int) $req->get_param( 'id' );
+
+        // Ownership check — customer can only upload their OWN slip
+        global $wpdb;
+        if ( function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            $table = dinoco_claim_charges_table_name();
+            $owner = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT user_id FROM {$table} WHERE id = %d", $chid
+            ) );
+            $cuid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+            if ( $owner !== $cuid ) {
+                return new WP_Error( 'forbidden', 'You can only upload slips for your own charges', array( 'status' => 403 ) );
+            }
+        }
+
+        // NOTE: actual slip image storage + Slip2Go async call is delegated to
+        // Phase 2.6 (separate task). V.0.2 only handles state transition; the
+        // slip_image_url + slip_ref_hash + slip_verify_data columns will be
+        // populated by that handler before invoking this endpoint.
+        return dinoco_claim_payment_wrapped_transition(
+            'claim_charge_upload', 'claim-charge-upload',
+            $chid, 'pending_review', 'customer',
+            array( 'verify_method' => 'slip2go_pending' ),
+            10  // 10/hr per customer
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_verify' ) ) {
+    function dinoco_claim_payment_rest_verify( $req ) {
+        $chid    = (int) $req->get_param( 'id' );
+        $method  = (string) ( $req->get_param( 'verify_method' ) ?: 'admin_manual' );
+        return dinoco_claim_payment_wrapped_transition(
+            'claim_charge_verify', 'claim-charge-verify',
+            $chid, 'verified', 'admin',
+            array( 'verify_method' => $method ),
+            60
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_reject' ) ) {
+    function dinoco_claim_payment_rest_reject( $req ) {
+        $chid   = (int) $req->get_param( 'id' );
+        $reason = sanitize_text_field( (string) $req->get_param( 'reason' ) );
+        if ( $reason === '' ) {
+            return new WP_Error( 'reason_required', 'Reject reason required', array( 'status' => 422 ) );
+        }
+        return dinoco_claim_payment_wrapped_transition(
+            'claim_charge_reject', 'claim-charge-reject',
+            $chid, 'rejected', 'admin',
+            array( 'reason' => $reason ),
+            30
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_refund' ) ) {
+    function dinoco_claim_payment_rest_refund( $req ) {
+        $chid       = (int) $req->get_param( 'id' );
+        $reason     = sanitize_text_field( (string) $req->get_param( 'reason' ) );
+        $approver   = (int) $req->get_param( 'refund_approver_id' );
+        return dinoco_claim_payment_wrapped_transition(
+            'claim_charge_refund', 'claim-charge-refund',
+            $chid, 'refunded', 'admin',
+            array( 'reason' => $reason, 'refund_approver_id' => $approver ),
+            20  // tight — refunds are rare + high-risk
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_cancel' ) ) {
+    function dinoco_claim_payment_rest_cancel( $req ) {
+        $chid   = (int) $req->get_param( 'id' );
+        $reason = sanitize_text_field( (string) $req->get_param( 'reason' ) );
+        return dinoco_claim_payment_wrapped_transition(
+            'claim_charge_cancel', 'claim-charge-cancel',
+            $chid, 'cancelled', 'admin',
+            array( 'reason' => $reason ),
+            30
+        );
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. CRON SWEEPS (called by Notifier V.0.5 cron handlers)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_payment_run_expire_sweep' ) ) {
+    /**
+     * Daily 02:25 ICT — flip `pending_payment` rows with expires_at < NOW()
+     * to `expired`. Each transition uses dinoco_claim_charge_transition() so
+     * action fire + idempotency + audit all work consistently.
+     */
+    function dinoco_claim_payment_run_expire_sweep() {
+        global $wpdb;
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) return;
+        $table = dinoco_claim_charges_table_name();
+        $rows  = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id FROM {$table} WHERE status = %s AND expires_at < %s LIMIT 500",
+            'pending_payment', current_time( 'mysql' )
+        ), ARRAY_A );
+        if ( empty( $rows ) ) return;
+        foreach ( $rows as $r ) {
+            $res = dinoco_claim_charge_transition( (int) $r['id'], 'expired', 'system', array( 'reason' => 'auto_expire_cron' ) );
+            if ( is_wp_error( $res ) && function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'claim_charge_expire_skipped', array(
+                    'charge_id' => (int) $r['id'],
+                    'error'     => $res->get_error_code(),
+                ) );
+            }
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_run_pending_review_sweep' ) ) {
+    /**
+     * Hourly — flag `pending_review` rows stuck > 24h for admin attention.
+     * Telegram alert via b2b_tg_send_dedup (1hr TTL prevents spam).
+     */
+    function dinoco_claim_payment_run_pending_review_sweep() {
+        global $wpdb;
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) return;
+        $table = dinoco_claim_charges_table_name();
+        $count = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table} WHERE status = %s AND verified_at IS NULL AND created_at < DATE_SUB(%s, INTERVAL 24 HOUR)",
+            'pending_review', current_time( 'mysql' )
+        ) );
+        if ( $count > 0 && function_exists( 'b2b_tg_send_dedup' ) ) {
+            b2b_tg_send_dedup( 'claim_charge_review_stuck',
+                sprintf( "[CHARGES] %d charges stuck > 24h in pending_review", $count ),
+                3600 );
+        }
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. WIRE-UP — flag-gated REST registration
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( $dinoco_claim_payment_enabled ) {
+    add_action( 'rest_api_init', 'dinoco_claim_payment_register_rest' );
+}

@@ -124,8 +124,23 @@ describe('Claim Lifecycle Notifier — Sprint 5 drift detector', () => {
             expect(restRegion[0]).not.toMatch(/current_user_can\(\s*'edit_posts'\s*\)/);
         });
 
-        test('sentinel constant bumped to 0.3', () => {
-            expect(code).toMatch(/DINOCO_CLAIM_LIFECYCLE_NOTIFIER_LOADED'\s*,\s*'0\.3'/);
+        test('sentinel constant bumped to 0.5 (V.0.5 Sprint 13 Phase 2.5)', () => {
+            expect(code).toMatch(/DINOCO_CLAIM_LIFECYCLE_NOTIFIER_LOADED'\s*,\s*'0\.5'/);
+        });
+
+        test('V.0.5 charge dispatch table constant defined', () => {
+            expect(code).toMatch(/DINOCO_CLAIM_NOTIF_CHARGE_DISPATCH_TABLE/);
+            expect(code).toMatch(/b2b_build_flex_claim_slip_received/);
+        });
+
+        test('V.0.5 charge state listener wired', () => {
+            expect(code).toMatch(/dinoco\/claim\/charge_state_changed/);
+            expect(code).toMatch(/'dinoco_claim_notify_charge_state_changed'\s*,\s*20\s*,\s*5/);
+        });
+
+        test('V.0.5 two crons registered', () => {
+            expect(code).toMatch(/dinoco_claim_charge_expire_cron/);
+            expect(code).toMatch(/dinoco_claim_charge_pending_review_sweep_cron/);
         });
 
         test('DB_ID 1211 in header', () => {
