@@ -124,13 +124,17 @@ describe('Sprint 15 Claim Refund Consent — H2 + M4 drift detector', () => {
     // LIFF — REST route + handler + transition extension
     // ────────────────────────────────────────────────────────────────
 
-    describe('LIFF V.0.4', () => {
-        test('liff version stamped V.0.4 (Sprint 15)', () => {
+    describe('LIFF V.0.4 (lineage)', () => {
+        test('liff V.0.4 header retained in lineage chain (Sprint 15)', () => {
+            // V.0.4 lineage block still present in header chain even after
+            // Sprint 16 (V.0.5) + Sprint 17 (V.0.6) bumps.
             expect(LIFF).toMatch(/Version:\s*V\.0\.4\s*\(2026-05-14\)/);
         });
 
-        test('DINOCO_CLAIM_PAYMENT_LIFF_LOADED bumped to 0.4', () => {
-            expect(LIFF).toMatch(/'DINOCO_CLAIM_PAYMENT_LIFF_LOADED'\s*,\s*'0\.4'/);
+        test('DINOCO_CLAIM_PAYMENT_LIFF_LOADED bumped to 0.6 (Sprint 17)', () => {
+            // Sprint 17 bumped LIFF V.0.5 → V.0.6 and constant 0.4 → 0.6.
+            // The constant is a single source of truth — current value pin.
+            expect(LIFF).toMatch(/'DINOCO_CLAIM_PAYMENT_LIFF_LOADED'\s*,\s*'0\.6'/);
         });
 
         // M4 — new REST route

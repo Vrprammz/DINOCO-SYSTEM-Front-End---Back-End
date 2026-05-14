@@ -1,6 +1,24 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO Claim Payment LIFF                              ║
+ * ║  Version: V.0.6 (2026-05-14) — Sprint 17 Phase 2.6 backbone:       ║
+ * ║    • NEW POST /dinoco-claim/v1/charges (admin create) — landing     ║
+ * ║      Sprint 13 deferred. Body { claim_id, amount_thb (DECIMAL),     ║
+ * ║      reason (whitelist), reason_note?, bank_context default+walkin, ║
+ * ║      expires_in_days 1..30 }. GET_LOCK + transaction + bank_*       ║
+ * ║      7-col snapshot + payment_ref CLM-CHG-{id}-{crockford4} +       ║
+ * ║      amount_thb_at_create mirror (chk_amount_snapshot satisfies).   ║
+ * ║      201 returns { id, charge_id, payment_ref, amount_thb,          ║
+ * ║      expires_at, bank_snapshot, liff_url }. Rate limit 30/hr/admin. ║
+ * ║      Idempotency body hash uses amount_cents int (no float drift).  ║
+ * ║      Fires `dinoco/claim/charge_state_changed` post-COMMIT.         ║
+ * ║    • NEW GET /dinoco-claim/v1/charges/{id} (tiered read) — admin   ║
+ * ║      sees full row + unmasked account + slip URL + audit cols;     ║
+ * ║      owner customer sees masked account (last-4) + sanitized row;  ║
+ * ║      anyone else → 404 charge_not_found (anti-enumeration per      ║
+ * ║      R3 HIGH-5 / Sprint 14 H3 pattern). 60s per-tier transient.   ║
+ * ║    • NEW GET /dinoco-claim/v1/charges?claim_id=X (admin list) —   ║
+ * ║      filter+paginate charge cards for Service Center panel.        ║
  * ║  Version: V.0.5 (2026-05-14) — Sprint 16 code-reviewer remediation:║
  * ║    • C2 timezone bug — was `gmdate('Y-m-d H:i:s', strtotime($now)  ║
  * ║      + ttl*60)` which formatted as UTC while DB comparisons use    ║
@@ -152,7 +170,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 $dinoco_claim_payment_enabled = (bool) get_option( 'dinoco_claim_payment_enabled', false );
 
 if ( ! defined( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED' ) ) {
-    define( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED', '0.4' );
+    define( 'DINOCO_CLAIM_PAYMENT_LIFF_LOADED', '0.6' );
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -511,6 +529,47 @@ if ( ! function_exists( 'dinoco_claim_payment_register_rest' ) ) {
             'args' => array(
                 'id'          => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),
                 'ttl_minutes' => array( 'required' => false, 'type' => 'integer', 'minimum' => 5, 'maximum' => 60, 'default' => 15 ),
+            ),
+        ) );
+
+        // Sprint 17 Phase 2.6 — admin charge create
+        register_rest_route( $base, '/charges', array(
+            // GET = admin list (filter by claim_id)
+            array(
+                'methods'             => 'GET',
+                'callback'            => 'dinoco_claim_payment_rest_charges_list',
+                'permission_callback' => 'dinoco_claim_payment_perm_admin',
+                'args' => array(
+                    'claim_id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),
+                    'status'   => array( 'required' => false, 'type' => 'string' ),
+                    'limit'    => array( 'required' => false, 'type' => 'integer', 'minimum' => 1, 'maximum' => 50, 'default' => 20 ),
+                    'offset'   => array( 'required' => false, 'type' => 'integer', 'minimum' => 0, 'default' => 0 ),
+                ),
+            ),
+            // POST = admin create
+            array(
+                'methods'             => 'POST',
+                'callback'            => 'dinoco_claim_payment_rest_charge_create',
+                'permission_callback' => 'dinoco_claim_payment_perm_admin',
+                'args' => array(
+                    'claim_id'        => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),
+                    'amount_thb'      => array( 'required' => true, 'type' => 'number' ),
+                    'reason'          => array( 'required' => true, 'type' => 'string', 'maxLength' => 32 ),
+                    'reason_note'     => array( 'required' => false, 'type' => 'string', 'maxLength' => 500 ),
+                    'bank_context'    => array( 'required' => false, 'type' => 'string', 'default' => 'default' ),
+                    'expires_in_days' => array( 'required' => false, 'type' => 'integer', 'minimum' => 1, 'maximum' => 30, 'default' => 7 ),
+                ),
+            ),
+        ) );
+
+        // Sprint 17 Phase 2.6 — tiered single read
+        register_rest_route( $base, '/charges/(?P<id>\\d+)', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_claim_payment_rest_charge_read',
+            // Permission: any logged-in user; tier resolution inside handler.
+            'permission_callback' => function() { return is_user_logged_in(); },
+            'args' => array(
+                'id' => array( 'required' => true, 'type' => 'integer', 'minimum' => 1 ),
             ),
         ) );
     }
@@ -904,6 +963,565 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_cancel' ) ) {
         );
     }
 }
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2.6. SPRINT 17 — CHARGE CREATE + TIERED READ + ADMIN LIST
+ *
+ * Closes Sprint 13 "Charge create + GET /charge/{id}" deferred backlog.
+ *
+ * Design notes (mirroring spec from feature-architect / api-specialist):
+ *   • Idempotency body hash uses amount_cents = round($amt * 100) int — float
+ *     normalization prevents drift across PHP versions / locales.
+ *   • Bank snapshot at INSERT is IMMUTABLE per spec §6.4 — once charge row
+ *     issued, admin's mid-flow bank edits cannot invalidate customer Flex.
+ *   • amount_thb_at_create = amount_thb at INSERT — CHECK chk_amount_snapshot
+ *     enforces equality on every UPDATE so refund handler 4-eyes gate cannot
+ *     be bypassed by lowering amount_thb (Sprint 14 H2).
+ *   • payment_ref CLM-CHG-{id}-{crockford4} computed POST-INSERT (need id).
+ *   • Tiered read 404 on non-owner non-admin → anti-enumeration (Sprint 14 H3).
+ *   • Per-tier transient 60s — invalidated on `dinoco/claim/charge_state_changed`.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_claim_payment_generate_payment_ref' ) ) {
+    /**
+     * Crockford alphabet (excludes I/L/O/U) — case-insensitive lookup
+     * resistant. Same alphabet used by SN system (consistency).
+     */
+    function dinoco_claim_payment_generate_payment_ref( $charge_id ) {
+        $alpha = 'ABCDEFGHJKMNPQRSTVWXYZ23456789'; // Crockford-ish, no IL OU/01
+        $len = strlen( $alpha );
+        $suf = '';
+        for ( $i = 0; $i < 4; $i++ ) {
+            $suf .= $alpha[ random_int( 0, $len - 1 ) ];
+        }
+        return 'CLM-CHG-' . str_pad( (string) (int) $charge_id, 4, '0', STR_PAD_LEFT ) . '-' . $suf;
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_mask_account' ) ) {
+    /**
+     * Mask bank account number — keep last 4 chars; replace remainder with •.
+     * Used for owner-tier read response (admin always sees unmasked).
+     */
+    function dinoco_claim_payment_mask_account( $account ) {
+        $account = (string) $account;
+        $len = mb_strlen( $account );
+        if ( $len <= 4 ) return str_repeat( '•', $len );
+        return str_repeat( '•', $len - 4 ) . mb_substr( $account, -4 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_charge_create' ) ) {
+    /**
+     * POST /dinoco-claim/v1/charges — admin create charge for a claim.
+     *
+     * Flow:
+     *   1. b2b_rate_limit 30/hr/admin
+     *   2. Validate body (claim exists, amount range, reason whitelist,
+     *      bank_context whitelist, expires_in_days 1-30)
+     *   3. Reject if claim already has active charge (status IN pending/review/verified)
+     *   4. Resolve bank snapshot via dinoco_claim_bank_resolve()
+     *   5. GET_LOCK('claim_charge_create_{claim_id}', 5s)
+     *   6. Idempotency check (cents int hash)
+     *   7. START TRANSACTION → INSERT row (amount_thb = amount_thb_at_create)
+     *      → UPDATE payment_ref post-id → COMMIT
+     *   8. Fire `dinoco/claim/charge_state_changed` post-COMMIT
+     *   9. Idempotency store + audit log
+     *  10. RELEASE_LOCK in finally
+     */
+    function dinoco_claim_payment_rest_charge_create( $req ) {
+        global $wpdb;
+
+        $uid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+        if ( $uid <= 0 ) {
+            return new WP_Error( 'unauthenticated', 'Admin must be authenticated', array( 'status' => 401 ) );
+        }
+
+        // Rate limit
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'claim_charge_create_' . $uid, 30, 3600 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        // Schema availability
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            return new WP_Error( 'schema_missing', 'Charges schema not installed', array( 'status' => 500 ) );
+        }
+        $table = dinoco_claim_charges_table_name();
+
+        // ── Body validation ──────────────────────────────────────────
+        $claim_id        = (int) $req->get_param( 'claim_id' );
+        $amount_thb_raw  = $req->get_param( 'amount_thb' );
+        $reason          = sanitize_text_field( (string) $req->get_param( 'reason' ) );
+        $reason_note     = sanitize_textarea_field( (string) $req->get_param( 'reason_note' ) );
+        $bank_context_in = sanitize_text_field( (string) $req->get_param( 'bank_context' ) );
+        $expires_days    = (int) $req->get_param( 'expires_in_days' );
+
+        if ( $claim_id <= 0 ) {
+            return new WP_Error( 'invalid_claim_id', 'claim_id must be positive integer', array( 'status' => 422 ) );
+        }
+
+        // Amount validation
+        if ( ! is_numeric( $amount_thb_raw ) ) {
+            return new WP_Error( 'invalid_amount', 'amount_thb must be numeric', array( 'status' => 422 ) );
+        }
+        $amount_thb = (float) $amount_thb_raw;
+        if ( $amount_thb < 0.01 || $amount_thb > 9999999.99 ) {
+            return new WP_Error( 'invalid_amount', 'amount_thb must be 0.01..9,999,999.99', array( 'status' => 422 ) );
+        }
+        // Round to 2 dp to align with DECIMAL(14,2) storage
+        $amount_thb = round( $amount_thb, 2 );
+        $amount_cents = (int) round( $amount_thb * 100.0 );
+
+        // Reason whitelist
+        if ( ! defined( 'DINOCO_CLAIM_CHARGES_REASON_WHITELIST' ) ) {
+            return new WP_Error( 'schema_missing', 'Reason whitelist constant missing', array( 'status' => 500 ) );
+        }
+        $reason_wl = explode( ',', DINOCO_CLAIM_CHARGES_REASON_WHITELIST );
+        if ( ! in_array( $reason, $reason_wl, true ) ) {
+            return new WP_Error( 'invalid_reason', 'reason must be one of: ' . DINOCO_CLAIM_CHARGES_REASON_WHITELIST, array( 'status' => 422 ) );
+        }
+
+        // Bank context whitelist — spec param maps to schema bucket:
+        //   'default' → schema bank_context 'claim'        → resolver use_walkin=false
+        //   'walkin'  → schema bank_context 'claim_walkin' → resolver use_walkin=true
+        if ( $bank_context_in === '' ) $bank_context_in = 'default';
+        $allowed_input_contexts = array( 'default', 'walkin' );
+        if ( ! in_array( $bank_context_in, $allowed_input_contexts, true ) ) {
+            return new WP_Error( 'invalid_bank_context', "bank_context must be 'default' or 'walkin'", array( 'status' => 422 ) );
+        }
+        $use_walkin   = ( $bank_context_in === 'walkin' );
+        $schema_bank_ctx = $use_walkin ? 'claim_walkin' : 'claim';
+
+        if ( $expires_days < 1 || $expires_days > 30 ) {
+            return new WP_Error( 'invalid_expires_in_days', 'expires_in_days must be 1..30', array( 'status' => 422 ) );
+        }
+
+        // Claim must exist
+        $claim_post = get_post( $claim_id );
+        if ( ! $claim_post || $claim_post->post_type !== 'claim_ticket' ) {
+            return new WP_Error( 'claim_not_found', 'claim_id does not match any claim_ticket', array( 'status' => 422 ) );
+        }
+
+        // Resolve bank snapshot
+        if ( ! function_exists( 'dinoco_claim_bank_resolve' ) ) {
+            return new WP_Error( 'bank_resolver_missing', 'dinoco_claim_bank_resolve() not available', array( 'status' => 500 ) );
+        }
+        $bank = dinoco_claim_bank_resolve( $use_walkin );
+        if ( ! empty( $bank['error'] ) ) {
+            return new WP_Error(
+                'bank_snapshot_incomplete',
+                'Bank settings not complete for context: ' . $bank_context_in,
+                array( 'status' => 422, 'bank_error' => $bank['error'], 'missing_fields' => isset( $bank['missing_fields'] ) ? $bank['missing_fields'] : array() )
+            );
+        }
+
+        // Determine claim owner user_id for customer column.
+        // Common pattern: ACF 'customer_id' or post_author. Defensive resolution.
+        $claim_user_id = 0;
+        if ( function_exists( 'get_field' ) ) {
+            $maybe = get_field( 'customer_id', $claim_id );
+            if ( is_numeric( $maybe ) && (int) $maybe > 0 ) $claim_user_id = (int) $maybe;
+        }
+        if ( $claim_user_id === 0 && (int) $claim_post->post_author > 0 ) {
+            $claim_user_id = (int) $claim_post->post_author;
+        }
+
+        // ── Idempotency body hash (cents int — no float drift) ──────
+        $idem_namespace = 'claim-charge-create';
+        $idem_body = array(
+            'claim_id'      => $claim_id,
+            'amount_cents'  => $amount_cents,
+            'reason'        => $reason,
+            'bank_context'  => $bank_context_in,
+            'actor_user_id' => $uid,
+        );
+        $idem_key = '';
+        if ( function_exists( 'dinoco_idempotency_hash' ) && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_key = $idem_namespace . ':' . dinoco_idempotency_hash( $idem_body );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( $cached ) {
+                if ( is_array( $cached ) && isset( $cached['__resp'] ) ) {
+                    // Idempotency Helper may wrap response; pass through transparently
+                    return rest_ensure_response( $cached['__resp'] );
+                }
+                return rest_ensure_response( $cached );
+            }
+        }
+
+        // ── Acquire GET_LOCK per claim ──────────────────────────────
+        $lock_key = 'claim_charge_create_' . md5( (string) $claim_id );
+        $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, %d)", $lock_key, 5 ) );
+        if ( $got_lock !== 1 ) {
+            return new WP_Error( 'lock_timeout', 'Concurrent charge create — please retry', array( 'status' => 409 ) );
+        }
+
+        $charge_id = 0;
+        $payment_ref = '';
+        $expires_at = '';
+        $now_mysql  = current_time( 'mysql' );
+
+        try {
+            // Reject if claim has an active charge already.
+            // Active = pending_payment / pending_review / verified (verified is
+            // "money received, awaiting refund or close").
+            $active_count = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table}
+                  WHERE claim_id = %d
+                    AND status IN ('pending_payment','pending_review','verified')",
+                $claim_id
+            ) );
+            if ( $active_count > 0 ) {
+                return new WP_Error( 'charge_active_exists', 'เคลมนี้มี Charge ที่ยังไม่ปิดอยู่', array( 'status' => 409 ) );
+            }
+
+            $wpdb->query( 'START TRANSACTION' );
+
+            // Compute expires_at — Bangkok-local via date() (Sprint 16 C2 lesson)
+            $expires_at = date( 'Y-m-d H:i:s', strtotime( $now_mysql ) + ( $expires_days * DAY_IN_SECONDS ) );
+
+            $insert_data = array(
+                'claim_id'              => $claim_id,
+                'user_id'               => $claim_user_id,
+                'amount_thb'            => $amount_thb,
+                'amount_thb_at_create'  => $amount_thb,   // Sprint 14 H2: BOTH set to satisfy chk_amount_snapshot
+                'reason'                => $reason,
+                'reason_note'           => $reason_note,
+                'status'                => 'pending_payment',
+                'bank_code'             => isset( $bank['bank_code'] ) ? (string) $bank['bank_code'] : '',
+                'bank_account'          => isset( $bank['bank_account'] ) ? (string) $bank['bank_account'] : '',
+                'bank_holder'           => isset( $bank['bank_holder'] ) ? (string) $bank['bank_holder'] : '',
+                'bank_name'             => isset( $bank['bank_name'] ) ? (string) $bank['bank_name'] : '',
+                'bank_branch'           => isset( $bank['bank_branch'] ) ? (string) $bank['bank_branch'] : '',
+                'bank_context'          => $schema_bank_ctx,
+                'payment_ref'           => 'PENDING',                // temp placeholder — UPDATE post-INSERT
+                'expires_at'            => $expires_at,
+                'created_at'            => $now_mysql,
+                'created_by'            => $uid,
+            );
+            $insert_fmt = array(
+                '%d','%d','%f','%f','%s','%s','%s','%s','%s','%s','%s','%s','%s','%s','%s','%d'
+            );
+
+            $ok = $wpdb->insert( $table, $insert_data, $insert_fmt );
+            if ( $ok === false ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'error', 'claim_charge_create_insert_failed', array(
+                        'claim_id' => $claim_id,
+                        'db_error' => isset( $wpdb->last_error ) ? (string) $wpdb->last_error : '',
+                    ) );
+                }
+                return new WP_Error( 'db_insert_failed', 'Failed to insert charge row', array( 'status' => 500 ) );
+            }
+            $charge_id = (int) $wpdb->insert_id;
+
+            // Generate payment_ref (CLM-CHG-NNNN-XXXX) + UPDATE row.
+            $payment_ref = dinoco_claim_payment_generate_payment_ref( $charge_id );
+            $upd = $wpdb->update( $table, array( 'payment_ref' => $payment_ref ), array( 'id' => $charge_id ), array( '%s' ), array( '%d' ) );
+            if ( $upd === false ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'db_update_failed', 'Failed to populate payment_ref', array( 'status' => 500 ) );
+            }
+
+            $wpdb->query( 'COMMIT' );
+
+            // POST-COMMIT action fire — Notifier listens at priority 20.
+            $action_ctx = array(
+                'actor'         => 'admin',
+                'actor_user_id' => $uid,
+                'amount_thb'    => $amount_thb,
+                'reason'        => $reason,
+                'context'       => 'created',
+            );
+            do_action( 'dinoco/claim/charge_state_changed',
+                $claim_id, $charge_id, '', 'pending_payment', $action_ctx );
+
+            // Audit + obs
+            if ( function_exists( 'dinoco_audit_log' ) ) {
+                dinoco_audit_log( array(
+                    'event_type'  => 'claim_charge_created',
+                    'actor_type'  => 'admin',
+                    'actor_id'    => (string) $uid,
+                    'target_type' => 'claim_charge',
+                    'target_id'   => (string) $charge_id,
+                    'amount'      => $amount_thb,
+                    'context'     => array(
+                        'claim_id'      => $claim_id,
+                        'reason'        => $reason,
+                        'bank_context'  => $bank_context_in,
+                        'payment_ref'   => $payment_ref,
+                        'expires_at'    => $expires_at,
+                    ),
+                ) );
+            }
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'info', 'claim_charge_created', array(
+                    'charge_id'    => $charge_id,
+                    'claim_id'     => $claim_id,
+                    'amount_thb'   => $amount_thb,
+                    'reason'       => $reason,
+                    'bank_context' => $bank_context_in,
+                    'actor_user_id'=> $uid,
+                ) );
+            }
+
+            // Build response
+            $bank_snapshot = array(
+                'bank_code'    => isset( $bank['bank_code'] ) ? (string) $bank['bank_code'] : '',
+                'bank_name'    => isset( $bank['bank_name'] ) ? (string) $bank['bank_name'] : '',
+                'bank_account' => isset( $bank['bank_account'] ) ? (string) $bank['bank_account'] : '',
+                'bank_holder'  => isset( $bank['bank_holder'] ) ? (string) $bank['bank_holder'] : '',
+                'bank_branch'  => isset( $bank['bank_branch'] ) ? (string) $bank['bank_branch'] : '',
+            );
+            // LIFF URL — slug is /claim-pay/ per DB_ID 1212 description. Until
+            // boss creates the WP page the route won't resolve — but the URL
+            // itself is correct for when the page exists.
+            $liff_url = home_url( '/claim-pay/?cid=' . $charge_id );
+
+            $resp = array(
+                'id'             => $charge_id,
+                'charge_id'      => $charge_id,
+                'payment_ref'    => $payment_ref,
+                'amount_thb'     => $amount_thb,
+                'expires_at'     => $expires_at,
+                'bank_snapshot'  => $bank_snapshot,
+                'liff_url'       => $liff_url,
+            );
+
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, $resp, 201 );
+            }
+
+            $rest = rest_ensure_response( $resp );
+            $rest->set_status( 201 );
+            return $rest;
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', 'claim_charge_create_threw', array(
+                    'claim_id'  => $claim_id,
+                    'exception' => $e->getMessage(),
+                ) );
+            }
+            return new WP_Error( 'create_exception', 'Charge create failed: ' . $e->getMessage(), array( 'status' => 500 ) );
+        } finally {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_charge_read' ) ) {
+    /**
+     * GET /dinoco-claim/v1/charges/{id} — tiered read.
+     *
+     * Tiers:
+     *   admin (manage_options)            → full row + unmasked account + audit
+     *   owner (charge.user_id === uid)    → sanitized (masked account last-4, no audit)
+     *   other                             → 404 (anti-enumeration per R3 HIGH-5)
+     */
+    function dinoco_claim_payment_rest_charge_read( $req ) {
+        global $wpdb;
+        $chid = (int) $req->get_param( 'id' );
+        if ( $chid <= 0 ) {
+            return new WP_Error( 'invalid_charge_id', 'Invalid charge id', array( 'status' => 400 ) );
+        }
+
+        $uid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+        $is_admin = current_user_can( 'manage_options' );
+
+        // Rate limit READ separately (cheap probe defense).
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'claim_charge_read_' . $uid, 60, 60 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            return new WP_Error( 'schema_missing', 'Charges schema not installed', array( 'status' => 500 ) );
+        }
+        $table = dinoco_claim_charges_table_name();
+
+        $tier = $is_admin ? 'admin' : 'owner';
+        $cache_key = 'dinoco_claim_charge_v1_' . $chid . '_' . $tier;
+        $cached = get_transient( $cache_key );
+        if ( is_array( $cached ) ) {
+            // Owner tier may have cached a row that's no longer owned — defensive
+            // re-validate ownership before returning cached payload.
+            if ( $is_admin || ( isset( $cached['user_id'] ) && (int) $cached['user_id'] === $uid ) ) {
+                return rest_ensure_response( $cached );
+            }
+        }
+
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$table} WHERE id = %d", $chid
+        ), ARRAY_A );
+
+        if ( ! $row ) {
+            return new WP_Error( 'charge_not_found', 'ไม่พบใบเรียกเก็บนี้', array( 'status' => 404 ) );
+        }
+
+        // Owner tier check — 404 (not 403) on mismatch
+        if ( ! $is_admin ) {
+            if ( (int) $row['user_id'] !== $uid ) {
+                return new WP_Error( 'charge_not_found', 'ไม่พบใบเรียกเก็บนี้', array( 'status' => 404 ) );
+            }
+        }
+
+        // Build response by tier
+        $bank_snapshot = array(
+            'bank_code'    => (string) $row['bank_code'],
+            'bank_name'    => (string) $row['bank_name'],
+            'bank_account' => $is_admin
+                ? (string) $row['bank_account']
+                : dinoco_claim_payment_mask_account( (string) $row['bank_account'] ),
+            'bank_holder'  => (string) $row['bank_holder'],
+            'bank_branch'  => (string) $row['bank_branch'],
+        );
+
+        $resp = array(
+            'id'             => (int) $row['id'],
+            'charge_id'      => (int) $row['id'],
+            'claim_id'       => (int) $row['claim_id'],
+            'user_id'        => (int) $row['user_id'],
+            'amount_thb'     => (float) $row['amount_thb'],
+            'reason'         => (string) $row['reason'],
+            'reason_note'    => (string) $row['reason_note'],
+            'status'         => (string) $row['status'],
+            'payment_ref'    => (string) $row['payment_ref'],
+            'bank_snapshot'  => $bank_snapshot,
+            'bank_context'   => (string) $row['bank_context'],
+            'expires_at'     => (string) $row['expires_at'],
+            'created_at'     => (string) $row['created_at'],
+            'liff_url'       => home_url( '/claim-pay/?cid=' . (int) $row['id'] ),
+            // PromptPay QR — field present but null until helper lands (Phase 2.7)
+            'promptpay_qr'   => null,
+        );
+
+        if ( $is_admin ) {
+            $resp['amount_thb_at_create'] = isset( $row['amount_thb_at_create'] ) ? (float) $row['amount_thb_at_create'] : 0.0;
+            $resp['slip_image_url']       = (string) $row['slip_image_url'];
+            $resp['slip_ref_hash']        = (string) $row['slip_ref_hash'];
+            $resp['verified_at']          = (string) $row['verified_at'];
+            $resp['verified_by']          = (int) $row['verified_by'];
+            $resp['refund_reason']        = (string) $row['refund_reason'];
+            $resp['refund_approver_id']   = (int) $row['refund_approver_id'];
+            $resp['refunded_at']          = (string) $row['refunded_at'];
+            $resp['refunded_by']          = (int) $row['refunded_by'];
+            $resp['created_by']           = (int) $row['created_by'];
+        } else {
+            // Owner tier — only expose slip URL after verified (so admin's
+            // pre-verify review is private). Status pre-verify → null.
+            $resp['slip_image_url'] = in_array( $row['status'], array( 'verified', 'refunded' ), true )
+                ? (string) $row['slip_image_url']
+                : '';
+        }
+
+        set_transient( $cache_key, $resp, 60 );
+        return rest_ensure_response( $resp );
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_payment_rest_charges_list' ) ) {
+    /**
+     * GET /dinoco-claim/v1/charges?claim_id=X — admin-only list.
+     */
+    function dinoco_claim_payment_rest_charges_list( $req ) {
+        global $wpdb;
+
+        $uid = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'claim_charge_list_' . $uid, 60, 60 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        if ( ! function_exists( 'dinoco_claim_charges_table_name' ) ) {
+            return new WP_Error( 'schema_missing', 'Charges schema not installed', array( 'status' => 500 ) );
+        }
+        $table = dinoco_claim_charges_table_name();
+
+        $claim_id = (int) $req->get_param( 'claim_id' );
+        $status   = sanitize_text_field( (string) $req->get_param( 'status' ) );
+        $limit    = (int) $req->get_param( 'limit' );
+        $offset   = (int) $req->get_param( 'offset' );
+        if ( $limit < 1 || $limit > 50 ) $limit = 20;
+        if ( $offset < 0 ) $offset = 0;
+
+        if ( $claim_id <= 0 ) {
+            return new WP_Error( 'invalid_claim_id', 'claim_id required', array( 'status' => 422 ) );
+        }
+
+        // Status filter is optional but must match whitelist when provided.
+        $where  = "claim_id = %d";
+        $params = array( $claim_id );
+        if ( $status !== '' ) {
+            if ( ! defined( 'DINOCO_CLAIM_CHARGES_STATUS_WHITELIST' ) ) {
+                return new WP_Error( 'schema_missing', 'Status whitelist missing', array( 'status' => 500 ) );
+            }
+            $wl = explode( ',', DINOCO_CLAIM_CHARGES_STATUS_WHITELIST );
+            if ( ! in_array( $status, $wl, true ) ) {
+                return new WP_Error( 'invalid_status', 'status must be one of: ' . DINOCO_CLAIM_CHARGES_STATUS_WHITELIST, array( 'status' => 422 ) );
+            }
+            $where   .= " AND status = %s";
+            $params[] = $status;
+        }
+
+        $params[] = $limit;
+        $params[] = $offset;
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, claim_id, user_id, amount_thb, reason, reason_note, status,
+                    payment_ref, bank_context, expires_at, created_at, created_by,
+                    verified_at, refunded_at
+               FROM {$table}
+              WHERE {$where}
+              ORDER BY created_at DESC
+              LIMIT %d OFFSET %d",
+            $params
+        ), ARRAY_A );
+
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        $items = array();
+        foreach ( $rows as $r ) {
+            $items[] = array(
+                'id'           => (int) $r['id'],
+                'charge_id'    => (int) $r['id'],
+                'claim_id'     => (int) $r['claim_id'],
+                'amount_thb'   => (float) $r['amount_thb'],
+                'reason'       => (string) $r['reason'],
+                'reason_note'  => (string) $r['reason_note'],
+                'status'       => (string) $r['status'],
+                'payment_ref'  => (string) $r['payment_ref'],
+                'bank_context' => (string) $r['bank_context'],
+                'expires_at'   => (string) $r['expires_at'],
+                'created_at'   => (string) $r['created_at'],
+                'created_by'   => (int) $r['created_by'],
+                'verified_at'  => (string) $r['verified_at'],
+                'refunded_at'  => (string) $r['refunded_at'],
+            );
+        }
+
+        return rest_ensure_response( array(
+            'items'    => $items,
+            'claim_id' => $claim_id,
+            'limit'    => $limit,
+            'offset'   => $offset,
+            'count'    => count( $items ),
+        ) );
+    }
+}
+
+// Cache invalidation listener — purge per-charge transients on state change.
+if ( ! function_exists( 'dinoco_claim_payment_invalidate_charge_cache' ) ) {
+    function dinoco_claim_payment_invalidate_charge_cache( $claim_id, $charge_id, $from_state, $to_state, $context ) {
+        $cid = (int) $charge_id;
+        if ( $cid <= 0 ) return;
+        delete_transient( 'dinoco_claim_charge_v1_' . $cid . '_admin' );
+        delete_transient( 'dinoco_claim_charge_v1_' . $cid . '_owner' );
+    }
+}
+add_action( 'dinoco/claim/charge_state_changed', 'dinoco_claim_payment_invalidate_charge_cache', 5, 5 );
 
 
 /* ═══════════════════════════════════════════════════════════════════════════

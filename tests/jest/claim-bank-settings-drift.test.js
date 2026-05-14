@@ -27,13 +27,21 @@ describe('Claim Bank Settings — Sprint 9 Phase 1 Task 1.9 drift detector', () 
 
     // ─── Version + DB_ID integrity ────────────────────────────────────
 
-    test('Service Center version bumped to V.33.2 (Sprint 11 remediation)', () => {
-        expect(SC).toMatch(/Version: V\.33\.2 \(2026-05-14\)/);
+    test('Service Center version bumped to V.34.0 (Sprint 17 Phase 2.6)', () => {
+        expect(SC).toMatch(/Version: V\.34\.0 \(2026-05-14\)/);
     });
 
-    test('V.33.1 + V.33.0 lineage retained in header chain', () => {
+    test('V.33.x + V.33.0 lineage retained in header chain', () => {
+        expect(SC).toMatch(/Version: V\.33\.2 \(2026-05-14\)/);
         expect(SC).toMatch(/Version: V\.33\.1 \(2026-05-14\)/);
         expect(SC).toMatch(/Version: V\.33\.0 \(2026-05-13\)/);
+    });
+
+    test('Sprint 17 — charges section + trigger button + scoped CSS class present', () => {
+        // Sentinel pins for the Sprint 17 modal trigger integration.
+        expect(SC).toMatch(/id=['"]sc-claim-charges-section['"]/);
+        expect(SC).toMatch(/id=['"]dnc-cc-trigger-btn['"]/);
+        expect(SC).toMatch(/\.dnc-claim-charge-admin\b/);
     });
 
     // ─── Sprint 11 remediation pins ─────────────────────────────────
