@@ -66,61 +66,64 @@ describe('Customer-facing UX R3 fixes — 5 CRITICAL closed', () => {
         expect(code).not.toMatch(/goto\s+end_register_serial_handler/);
     });
 
-    test('C3 — Royal Warranty Upgrade hidden when user has no legacy CPT', () => {
+    test('C3 — V.31.15 REVERTED: Royal Warranty Upgrade always visible (boss B)', () => {
+        // V.31.3 R3 C3 gated the button behind $has_legacy_warranty WP_Query.
+        // V.31.15 boss directive B: revert to always-visible (pre-V.31.4 behavior).
+        // New users may still bring plastic cards in; gating caused confusion when
+        // multi-user admin compared two accounts and saw inconsistent UI.
         const code = read('header');
-        // Version header marker
-        expect(code).toMatch(/V\.31\.4[\s\S]{0,800}?C3/);
-        // WP_Query detects legacy presence
-        expect(code).toMatch(/\$has_legacy_warranty\s*=\s*false/);
-        expect(code).toMatch(/'post_type'\s*=>\s*'serial_number'/);
-        expect(code).toMatch(/'key'\s*=>\s*'owner_product'/);
-        // Royal Upgrade is wrapped in conditional
-        expect(code).toMatch(/<\?php if \(\s*\$has_legacy_warranty\s*\)\s*:\s*\?>[\s\S]{0,500}?royal-upgrade-btn[\s\S]{0,500}?<\?php endif;\s*\?>/);
-    });
-
-    test('C4 — Direction A V.31.14: action row + S/N input + notif accordion all DELETED', () => {
-        const code = read('header');
-        // V.31.14 Sprint 36 (ux-ui-expert audit): Direction A consolidation.
-        // Bottom nav (Global App Menu L624/631/640) is canonical surface for
-        // claim/SCAN/transfer. Manual S/N entry lives in FAB SCAN modal.
-        // Notification accordion moved to Edit Profile V.35.0 #sec-notif.
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
             .replace(/<\?php[\s\S]*?\?>/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '');
-        // Active code MUST NOT contain any of the deleted blocks
-        expect(stripped).not.toMatch(/<div class="dnc-dash-quick-actions"/);
-        expect(stripped).not.toMatch(/dnc-dash-quick-card--claim/);
-        expect(stripped).not.toMatch(/dnc-dash-quick-card--transfer/);
-        expect(stripped).not.toMatch(/dnc-dash-quick-card--scan/);
+        // Button markup always rendered (no conditional wrapper)
+        expect(stripped).toMatch(/royal-upgrade-btn/);
+        // Conditional + WP_Query GONE from active PHP
+        expect(code).not.toMatch(/\$has_legacy_warranty\s*=\s*\$legacy_q->have_posts/);
+        expect(code).not.toMatch(/<\?php if \(\s*\$has_legacy_warranty\s*\)\s*:/);
+        // V.31.15 audit trail
+        expect(code).toMatch(/V\.31\.15[\s\S]{0,500}?Royal Warranty/);
+    });
+
+    test('C4 — V.31.15 RESTORE 3-card action row (boss "แถบเมนูหายไปหมด")', () => {
+        // V.31.14 Direction A deleted action row. V.31.15 restored FULL 3 cards
+        // per boss: 📷 ลงทะเบียน + 🔧 แจ้งเคลม + 🤝 โอนสิทธิ์. ลงทะเบียน is intentionally
+        // a visible duplicate of FAB SCAN (boss explicit). Search-box-wrap stays
+        // deleted (manual S/N entry in FAB modal). Notif relocated to Profile.
+        const code = read('header');
+        const stripped = code
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<\?php[\s\S]*?\?>/g, '')
+            .replace(/\/\*[\s\S]*?\*\//g, '');
+        // 3-card row markup
+        expect(stripped).toMatch(/<div class="dnc-dash-quick-actions"/);
+        expect(stripped).toMatch(/dnc-dash-quick-card--register/);
+        expect(stripped).toMatch(/dnc-dash-quick-card--claim/);
+        expect(stripped).toMatch(/dnc-dash-quick-card--transfer/);
+        // UX-H3: no inline onclick (data-action delegation)
+        expect(stripped).not.toMatch(/dnc-dash-quick-card[^>]*onclick=/);
+        // Search-box-wrap + notif accordion stay DELETED
         expect(stripped).not.toMatch(/<div class="search-box-wrap">/);
-        expect(stripped).not.toMatch(/class="search-form-flex"/);
-        expect(stripped).not.toMatch(/class="dinoco-input-search"/);
         expect(stripped).not.toMatch(/<div class="dnc-sn-notif-settings"/);
-        expect(stripped).not.toMatch(/btn-reg/);
-        // Notif relocated to Profile — thin link row replaces accordion
-        expect(stripped).toMatch(/<a[^>]*href="\/edit-profile\/#sec-notif"[^>]*dnc-notif-link-row/);
-        // SCAN delegation handler retained (FAB modal future surfaces)
+        // Notif link to Profile present
+        expect(stripped).toMatch(/<a[^>]*href="\/edit-profile\/#sec-notif"/);
         expect(code).toContain('dinocoScanFirstQr');
     });
 
-    test('V.31.14 — Logo PNG RESTORED (wordmark pivot reverted per boss)', () => {
+    test('V.31.15 — Logo PNG further shrunk 50% (boss "เล็กกว่านี้ 50%")', () => {
         const code = read('header');
         const stripped = code
             .replace(/<!--[\s\S]*?-->/g, '')
             .replace(/<\?php[\s\S]*?\?>/g, '')
             .replace(/\/\*[\s\S]*?\*\//g, '')
             .replace(/^\s*\/\/.*$/gm, '');
-        // V.31.14 — PNG restored at canonical CDN URL with very small size cap
         expect(stripped).toMatch(/<img[^>]*src="https:\/\/www\.dinoco\.in\.th\/wp-content\/uploads\/2026\/01\/sss\.png"[^>]*class="card-title-mark"/);
-        expect(stripped).toMatch(/alt="DINOCO"/);
-        // Wordmark span GONE from active code
         expect(stripped).not.toMatch(/<span class="card-title-wordmark">/);
-        // Final size: height 14px + max-width 80px abs cap
-        expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*14px/);
-        expect(code).toMatch(/\.card-title-mark[\s\S]*?max-width:\s*80px/);
-        // <360px: 12px / 65px
-        expect(code).toMatch(/\.card-title-mark\s*\{\s*height:\s*12px;?\s*max-width:\s*65px/);
+        // V.31.15 — half of V.31.14: height 7px / max-width 40px
+        expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*7px/);
+        expect(code).toMatch(/\.card-title-mark[\s\S]*?max-width:\s*40px/);
+        // <360px: 6px / 34px
+        expect(code).toMatch(/\.card-title-mark\s*\{\s*height:\s*6px;?\s*max-width:\s*34px/);
     });
 
     test('V.31.14 — Scan delegation handler retained (FAB modal future surfaces)', () => {

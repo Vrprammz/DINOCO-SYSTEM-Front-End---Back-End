@@ -2793,38 +2793,36 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toContain('/warranty/activate');
         });
 
-        test('W7.1 V.31.14 Direction A — action row + S/N input + notif accordion DELETED', () => {
-            // V.31.14 Sprint 36 (ux-ui-expert audit): bottom nav (Global App Menu)
-            // is canonical surface for claim/SCAN/transfer. Notif relocated to Edit
-            // Profile V.35.0 #sec-notif. Manual S/N entry in FAB SCAN modal.
+        test('W7.1 V.31.15 — 3-card action row RESTORED + notif relocated', () => {
+            // V.31.15 boss restored ลงทะเบียน + แจ้งเคลม + โอนสิทธิ์ row
+            // (V.31.14 had deleted all). Notif still at Edit Profile.
             const code = readByPath(HEADER_PATH);
             const stripped = code
                 .replace(/<!--[\s\S]*?-->/g, '')
                 .replace(/<\?php[\s\S]*?\?>/g, '')
                 .replace(/\/\*[\s\S]*?\*\//g, '');
             expect(stripped).not.toMatch(/class="action-grid dnc-sn-action-grid-4"/);
-            expect(stripped).not.toMatch(/btn-reg/);
-            expect(stripped).not.toMatch(/<div class="dnc-dash-quick-actions"/);
-            expect(stripped).not.toMatch(/dnc-dash-quick-card/);
+            expect(stripped).not.toMatch(/btn-reg(?!ister)/);  // old class gone, new --register OK
+            expect(stripped).toMatch(/<div class="dnc-dash-quick-actions"/);
+            expect(stripped).toMatch(/dnc-dash-quick-card--register/);
+            expect(stripped).toMatch(/dnc-dash-quick-card--claim/);
+            expect(stripped).toMatch(/dnc-dash-quick-card--transfer/);
             expect(stripped).not.toMatch(/<div class="dnc-sn-notif-settings"/);
-            // Notif link row replaces accordion
             expect(stripped).toMatch(/href="\/edit-profile\/#sec-notif"/);
         });
 
-        test('W7.1 V.31.14 — logo PNG RESTORED (wordmark pivot reverted)', () => {
+        test('W7.1 V.31.15 — logo PNG 50% smaller (boss "เล็กกว่านี้ 50%")', () => {
             const code = readByPath(HEADER_PATH);
             const stripped = code
                 .replace(/<!--[\s\S]*?-->/g, '')
                 .replace(/<\?php[\s\S]*?\?>/g, '')
                 .replace(/\/\*[\s\S]*?\*\//g, '')
                 .replace(/^\s*\/\/.*$/gm, '');
-            // PNG restored at canonical CDN URL
             expect(stripped).toMatch(/src="https:\/\/www\.dinoco\.in\.th\/wp-content\/uploads\/2026\/01\/sss\.png"/);
             expect(stripped).toMatch(/class="card-title-mark"/);
-            // Wordmark gone
             expect(stripped).not.toMatch(/<span class="card-title-wordmark">/);
-            // Final size cap
-            expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*14px/);
+            // V.31.15: 7px / 40px (half of V.31.14)
+            expect(code).toMatch(/\.card-title-mark[\s\S]*?height:\s*7px/);
         });
 
         test('W7 SnTierBadgeTest helper test file exists with required cases', () => {
