@@ -2,6 +2,9 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO SN Go-Live Tool                          ║
  * ║  DB_ID: 1215                                                     ║
+ * ║  Version: V.2.1 (2026-05-15) — NEW /diagnose-flag endpoint +    ║
+ * ║    /clear-caches endpoint. Diagnoses GDPR FLAG OFF banner       ║
+ * ║    despite option ON — exposes raw vs Config Layer resolved.    ║
  * ║  Version: V.2.0 (2026-05-15) — Config Layer cache invalidate +  ║
  * ║    post-write verify (raw + Config Layer resolved) on flag-     ║
  * ║    toggle. Diagnoses banner-OFF-but-option-ON drift. Response   ║
@@ -545,7 +548,146 @@ add_action( 'rest_api_init', function() {
         'callback'            => 'dinoco_sn_golive_rest_reschedule_crons',
         'permission_callback' => $perm,
     ) );
+
+    // V.2.1 — Clear caches (WP Fastest Cache + WP object cache + Config Layer)
+    register_rest_route( 'dinoco-sn-golive/v1', '/clear-caches', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_sn_golive_rest_clear_caches',
+        'permission_callback' => $perm,
+    ) );
+
+    // V.2.1 — Diagnostic — show all paths the flag could be read from
+    register_rest_route( 'dinoco-sn-golive/v1', '/diagnose-flag', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_sn_golive_rest_diagnose_flag',
+        'permission_callback' => $perm,
+        'args'                => array(
+            'flag' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_key' ),
+        ),
+    ) );
 } );
+
+if ( ! function_exists( 'dinoco_sn_golive_rest_diagnose_flag' ) ) {
+    function dinoco_sn_golive_rest_diagnose_flag( $req ) {
+        $flag = sanitize_key( $req->get_param( 'flag' ) );
+        $whitelist = dinoco_sn_golive_flag_whitelist();
+        if ( ! isset( $whitelist[ $flag ] ) ) {
+            return new WP_Error( 'flag_not_whitelisted', 'Flag not in whitelist', array( 'status' => 400 ) );
+        }
+
+        $result = array(
+            'flag'               => $flag,
+            'label'              => $whitelist[ $flag ],
+            'paths'              => array(),
+        );
+
+        // Path 1 — raw get_option (what Go-Live Tool writes)
+        $raw = get_option( $flag, '__NOT_SET__' );
+        $result['paths']['raw_get_option'] = array(
+            'value'      => $raw,
+            'value_type' => gettype( $raw ),
+            'exists'     => $raw !== '__NOT_SET__',
+        );
+
+        // Path 2 — strict === '1' check (legacy fallback in GDPR snippet)
+        $result['paths']['strict_eq_string_1'] = ( $raw === '1' );
+
+        // Path 3 — Config Layer dotted-key mapping
+        $config_keys = array(
+            'dinoco_gdpr_enabled'             => 'gdpr.enabled',
+            'dinoco_obs_sentry_enabled'       => 'obs.sentry_enabled',
+            'dinoco_obs_correlation_enabled'  => 'obs.correlation_enabled',
+        );
+        if ( isset( $config_keys[ $flag ] ) ) {
+            $dot_key = $config_keys[ $flag ];
+            $result['paths']['config_layer'] = array(
+                'dotted_key'    => $dot_key,
+                'function_exists_dinoco_config'         => function_exists( 'dinoco_config' ),
+                'function_exists_dinoco_get_config_def' => function_exists( 'dinoco_get_config_def' ),
+                'function_exists_dinoco_config_option_key' => function_exists( 'dinoco_config_option_key' ),
+            );
+            if ( function_exists( 'dinoco_get_config_def' ) ) {
+                $def = dinoco_get_config_def( $dot_key );
+                $result['paths']['config_layer']['def_registered'] = ( $def !== null );
+                if ( $def ) {
+                    $result['paths']['config_layer']['def_type']          = $def['type'] ?? null;
+                    $result['paths']['config_layer']['def_legacy_option'] = $def['legacy_option'] ?? '';
+                }
+            }
+            if ( function_exists( 'dinoco_config_option_key' ) ) {
+                $resolved_option_key = dinoco_config_option_key( $dot_key );
+                $result['paths']['config_layer']['resolved_option_key']      = $resolved_option_key;
+                $result['paths']['config_layer']['resolved_option_matches'] = ( $resolved_option_key === $flag );
+            }
+            if ( function_exists( 'dinoco_config' ) ) {
+                // Bust per-request cache before reading
+                if ( isset( $GLOBALS['_dinoco_config_cache'] ) ) {
+                    unset( $GLOBALS['_dinoco_config_cache'][ $dot_key ] );
+                }
+                $cfg_val = dinoco_config( $dot_key, '__DEFAULT__' );
+                $result['paths']['config_layer']['dinoco_config_returns'] = $cfg_val;
+                $result['paths']['config_layer']['dinoco_config_type']    = gettype( $cfg_val );
+                $result['paths']['config_layer']['bool_cast']             = (bool) $cfg_val;
+            }
+        }
+
+        // Path 4 — GDPR-specific check
+        if ( $flag === 'dinoco_gdpr_enabled' ) {
+            $result['paths']['dinoco_gdpr_is_enabled'] = array(
+                'function_exists' => function_exists( 'dinoco_gdpr_is_enabled' ),
+                'returns'         => function_exists( 'dinoco_gdpr_is_enabled' ) ? dinoco_gdpr_is_enabled() : null,
+            );
+        }
+
+        return rest_ensure_response( $result );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_golive_rest_clear_caches' ) ) {
+    function dinoco_sn_golive_rest_clear_caches() {
+        $rl = dinoco_sn_golive_rate_limit( 'clear_caches', 10 );
+        if ( is_wp_error( $rl ) ) return $rl;
+        $cleared = array();
+
+        // WP object cache
+        if ( function_exists( 'wp_cache_flush' ) ) {
+            wp_cache_flush();
+            $cleared[] = 'wp_cache (object cache)';
+        }
+
+        // Config Layer per-request cache
+        if ( isset( $GLOBALS['_dinoco_config_cache'] ) ) {
+            $GLOBALS['_dinoco_config_cache'] = array();
+            $cleared[] = 'dinoco_config (per-request)';
+        }
+
+        // WP Fastest Cache plugin (3 known entry points)
+        if ( function_exists( 'wpfc_clear_all_cache' ) ) {
+            wpfc_clear_all_cache( true );
+            $cleared[] = 'wp_fastest_cache (page HTML)';
+        } elseif ( class_exists( 'WpFastestCache' ) ) {
+            $wpfc = new \WpFastestCache();
+            if ( method_exists( $wpfc, 'deleteCache' ) ) {
+                $wpfc->deleteCache( true );
+                $cleared[] = 'wp_fastest_cache (WpFastestCache::deleteCache)';
+            }
+        } else {
+            // Try filter API
+            do_action( 'wpfc_clear_all_cache' );
+            $cleared[] = 'wp_fastest_cache (hook fired — plugin may auto-respond)';
+        }
+
+        // SN-specific transients used by Go-Live monitor + tab 3
+        delete_transient( 'dinoco_sn_pool_stats_v1' );
+        $cleared[] = 'sn_pool_stats transient';
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'cleared' => $cleared,
+            'count'   => count( $cleared ),
+        ) );
+    }
+}
 
 if ( ! function_exists( 'dinoco_sn_golive_rest_reschedule_crons' ) ) {
     function dinoco_sn_golive_rest_reschedule_crons() {
