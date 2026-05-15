@@ -1,4 +1,4 @@
-> ⚠️ **SUPERSEDED 2026-05-15** by [35-boss-final-decisions-2026-05-15.md](./35-boss-final-decisions-2026-05-15.md). Boss clarified pilot was vestigial from pre-v2.2 plans — v2.2 standalone means dealers not involved. Internal QA replaces pilot. Document kept for historical record only.
+> ⚠️ **SUPERSEDED 2026-05-15** by [35-boss-final-decisions-2026-05-15.md](../35-boss-final-decisions-2026-05-15.md). Boss clarified pilot was vestigial from pre-v2.2 plans — v2.2 standalone means dealers not involved. Internal QA replaces pilot. Document kept for historical record only.
 
 # 🚨 Q12 Skip-Pilot Risk Acceptance
 

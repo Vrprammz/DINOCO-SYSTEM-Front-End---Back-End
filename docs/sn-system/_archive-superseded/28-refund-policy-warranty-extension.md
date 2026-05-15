@@ -1,4 +1,4 @@
-> ⚠️ **MERGED 2026-05-15** into [15-q20-manual-refund-sop.md](./15-q20-manual-refund-sop.md) per [35-boss-final-decisions-2026-05-15.md](./35-boss-final-decisions-2026-05-15.md). Boss decision: F#8 + Q20 share single manual refund flow (admin Facebook DM intake).
+> ⚠️ **MERGED 2026-05-15** into [15-q20-manual-refund-sop.md](../15-q20-manual-refund-sop.md) per [35-boss-final-decisions-2026-05-15.md](../35-boss-final-decisions-2026-05-15.md). Boss decision: F#8 + Q20 share single manual refund flow (admin Facebook DM intake).
 
 # 28 — Refund Policy: Warranty Extension Marketplace (F#8)
 

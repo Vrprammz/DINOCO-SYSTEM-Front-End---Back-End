@@ -1,4 +1,4 @@
-> ⚠️ **CANCELLED 2026-05-15** by [35-boss-final-decisions-2026-05-15.md](./35-boss-final-decisions-2026-05-15.md). Boss decision: F#8 uses non-VAT บัญชีบุคคล. Plain receipt only (ใบเสร็จธรรมดา) — NO tax invoice (ใบกำกับภาษี). VAT 7% calculation REMOVED from F#8 scope.
+> ⚠️ **CANCELLED 2026-05-15** by [35-boss-final-decisions-2026-05-15.md](../35-boss-final-decisions-2026-05-15.md). Boss decision: F#8 uses non-VAT บัญชีบุคคล. Plain receipt only (ใบเสร็จธรรมดา) — NO tax invoice (ใบกำกับภาษี). VAT 7% calculation REMOVED from F#8 scope.
 
 # 29 — Tax Invoice Format VAT 7% (Warranty Extension)
 

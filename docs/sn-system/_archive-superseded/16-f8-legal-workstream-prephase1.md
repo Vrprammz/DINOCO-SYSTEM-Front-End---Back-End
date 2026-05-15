@@ -1,4 +1,4 @@
-> ⚠️ **SUPERSEDED 2026-05-15** by [35-boss-final-decisions-2026-05-15.md](./35-boss-final-decisions-2026-05-15.md). Boss decision: F#8 uses non-VAT บัญชีบุคคล — NO legal workstream, NO VAT calculation, NO tax invoice. DO NOT send the email template in this doc.
+> ⚠️ **SUPERSEDED 2026-05-15** by [35-boss-final-decisions-2026-05-15.md](../35-boss-final-decisions-2026-05-15.md). Boss decision: F#8 uses non-VAT บัญชีบุคคล — NO legal workstream, NO VAT calculation, NO tax invoice. DO NOT send the email template in this doc.
 
 # ⚖️ F#8 Legal Workstream — Pre-Phase 1 Kickoff
 
