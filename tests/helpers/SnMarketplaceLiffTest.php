@@ -93,17 +93,19 @@ if ( ! function_exists( __NAMESPACE__ . '\\mpx_check_ownership' ) ) {
         return array( 'ok' => false, 'reason' => 'grace_exceeded', 'days_past_expiry' => $days_past );
     }
 
-    function mpx_compute_total( $base_price, $discount = 0.0, $vat_rate = 0.07 ): array {
+    function mpx_compute_total( $base_price, $discount = 0.0, $vat_rate = 0.0 ): array {
+        // V.0.6 (boss 2026-05-15 non-VAT บัญชีบุคคล): VAT calculation REMOVED.
+        // $vat_rate param retained for backward-compat but value FORCED to 0.
+        // Mirror production helper in [System] DINOCO Warranty Extension Marketplace V.0.6.
+        unset( $vat_rate );  // intentionally ignored — see V.0.6 contract
         $base = max( 0.0, (float) $base_price );
         $disc = max( 0.0, min( $base, (float) $discount ) );
-        $vat_rate = max( 0.0, (float) $vat_rate );
-        $subtotal_after_disc = $base - $disc;
-        $vat = round( $subtotal_after_disc * $vat_rate, 2 );
-        $total = round( $subtotal_after_disc + $vat, 2 );
+        $vat = 0.0;
+        $total = round( $base - $disc + $vat, 2 );
         return array(
             'subtotal' => round( $base, 2 ),
             'discount' => round( $disc, 2 ),
-            'vat'      => $vat,
+            'vat'      => $vat,  // always 0 — keep for backward-compat
             'total'    => $total,
         );
     }
@@ -254,20 +256,21 @@ class SnMarketplaceLiffTest extends TestCase {
 
     /* ─── Total computation (5 tests) ───────────────────────── */
 
-    public function test_total_basic_with_vat(): void {
+    public function test_total_basic_no_vat(): void {
+        // V.0.6 (boss 2026-05-15): non-VAT บัญชีบุคคล — total = base regardless of $vat_rate arg.
         $r = mpx_compute_total( 1000.00, 0, 0.07 );
         $this->assertSame( 1000.00, $r['subtotal'] );
         $this->assertSame( 0.00, $r['discount'] );
-        $this->assertSame( 70.00, $r['vat'] );
-        $this->assertSame( 1070.00, $r['total'] );
+        $this->assertSame( 0.00, $r['vat'], 'VAT MUST be 0 post-V.0.6 (non-VAT บัญชีบุคคล)' );
+        $this->assertSame( 1000.00, $r['total'], 'Total = base - discount (no VAT added)' );
     }
 
     public function test_total_with_discount(): void {
         $r = mpx_compute_total( 1000.00, 100.00, 0.07 );
         $this->assertSame( 100.00, $r['discount'] );
-        // (1000-100)*0.07 = 63
-        $this->assertSame( 63.00, $r['vat'] );
-        $this->assertSame( 963.00, $r['total'] );
+        $this->assertSame( 0.00, $r['vat'], 'No VAT post-V.0.6' );
+        // V.0.6: total = 1000 - 100 = 900 (no VAT line)
+        $this->assertSame( 900.00, $r['total'] );
     }
 
     public function test_total_discount_capped_at_subtotal(): void {
@@ -284,10 +287,18 @@ class SnMarketplaceLiffTest extends TestCase {
         $this->assertSame( 0.00, $r['total'] );
     }
 
-    public function test_total_zero_vat(): void {
-        $r = mpx_compute_total( 1500.00, 0, 0 );
-        $this->assertSame( 0.00, $r['vat'] );
-        $this->assertSame( 1500.00, $r['total'] );
+    public function test_total_vat_rate_arg_ignored(): void {
+        // V.0.6 contract: even if caller passes $vat_rate > 0, result MUST have vat=0.
+        // This prevents accidental VAT re-introduction via stale caller code.
+        $r1 = mpx_compute_total( 1500.00, 0, 0 );
+        $r2 = mpx_compute_total( 1500.00, 0, 0.07 );  // SAME result expected
+        $r3 = mpx_compute_total( 1500.00, 0, 0.20 );  // SAME result expected
+        $this->assertSame( 0.00, $r1['vat'] );
+        $this->assertSame( 0.00, $r2['vat'], 'vat_rate=0.07 MUST be ignored post-V.0.6' );
+        $this->assertSame( 0.00, $r3['vat'], 'vat_rate=0.20 MUST be ignored post-V.0.6' );
+        $this->assertSame( 1500.00, $r1['total'] );
+        $this->assertSame( 1500.00, $r2['total'] );
+        $this->assertSame( 1500.00, $r3['total'] );
     }
 
     /* ─── Image compression target (5 tests) ────────────────── */

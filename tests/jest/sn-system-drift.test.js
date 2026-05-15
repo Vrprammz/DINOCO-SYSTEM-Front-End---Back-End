@@ -5040,7 +5040,11 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(t).toContain('test_ownership_match_ok');
             expect(t).toContain('test_status_registered_allowed');
             expect(t).toContain('test_grace_warranty_not_yet_expired_eligible');
-            expect(t).toContain('test_total_basic_with_vat');
+            // V.0.6 (boss 2026-05-15 non-VAT บัญชีบุคคล): renamed test_total_basic_with_vat
+            // → test_total_basic_no_vat. Drift detector accepts new name + asserts new contract
+            // (vat_rate arg ignored). See feedback_non_vat_personal_bank.md.
+            expect(t).toContain('test_total_basic_no_vat');
+            expect(t).toContain('test_total_vat_rate_arg_ignored');
             expect(t).toContain('test_compress_over_2mb_target_quality_85');
             // Grace boundary edge case covered
             expect(t).toContain('test_grace_exactly_at_grace_boundary_eligible');
