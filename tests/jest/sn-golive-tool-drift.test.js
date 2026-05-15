@@ -153,12 +153,46 @@ describe("SN Go-Live Tool — admin activation shortcode (V.1.0)", () => {
   });
 
   describe("Version + DB_ID", () => {
-    test("Version V.1.0 header", () => {
+    test("Version V.1.0 header (foundation)", () => {
       expect(content).toMatch(/Version:\s*V\.1\.0.*Go-Live wizard/);
+    });
+
+    test("Version V.1.2 header (standalone URL)", () => {
+      expect(content).toMatch(/Version:\s*V\.1\.2.*Standalone URL/);
     });
 
     test("Shortcode name in header", () => {
       expect(content).toMatch(/Shortcode:\s*\[dinoco_sn_golive\]/);
+    });
+  });
+
+  describe("V.1.2 standalone URL bypasses theme/Elementor", () => {
+    test("template_redirect hook registered at priority 5", () => {
+      expect(content).toMatch(
+        /add_action\(\s*'template_redirect',\s*'dinoco_sn_golive_template_redirect',\s*5\s*\)/
+      );
+    });
+
+    test("URL match /dinoco-sn-golive/ (with + without trailing slash)", () => {
+      expect(content).toMatch(/'\/dinoco-sn-golive'\s*\|\|.*'\/dinoco-sn-golive\/'/);
+    });
+
+    test("Login redirect when not logged in", () => {
+      expect(content).toMatch(/wp_safe_redirect\(\s*wp_login_url/);
+    });
+
+    test("403 page for non-admin logged-in user", () => {
+      expect(content).toMatch(/status_header\(\s*403\s*\)[\s\S]{0,500}Admin only/);
+    });
+
+    test("Renders full DOCTYPE + wp_head + wp_footer (no theme wrap)", () => {
+      expect(content).toMatch(/<!doctype html><html lang="th">/);
+      expect(content).toMatch(/wp_head\(\)/);
+      expect(content).toMatch(/wp_footer\(\)/);
+      // exit; after render to prevent theme template
+      expect(content).toMatch(
+        /dinoco_sn_golive_template_redirect[\s\S]{0,3500}exit;/
+      );
     });
   });
 });
