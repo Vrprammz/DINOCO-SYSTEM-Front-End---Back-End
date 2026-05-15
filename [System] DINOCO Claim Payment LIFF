@@ -1,6 +1,18 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO Claim Payment LIFF                              ║
+ * ║  Version: V.0.12 (2026-05-15) — Round 56 Idempotency-Key wrap on  ║
+ * ║    /charges/{id}/approve-refund (CRITICAL 4-eyes audit op):       ║
+ * ║      • Approver double-click = orphan consent_token risk +         ║
+ * ║        duplicate INSERTs (uq_consent_token UNIQUE catches but      ║
+ * ║        admin sees only first token returned; orphan rows linger)   ║
+ * ║      • Body hash {charge_id, ttl_minutes, approver_user_id}        ║
+ * ║      • Different ttl_minutes mid-retry → 409 (admin re-evaluation)│
+ * ║      • Layered over 20/hr rate limit microsecond window            ║
+ * ║    Push toward 85% milestone (161 → 162/196 = 82.65%); plus       ║
+ * ║    accounting fix: registers 6 already-wrapped transition POSTs   ║
+ * ║    (verify/reject/refund/cancel/upload-slip/charge-create) in     ║
+ * ║    tracker as dinoco-claim/v1 cluster expansion → 168/196 = 85.7%║
  * ║  Version: V.0.11 (2026-05-14) — Sprint 32 deprecation redirect:  ║
  * ║    Boss UX refactor: customer Claim Payment + History pages       ║
  * ║    DEPRECATED. Customer journey moved INLINE into Member          ║
@@ -1123,6 +1135,39 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_approve_refund' ) ) {
             if ( is_wp_error( $rl ) ) return $rl;
         }
 
+        // Round 56 (2026-05-15) — Idempotency-Key wrapper. CRITICAL 4-eyes audit op.
+        // Approver "อนุมัติคืนเงิน" double-click on slow UPDATE prior-revoke + INSERT new
+        // consent_token row → 2× UPDATE consumed_at (idempotent) + 2× INSERT new token
+        // rows (orphan token risk — only ONE returned to admin via response, the other
+        // is dangling in DB until uq_consent_token UNIQUE catches; downstream refund
+        // handler uses returned token). Body hash = {charge_id, ttl_minutes, approver_uid}.
+        // Different ttl_minutes mid-retry → 409 catches admin re-evaluating expiry window.
+        // Layered defense over 20/hr rate limit (microsecond window — cached replay covers
+        // 24h TTL beyond rate limit window).
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco-claim/v1::charge-approve-refund';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'charge_id'        => (int) $chid,
+                'ttl_minutes'      => (int) $ttl_minutes,
+                'approver_user_id' => (int) $uid,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data    = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code ) );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return $resp;
+            }
+        }
+
         if ( ! function_exists( 'dinoco_claim_charges_table_name' ) || ! function_exists( 'dinoco_claim_refund_approvals_table_name' ) ) {
             return new WP_Error( 'schema_missing', 'Charges schema not installed', array( 'status' => 500 ) );
         }
@@ -1206,13 +1251,18 @@ if ( ! function_exists( 'dinoco_claim_payment_rest_approve_refund' ) ) {
             return new WP_Error( 'consent_insert_failed', 'Failed to issue consent token', array( 'status' => 500 ) );
         }
 
-        return array(
+        $resp_arr = array(
             'token'            => $token,
             'expires_at'       => $expires,
             'approver_user_id' => $uid,
             'charge_id'        => $chid,
             'ttl_minutes'      => $ttl_minutes,
         );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                array_merge( $resp_arr, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return $resp_arr;
     }
 }
 
