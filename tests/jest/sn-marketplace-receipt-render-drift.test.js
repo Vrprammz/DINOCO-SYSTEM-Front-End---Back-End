@@ -68,4 +68,25 @@ describe('SN marketplace receipt render — Phase 6 W19+ (V.0.50)', () => {
   test('version header bumped to V.0.50', () => {
     expect(content).toMatch(/Version: V\.0\.50.*marketplace receipt/);
   });
+
+  test('V.0.51 logo branding — 3-tier resolver chain', () => {
+    // Resolves via dinoco_brand_logo_url('dark') → b2b_get_logo_url() → hardcoded URL.
+    const fn = content.match(/function\s+dinoco_sn_rest_marketplace_receipt_render[\s\S]{0,8000}/);
+    expect(fn).toBeTruthy();
+    expect(fn[0]).toMatch(/dinoco_brand_logo_url\(\s*'dark'\s*\)/);
+    expect(fn[0]).toMatch(/b2b_get_logo_url\(\)/);
+    expect(fn[0]).toMatch(/dinoco\.in\.th\/wp-content\/uploads\/2026\/02\/logodnc\.png/);
+  });
+
+  test('V.0.51 logo emitted in HTML brand strip + esc_url sanitization', () => {
+    const fn = content.match(/function\s+dinoco_sn_rest_marketplace_receipt_render[\s\S]{0,8000}/);
+    expect(fn).toBeTruthy();
+    expect(fn[0]).toMatch(/\$esc_logo\s*=\s*esc_url\(\s*\$brand_logo\s*\)/);
+    expect(fn[0]).toMatch(/<img src="' \. \$esc_logo \. '"/);
+    expect(fn[0]).toMatch(/'<div class="brand">'/);
+  });
+
+  test('V.0.51 version header bumped', () => {
+    expect(content).toMatch(/Version: V\.0\.51.*Receipt branding.*DINOCO logo/);
+  });
 });
