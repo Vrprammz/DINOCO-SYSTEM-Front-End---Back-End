@@ -1,3 +1,5 @@
+> ⚠️ **SUPERSEDED 2026-05-15** by [35-boss-final-decisions-2026-05-15.md](./35-boss-final-decisions-2026-05-15.md). Boss seeds 2 admins himself via Role Manager matrix UI — no 10-user UAT script needed.
+
 # 🎭 Q15 R2 Role Matrix UAT Plan
 
 **Version**: 1.0 (2026-05-07)

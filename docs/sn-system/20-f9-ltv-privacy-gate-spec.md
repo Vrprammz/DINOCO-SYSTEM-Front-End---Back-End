@@ -1,3 +1,5 @@
+> ⚠️ **CLOSED 2026-05-15** by [35-boss-final-decisions-2026-05-15.md](./35-boss-final-decisions-2026-05-15.md). Boss: use existing role gates in system; no extra spec needed. F#9 LTV already role-gated via `dinoco_sn_view_pii` capability.
+
 # 🔐 F#9 LTV Dashboard Privacy Gate Spec (Backend Cap Enforcement)
 
 **Version**: 1.0 (2026-05-07)
