@@ -10,6 +10,46 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Added — F#8 non-VAT scope refactor + Boss 6-decisions close (2026-05-15)
+
+Boss closed all 6 pending SN system decisions in single round. ZERO boss-blocked
+items remain in roadmap.
+
+**Boss decisions** (`docs/sn-system/35-boss-final-decisions-2026-05-15.md`):
+
+1. F#8 Extension Marketplace = **non-VAT บัญชีบุคคล** → CANCEL legal workstream
+   + VAT 7% calc + tax invoice format. F#8 effort 80h → ~30h.
+2. F#1-F#5 SN notifications → **เปิดได้เลย** (5 flag-flip commands ready).
+3. SN pilot 100 plate × 5 dealers → **CANCELLED** — vestigial from pre-v2.2.
+4. Q15 Role Manager → boss seeds 2 admins, push to prod.
+5. Q20 Manual Refund → activate immediately, CS team trains via docs.
+6. F#9 LTV → use existing role gates (no extra spec).
+
+**Commits**:
+
+- `f5f7cc8` NEW boss-decisions doc (440 lines) + 6 superseded docs + 3 memory files.
+- `653d15b` F#8 V.0.5 → V.0.6 — VAT calc removed + PHPUnit + drift detector sync.
+
+### Added — Idempotency Round 53-59 push to 95% milestone (2026-05-15)
+
+Sustained 7-round push from 78.1% → 94.9% coverage. **7 milestones crossed in
+17 rounds**: 50% R42 → 60% R46 → 70% R50 → 80% R54 → 85% R56 → 90% R58 → **95% R59**.
+
+| Round | Commit | Endpoints | Coverage | Milestone |
+|---|---|---|---|---|
+| R54 | `36ce3f0` | +4 Manual Invoice slip + destructive | 157/196 = 80.1% | 🎯 80% |
+| R55 | `06fe47e` | +4 Service Center + Public API tokens | 161/196 = 82.1% | — |
+| R56 | `991a458` | +7 Claim Payment (1 new + 6 helper) | 168/196 = 85.7% | 🎯 85% |
+| R57 | `274af83` | +8 GDPR PDPA + audit + sn-roles | 176/196 = 89.8% | — |
+| R58 | `b0b0590` | +1 B2F settings | 177/196 = 90.3% | 🎯 90% |
+| R59 | `4736ee8` | +9 Snippet 1+2 close-out | 186/196 = 94.9% | 🎯 95% |
+
+**NEW namespaces**: dinoco-claim/v1 (9) + dinoco-sn/v1 admin (2) + dinoco-gdpr/v1 (6).
+**Test cases**: 569 → 636 cumulative (41-round campaign Rounds 18-59).
+
+Remaining ~10 POSTs (5%): LINE webhook (platform retries), cron-triggered, pubapi
+(flag-gated OFF). 95% effectively complete for retry-prone admin/customer paths.
+
 ### Added — B2B Canonical Sprint 3 + 4 closure (2026-05-14 → 2026-05-15)
 
 Closed remaining `B2B-CANONICAL-REFERENCE-2026-05-13.md` §9 roadmap items per
