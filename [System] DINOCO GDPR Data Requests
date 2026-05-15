@@ -1,6 +1,14 @@
 /**
  * File: [System] DINOCO GDPR Data Requests
  * Description: GDPR / Thai PDPA compliance — self-service data export + deletion
+ * Version: V.4.3 — (2026-05-15): Round 57 Idempotency-Key wrap on 6 PDPA POSTs:
+ *   - /my-data-export, /my-data-delete (customer queue request — dedup over 24hr
+ *     existing dup-check window)
+ *   - /admin/request/{id}/approve (irreversible pending→processing transition)
+ *   - /admin/request/{id}/reject (state-machine with reason discriminator)
+ *   - /admin/request/{id}/undo (30s window cancel — destructive double-click)
+ *   - /admin/request/{id}/manual-export (synchronous worker run — heavy I/O)
+ *   Feature still flag-gated OFF (dinoco_gdpr_enabled default 0) — defense-in-depth.
  * Version: V.4.2 — (2026-05-07): Plan v2.13 §H Phase 4 W14.4 — CSV-format S/N
  *   scope helpers (additive supplement to V.4.1 JSON exports). Adds:
  *     - dinoco_gdpr_export_sn_pool_data($user_id, $request_id) — emits
@@ -560,6 +568,19 @@ if ( ! function_exists( 'dinoco_gdpr_rest_export' ) ) {
             return dinoco_gdpr_disabled_response();
         }
 
+        // Round 57 — Idempotency wrap. Customer "ขอ Export ข้อมูล" double-click → 2× queue
+        // request + 2× email confirmation. dinoco_gdpr_queue_request has dup-check 24hr
+        // window (returns existing pending) but cached idempotency adds full-TTL replay.
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'dinoco-gdpr/v1::my-data-export';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array( 'user_id' => (int) get_current_user_id(), 'type' => 'export' );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( is_array( $cached ) ) { unset( $cached['_idem_code'] ); return new WP_REST_Response( $cached, 202 ); }
+        }
+
         $user_id = get_current_user_id();
         $queued  = dinoco_gdpr_queue_request( $user_id, 'export' );
         if ( is_wp_error( $queued ) ) {
@@ -571,12 +592,16 @@ if ( ! function_exists( 'dinoco_gdpr_rest_export' ) ) {
             ), isset( $queued->get_error_data()['status'] ) ? $queued->get_error_data()['status'] : 400 );
         }
 
-        return new WP_REST_Response( array(
+        $resp_arr = array(
             'success' => true,
             'code'    => 'queued',
             'message' => 'Export request received. You will receive a download link via email within 30 days (PDPA Section 30).',
             'data'    => $queued,
-        ), 202 );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_arr, array( '_idem_code' => 202 ) ), 202 );
+        }
+        return new WP_REST_Response( $resp_arr, 202 );
     }
 }
 
@@ -584,6 +609,25 @@ if ( ! function_exists( 'dinoco_gdpr_rest_delete' ) ) {
     function dinoco_gdpr_rest_delete( WP_REST_Request $request ) {
         if ( ! dinoco_gdpr_is_enabled() ) {
             return dinoco_gdpr_disabled_response();
+        }
+
+        // Round 57 — Idempotency wrap on irreversible account deletion request.
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'dinoco-gdpr/v1::my-data-delete';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'user_id' => (int) get_current_user_id(),
+                'type'    => 'delete',
+                'confirm' => (string) $request->get_param( 'confirm' ),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( is_array( $cached ) ) {
+                $code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 202;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $code );
+            }
         }
 
         // Require explicit confirmation (defense against accidental calls)
@@ -607,12 +651,16 @@ if ( ! function_exists( 'dinoco_gdpr_rest_delete' ) ) {
             ), isset( $queued->get_error_data()['status'] ) ? $queued->get_error_data()['status'] : 400 );
         }
 
-        return new WP_REST_Response( array(
+        $resp_arr = array(
             'success' => true,
             'code'    => 'queued',
             'message' => 'Deletion request received. Admin will review within 30 days (PDPA Section 33). Account remains active until processed.',
             'data'    => $queued,
-        ), 202 );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_arr, array( '_idem_code' => 202 ) ), 202 );
+        }
+        return new WP_REST_Response( $resp_arr, 202 );
     }
 }
 
@@ -2788,6 +2836,25 @@ if ( ! function_exists( 'dinoco_gdpr_rest_admin_approve' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_id' ), 400 );
         }
 
+        // Round 57 — Idempotency wrap on irreversible approve→processing transition.
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'dinoco-gdpr/v1::admin-approve';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'request_id'    => (int) $id,
+                'confirm_text'  => (string) $request->get_param( 'confirm_text' ),
+                'actor_user_id' => (int) get_current_user_id(),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( is_array( $cached ) ) {
+                $code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $code );
+            }
+        }
+
         // Confirmation gate — caller must pass "APPROVE" (matches dinocoModal.confirm typed input)
         $confirm = (string) $request->get_param( 'confirm_text' );
         if ( $confirm !== 'APPROVE' ) {
@@ -2860,14 +2927,18 @@ if ( ! function_exists( 'dinoco_gdpr_rest_admin_approve' ) ) {
             'note'        => 'Worker scheduled at ' . $window_until . ' (30s undo window)',
         ) );
 
-        return new WP_REST_Response( array(
+        $resp_arr = array(
             'success'         => true,
             'request_id'      => $id,
             'scheduled'       => (bool) $scheduled,
             'scheduled_at'    => $window_until,
             'window_seconds'  => 30,
             'message'         => 'Approved. Worker fires after 30s undo window.',
-        ), 200 );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_arr, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $resp_arr, 200 );
     }
 }
 
@@ -2882,6 +2953,25 @@ if ( ! function_exists( 'dinoco_gdpr_rest_admin_reject' ) ) {
         }
         $id     = absint( $request->get_param( 'id' ) );
         $reason = sanitize_key( (string) $request->get_param( 'reason' ) );
+
+        // Round 57 — Idempotency wrap. reason discriminator catches admin re-evaluation.
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'dinoco-gdpr/v1::admin-reject';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'request_id'    => (int) $id,
+                'reason'        => $reason,
+                'actor_user_id' => (int) get_current_user_id(),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( is_array( $cached ) ) {
+                $code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $code );
+            }
+        }
         $note   = sanitize_textarea_field( (string) $request->get_param( 'note' ) );
         if ( $id <= 0 ) {
             return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_id' ), 400 );
@@ -2962,11 +3052,15 @@ if ( ! function_exists( 'dinoco_gdpr_rest_admin_reject' ) ) {
             dinoco_gdpr_email_user( (int) $row['user_id'], 'rejection', $payload );
         }
 
-        return new WP_REST_Response( array(
+        $resp_arr = array(
             'success'    => true,
             'request_id' => $id,
             'message'    => 'Request rejected. User notified via email.',
-        ), 200 );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_arr, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $resp_arr, 200 );
     }
 }
 
@@ -2983,6 +3077,22 @@ if ( ! function_exists( 'dinoco_gdpr_rest_admin_undo' ) ) {
         if ( $id <= 0 ) {
             return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_id' ), 400 );
         }
+
+        // Round 57 — Idempotency wrap on undo (30s window).
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'dinoco-gdpr/v1::admin-undo';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array( 'request_id' => (int) $id, 'actor_user_id' => (int) get_current_user_id() );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( is_array( $cached ) ) {
+                $code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $code );
+            }
+        }
+
         global $wpdb;
         $tbl = $wpdb->prefix . 'dinoco_gdpr_requests';
 
@@ -3050,11 +3160,15 @@ if ( ! function_exists( 'dinoco_gdpr_rest_admin_undo' ) ) {
             'note'        => 'Cancelled via 30s undo window',
         ) );
 
-        return new WP_REST_Response( array(
+        $resp_arr = array(
             'success'    => true,
             'request_id' => $id,
             'message'    => 'Approval cancelled. Worker unscheduled.',
-        ), 200 );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_arr, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $resp_arr, 200 );
     }
 }
 
@@ -3072,6 +3186,26 @@ if ( ! function_exists( 'dinoco_gdpr_rest_admin_manual_export' ) ) {
         if ( $id <= 0 ) {
             return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_id' ), 400 );
         }
+
+        // Round 57 — Idempotency wrap. Synchronous worker run = heavy DB+I/O cascade.
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'dinoco-gdpr/v1::admin-manual-export';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'request_id'    => (int) $id,
+                'confirm_text'  => (string) $request->get_param( 'confirm_text' ),
+                'actor_user_id' => (int) get_current_user_id(),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( is_array( $cached ) ) {
+                $code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $code );
+            }
+        }
+
         $confirm = (string) $request->get_param( 'confirm_text' );
         if ( $confirm !== 'PROCESS' ) {
             return new WP_REST_Response( array(
@@ -3125,12 +3259,16 @@ if ( ! function_exists( 'dinoco_gdpr_rest_admin_manual_export' ) ) {
         // Re-read final state
         $final = $wpdb->get_row( $wpdb->prepare( "SELECT id, status, notes FROM {$tbl} WHERE id = %d", $id ), ARRAY_A );
 
-        return new WP_REST_Response( array(
+        $resp_arr = array(
             'success'      => true,
             'request_id'   => $id,
             'final_status' => $final ? $final['status'] : '?',
             'message'      => 'Manual processing complete (synchronous)',
-        ), 200 );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_arr, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $resp_arr, 200 );
     }
 }
 

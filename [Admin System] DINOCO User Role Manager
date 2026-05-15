@@ -1,6 +1,10 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO User Role Manager                        ║
+ * ║  Version: V.0.5 (2026-05-15) — Round 57 Idempotency-Key wrap on              ║
+ * ║    /sn-roles/bulk-assign (bulk-of-targets up to 200 changes —                ║
+ * ║    canonical sort by user_id+role+action for order-stable hash;              ║
+ * ║    cached replay covers 24h TTL; different changes[] mid-retry → 409).       ║
  * ║  Version: V.0.4 (2026-05-07) — B1 audit signature fix + L1 nonce constant ║
  * ║  Version: V.0.3 (2026-05-07) — fix invalid_section: 'settings' → 'system' ║
  * ║  Version: V.0.2 (2026-05-05) — Q15 R2: matrix UI + bulk save    ║
@@ -227,6 +231,38 @@ if ( ! function_exists( 'dinoco_sn_rest_bulk_assign_roles' ) ) {
             return new WP_Error( 'too_many', 'แก้ทีละไม่เกิน 200 รายการ', array( 'status' => 413 ) );
         }
 
+        // Round 57 — Idempotency wrap. Admin "บันทึก Role Matrix" double-click on slow
+        // add_role/remove_role × 200 changes loop + audit row INSERT × N → 2× audit
+        // spam + role flicker (no-op on dup). Body hash = bulk-of-targets {changes
+        // canonicalized via user_id+role+action sort, actor_user_id}. Different changes[]
+        // mid-retry catches admin scope re-evaluation.
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'dinoco/v1::sn-roles-bulk-assign';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            // Canonical-normalize changes[] for order-stable hash (admin re-uploads
+            // same matrix in different order = cached 200 instant).
+            $normalized = array_map( function( $c ) {
+                return array(
+                    'user_id' => (int) ( $c['user_id'] ?? 0 ),
+                    'role'    => (string) ( $c['role'] ?? '' ),
+                    'action'  => (string) ( $c['action'] ?? '' ),
+                );
+            }, $changes );
+            usort( $normalized, function( $a, $b ) {
+                if ( $a['user_id'] !== $b['user_id'] ) return $a['user_id'] - $b['user_id'];
+                if ( $a['role']    !== $b['role'] )    return strcmp( $a['role'], $b['role'] );
+                return strcmp( $a['action'], $b['action'] );
+            } );
+            $idem_body = array(
+                'changes'       => $normalized,
+                'actor_user_id' => (int) get_current_user_id(),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) return $cached;
+            if ( is_array( $cached ) ) { unset( $cached['_idem_code'] ); return rest_ensure_response( $cached ); }
+        }
+
         $valid_roles = array( 'dinoco_sn_approver', 'dinoco_sn_warehouse', 'dinoco_sn_view_pii', 'dinoco_sn_readonly' );
         $applied = 0;
         $errors = array();
@@ -268,12 +304,16 @@ if ( ! function_exists( 'dinoco_sn_rest_bulk_assign_roles' ) ) {
             // No-op (add when already has, remove when doesn't have) — silent skip
         }
 
-        return rest_ensure_response( array(
+        $resp_arr = array(
             'applied'    => $applied,
             'errors'     => $errors,
             'total'      => count( $changes ),
             'no_op'      => count( $changes ) - $applied - count( $errors ),
-        ) );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_arr, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return rest_ensure_response( $resp_arr );
     }
 }
 
