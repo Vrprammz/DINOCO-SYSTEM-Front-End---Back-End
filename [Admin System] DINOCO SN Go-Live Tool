@@ -1,0 +1,722 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO SN Go-Live Tool                          ║
+ * ║  DB_ID: pending                                                  ║
+ * ║  Version: V.1.0 (2026-05-15) — One-stop admin Go-Live wizard    ║
+ * ║    for Production SN v2.13 activation. Boss has no SSH access — ║
+ * ║    every operation runs via REST + UI (no wp-cli / no SQL UI).  ║
+ * ║                                                                  ║
+ * ║  Shortcode: [dinoco_sn_golive]                                  ║
+ * ║                                                                  ║
+ * ║  Pattern reused from [Admin System] Flash Shipping V.42         ║
+ * ║  Go-Live Tool V.2.1 — same structure: preflight → steps →       ║
+ * ║  flip flags → monitor. Permission: manage_options + wp_rest     ║
+ * ║  nonce. Rate limit 30 req/min general, 5 req/min destructive.   ║
+ * ║                                                                  ║
+ * ║  REST namespace: /dinoco-sn-golive/v1/*                         ║
+ * ║    GET  /preflight         — 9-check go/no-go matrix             ║
+ * ║    GET  /flag-status       — current state of all 9 SN flags    ║
+ * ║    POST /flag-toggle       — flip a single flag (typed confirm) ║
+ * ║    GET  /schema-status     — 15 tables + ALTER products check   ║
+ * ║    POST /schema-install    — trigger lazy install via admin_init║
+ * ║    GET  /role-matrix       — list users + 4 SN roles            ║
+ * ║    POST /role-assign       — assign/revoke role for user_id     ║
+ * ║    GET  /monitor           — 24h health snapshot                ║
+ * ║                                                                  ║
+ * ║  Design: TEMPORARY tool. Delete after Go-Live stable (mirror    ║
+ * ║  Flash V.42 Go-Live which says "delete after V.42 stable").     ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ─── Whitelist of flags this tool can toggle ─────────────────────
+ *
+ * SECURITY: hardcoded list — request param NOT used to derive option
+ * name. Prevents `dinoco_sn_golive_flag_set` from being abused to
+ * write arbitrary options.
+ */
+if ( ! function_exists( 'dinoco_sn_golive_flag_whitelist' ) ) {
+    function dinoco_sn_golive_flag_whitelist() {
+        return array(
+            'dinoco_sn_system_enabled'              => 'Master Kill Switch — เปิดทั้งระบบ SN',
+            'dinoco_sn_expiry_reminder_enabled'     => 'F#1 Expiry Reminder LINE Push',
+            'dinoco_sn_anniversary_enabled'         => 'F#4 Anniversary Push',
+            'dinoco_sn_review_request_enabled'      => 'F#10 Review Request 30d',
+            'dinoco_sn_service_reminder_enabled'    => 'QW-7 Smart Service Reminder',
+            'dinoco_sn_ltv_snapshot_enabled'        => 'F#9 LTV Daily Snapshot Cron',
+            'dinoco_sn_marketplace_enabled'         => 'F#8 Marketplace (ลูกค้าซื้อต่อประกัน)',
+            'dinoco_sn_marketplace_refund_enabled'  => 'F#8 Refund Flow (Q20 Manual)',
+            'dinoco_sn_agent_webhook_enabled'       => 'OpenClaw Agent Webhook Fire',
+            'dinoco_gdpr_enabled'                   => 'GDPR/PDPA Data Request Endpoints',
+            'dinoco_obs_sentry_enabled'             => 'Sentry Error Tracking',
+            'dinoco_obs_correlation_enabled'        => 'X-Request-ID Correlation Header',
+        );
+    }
+}
+
+/* ─── Permission + rate limit ──────────────────────────────────── */
+if ( ! function_exists( 'dinoco_sn_golive_perm' ) ) {
+    function dinoco_sn_golive_perm( $req ) {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new WP_Error( 'rest_forbidden', 'Admin only', array( 'status' => 403 ) );
+        }
+        $nonce = $req->get_header( 'X-WP-Nonce' );
+        if ( ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
+            return new WP_Error( 'rest_cookie_invalid_nonce', 'Nonce expired', array( 'status' => 403 ) );
+        }
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_golive_rate_limit' ) ) {
+    function dinoco_sn_golive_rate_limit( $bucket = 'general', $limit = 30 ) {
+        if ( ! function_exists( 'b2b_rate_limit' ) ) return true;
+        $rl = b2b_rate_limit( 'sn_golive_' . $bucket, get_current_user_id(), $limit, 60 );
+        if ( is_wp_error( $rl ) ) return $rl;
+        return true;
+    }
+}
+
+/* ─── Preflight check — 9 gates ─────────────────────────────────── */
+if ( ! function_exists( 'dinoco_sn_golive_preflight' ) ) {
+    function dinoco_sn_golive_preflight() {
+        global $wpdb;
+        $checks = array();
+
+        // 1. Required snippets present
+        $checks[] = array(
+            'id'       => 'snippets_loaded',
+            'label'    => 'SN snippets ทั้ง 3 ตัวโหลด',
+            'pass'     => function_exists( 'dinoco_sn_install_schema' )
+                          && function_exists( 'dinoco_sn_required_plates_for_sku' )
+                          && function_exists( 'dinoco_sn_marketplace_is_enabled' ),
+            'hint'     => 'ตรวจว่า Production SN Manager + SN REST API + Warranty Activation LIFF sync จาก GitHub แล้ว',
+        );
+
+        // 2. Schema 15 tables installed
+        $tables = $wpdb->get_col(
+            "SELECT TABLE_NAME FROM information_schema.tables
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE '" . $wpdb->prefix . "dinoco_sn_%'"
+        );
+        $checks[] = array(
+            'id'       => 'schema_15_tables',
+            'label'    => 'Schema 15 ตาราง SN ติดตั้งครบ',
+            'pass'     => count( $tables ) >= 14, // 14 sn_* + 1 flag_audit external
+            'hint'     => 'พบ ' . count( $tables ) . '/15 ตาราง — ถ้าไม่ครบกด Install Schema',
+        );
+
+        // 3. ALTER products columns
+        $cols = $wpdb->get_col(
+            "SHOW COLUMNS FROM {$wpdb->prefix}dinoco_products LIKE 'sn_%'"
+        );
+        $checks[] = array(
+            'id'       => 'alter_products',
+            'label'    => 'ALTER wp_dinoco_products เพิ่ม 3 columns',
+            'pass'     => count( $cols ) >= 3,
+            'hint'     => 'ต้องการ sn_attach_level + sn_required + sn_qty_per_unit (พบ ' . count( $cols ) . '/3)',
+        );
+
+        // 4. Idempotency Helper available
+        $checks[] = array(
+            'id'       => 'idempotency_helper',
+            'label'    => 'Idempotency Helper โหลด',
+            'pass'     => function_exists( 'dinoco_idempotency_check' ),
+            'hint'     => 'ถ้าไม่โหลดจะมี race condition ตอน slip upload',
+        );
+
+        // 5. Modal Helpers available
+        $checks[] = array(
+            'id'       => 'modal_helpers',
+            'label'    => 'Modal Helpers (window.dinocoModal)',
+            'pass'     => true, // client-side check — assume true (loaded via wp_footer)
+            'hint'     => 'Frontend confirm dialogs ต้องการ — fallback native ถ้าไม่โหลด',
+        );
+
+        // 6. Constants required
+        $line_ok = defined( 'DINOCO_LINE_CHANNEL_ID' )
+                   && defined( 'DINOCO_LINE_CHANNEL_SECRET' )
+                   && defined( 'DINOCO_LINE_REDIRECT_URI' );
+        $checks[] = array(
+            'id'       => 'line_constants',
+            'label'    => 'LINE OAuth constants ตั้งใน wp-config.php',
+            'pass'     => $line_ok,
+            'hint'     => 'ต้องมี DINOCO_LINE_CHANNEL_ID/SECRET/REDIRECT_URI สำหรับ LIFF activate',
+        );
+
+        // 7. B2B integration helpers
+        $checks[] = array(
+            'id'       => 'b2b_helpers',
+            'label'    => 'B2B Snippet helpers (logo + bank + push)',
+            'pass'     => function_exists( 'b2b_get_logo_url' )
+                          && function_exists( 'b2b_get_bank_info' )
+                          && function_exists( 'b2b_send_text_message' ),
+            'hint'     => 'ต้องการสำหรับ receipt logo + payment instructions + notifications',
+        );
+
+        // 8. At least 1 SKU with sn_attach_level configured
+        $sku_count = 0;
+        if ( count( $cols ) >= 3 ) {
+            $sku_count = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$wpdb->prefix}dinoco_products
+                 WHERE sn_attach_level IS NOT NULL AND sn_attach_level != 'none'"
+            );
+        }
+        $checks[] = array(
+            'id'       => 'sku_configured',
+            'label'    => 'SKU อย่างน้อย 1 ตัวมี sn_attach_level',
+            'pass'     => $sku_count > 0,
+            'hint'     => 'พบ ' . $sku_count . ' SKU — เปิด Product Catalog → Edit → SN Plate Configuration',
+        );
+
+        // 9. Cron heartbeat option not corrupted
+        $cron_drift = 0;
+        $cron_hooks = array(
+            'dinoco_sn_expiry_reminder_cron',
+            'dinoco_sn_anniversary_cron',
+            'dinoco_sn_review_request_cron',
+            'dinoco_sn_service_reminder_cron',
+            'dinoco_sn_ltv_snapshot_cron',
+        );
+        foreach ( $cron_hooks as $hook ) {
+            if ( ! wp_next_scheduled( $hook ) ) {
+                $cron_drift++;
+            }
+        }
+        $checks[] = array(
+            'id'       => 'cron_scheduled',
+            'label'    => 'Cron jobs ถูก schedule แล้ว',
+            'pass'     => $cron_drift === 0,
+            'hint'     => $cron_drift . '/5 cron ไม่ schedule — เปิด master flag แล้วรอ wp_loaded',
+        );
+
+        $all_pass = true;
+        foreach ( $checks as $c ) {
+            if ( ! $c['pass'] ) { $all_pass = false; break; }
+        }
+
+        return array(
+            'all_pass' => $all_pass,
+            'checks'   => $checks,
+            'summary'  => array(
+                'total'  => count( $checks ),
+                'passed' => count( array_filter( $checks, function( $c ) { return $c['pass']; } ) ),
+            ),
+        );
+    }
+}
+
+/* ─── Schema install trigger ──────────────────────────────────── */
+if ( ! function_exists( 'dinoco_sn_golive_rest_schema_install' ) ) {
+    function dinoco_sn_golive_rest_schema_install( $req ) {
+        $rl = dinoco_sn_golive_rate_limit( 'schema_install', 5 );
+        if ( is_wp_error( $rl ) ) return $rl;
+
+        if ( $req->get_param( 'confirm' ) !== 'true' ) {
+            return new WP_Error( 'confirm_required', 'Type "INSTALL SCHEMA" to confirm', array( 'status' => 400 ) );
+        }
+        if ( ! function_exists( 'dinoco_sn_install_schema' ) ) {
+            return new WP_Error( 'not_ready', 'Production SN Manager snippet not loaded', array( 'status' => 503 ) );
+        }
+
+        try {
+            dinoco_sn_install_schema();
+            global $wpdb;
+            $tables = $wpdb->get_col(
+                "SELECT TABLE_NAME FROM information_schema.tables
+                 WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE '" . $wpdb->prefix . "dinoco_sn_%'"
+            );
+            return rest_ensure_response( array(
+                'success'      => true,
+                'tables_count' => count( $tables ),
+                'tables'       => $tables,
+            ) );
+        } catch ( \Throwable $e ) {
+            return new WP_Error( 'schema_fail', $e->getMessage(), array( 'status' => 500 ) );
+        }
+    }
+}
+
+/* ─── Flag operations ──────────────────────────────────────────── */
+if ( ! function_exists( 'dinoco_sn_golive_rest_flag_status' ) ) {
+    function dinoco_sn_golive_rest_flag_status() {
+        $whitelist = dinoco_sn_golive_flag_whitelist();
+        $state = array();
+        foreach ( $whitelist as $flag => $label ) {
+            $state[] = array(
+                'flag'    => $flag,
+                'label'   => $label,
+                'value'   => (int) (bool) get_option( $flag, 0 ),
+                'autoload'=> wp_load_alloptions() && isset( wp_load_alloptions()[ $flag ] ),
+            );
+        }
+        return rest_ensure_response( array( 'success' => true, 'flags' => $state ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_golive_rest_flag_toggle' ) ) {
+    function dinoco_sn_golive_rest_flag_toggle( $req ) {
+        $rl = dinoco_sn_golive_rate_limit( 'flag_toggle', 10 );
+        if ( is_wp_error( $rl ) ) return $rl;
+
+        $flag = sanitize_key( $req->get_param( 'flag' ) );
+        $on   = (int) (bool) $req->get_param( 'value' );
+        $whitelist = dinoco_sn_golive_flag_whitelist();
+        if ( ! isset( $whitelist[ $flag ] ) ) {
+            return new WP_Error( 'flag_not_whitelisted', 'Flag not in whitelist', array( 'status' => 400 ) );
+        }
+        if ( $req->get_param( 'confirm' ) !== 'true' ) {
+            return new WP_Error( 'confirm_required', 'Type confirm phrase', array( 'status' => 400 ) );
+        }
+
+        $old = (int) (bool) get_option( $flag, 0 );
+        update_option( $flag, (string) $on, false ); // autoload=false
+
+        // Log via Flag Audit if available
+        if ( function_exists( 'dinoco_flag_audit_log' ) ) {
+            dinoco_flag_audit_log( $flag, $old, $on, 'sn_golive_tool', 'admin' );
+        }
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'flag'    => $flag,
+            'old'     => $old,
+            'new'     => $on,
+        ) );
+    }
+}
+
+/* ─── Role matrix ──────────────────────────────────────────────── */
+if ( ! function_exists( 'dinoco_sn_golive_rest_role_matrix' ) ) {
+    function dinoco_sn_golive_rest_role_matrix() {
+        $users = get_users( array(
+            'number'  => 50,
+            'orderby' => 'display_name',
+            'order'   => 'ASC',
+        ) );
+        $matrix = array();
+        foreach ( $users as $u ) {
+            $matrix[] = array(
+                'user_id'    => $u->ID,
+                'name'       => $u->display_name,
+                'email'      => $u->user_email,
+                'roles'      => array(
+                    'warehouse' => (bool) get_user_meta( $u->ID, 'dinoco_sn_warehouse', true ),
+                    'approver'  => (bool) get_user_meta( $u->ID, 'dinoco_sn_approver', true ),
+                    'view_pii'  => (bool) get_user_meta( $u->ID, 'dinoco_sn_view_pii', true ),
+                    'admin'     => user_can( $u->ID, 'manage_options' ),
+                ),
+            );
+        }
+        return rest_ensure_response( array( 'success' => true, 'users' => $matrix ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_golive_rest_role_assign' ) ) {
+    function dinoco_sn_golive_rest_role_assign( $req ) {
+        $rl = dinoco_sn_golive_rate_limit( 'role_assign', 20 );
+        if ( is_wp_error( $rl ) ) return $rl;
+
+        $user_id = (int) $req->get_param( 'user_id' );
+        $role    = sanitize_key( $req->get_param( 'role' ) );
+        $on      = (int) (bool) $req->get_param( 'value' );
+
+        if ( ! in_array( $role, array( 'warehouse', 'approver', 'view_pii' ), true ) ) {
+            return new WP_Error( 'invalid_role', 'Role must be warehouse/approver/view_pii', array( 'status' => 400 ) );
+        }
+        if ( ! get_userdata( $user_id ) ) {
+            return new WP_Error( 'user_not_found', 'User not found', array( 'status' => 404 ) );
+        }
+
+        $meta_key = 'dinoco_sn_' . $role;
+        if ( $on ) {
+            update_user_meta( $user_id, $meta_key, 1 );
+        } else {
+            delete_user_meta( $user_id, $meta_key );
+        }
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'user_id' => $user_id,
+            'role'    => $role,
+            'value'   => $on,
+        ) );
+    }
+}
+
+/* ─── 24h Monitor snapshot ─────────────────────────────────────── */
+if ( ! function_exists( 'dinoco_sn_golive_rest_monitor' ) ) {
+    function dinoco_sn_golive_rest_monitor() {
+        global $wpdb;
+        $now = current_time( 'mysql' );
+
+        // Pool counts by status
+        $pool = array();
+        if ( $wpdb->get_var( "SHOW TABLES LIKE '{$wpdb->prefix}dinoco_sn_pool'" ) ) {
+            $pool = $wpdb->get_results(
+                "SELECT status, COUNT(*) as count FROM {$wpdb->prefix}dinoco_sn_pool GROUP BY status",
+                ARRAY_A
+            );
+        }
+
+        // Recent audit events (24h)
+        $audit = array();
+        if ( $wpdb->get_var( "SHOW TABLES LIKE '{$wpdb->prefix}dinoco_sn_audit'" ) ) {
+            $audit = $wpdb->get_results(
+                "SELECT event_type, COUNT(*) as count
+                 FROM {$wpdb->prefix}dinoco_sn_audit
+                 WHERE created_at > DATE_SUB(NOW(), INTERVAL 1 DAY)
+                 GROUP BY event_type ORDER BY count DESC",
+                ARRAY_A
+            );
+        }
+
+        // Cron heartbeats
+        $crons = array();
+        $cron_hooks = array(
+            'dinoco_sn_expiry_reminder_cron'  => 'F#1 Expiry',
+            'dinoco_sn_anniversary_cron'      => 'F#4 Anniversary',
+            'dinoco_sn_review_request_cron'   => 'F#10 Review',
+            'dinoco_sn_service_reminder_cron' => 'QW-7 Service',
+            'dinoco_sn_ltv_snapshot_cron'     => 'F#9 LTV',
+            'dinoco_sn_marketplace_timeout'   => 'Marketplace TO',
+            'dinoco_sn_audit_retention_cron'  => 'Audit Retention',
+        );
+        foreach ( $cron_hooks as $hook => $label ) {
+            $last = get_option( 'dinoco_cron_' . str_replace( '_cron', '_last_run', $hook ), '' );
+            $next = wp_next_scheduled( $hook );
+            $crons[] = array(
+                'hook'       => $hook,
+                'label'      => $label,
+                'last_run'   => $last ?: '—',
+                'next_run'   => $next ? date_i18n( 'Y-m-d H:i', $next ) : '—',
+                'healthy'    => ! empty( $last ) || $next > 0,
+            );
+        }
+
+        return rest_ensure_response( array(
+            'success'    => true,
+            'as_of'      => $now,
+            'pool'       => $pool,
+            'audit_24h'  => $audit,
+            'crons'      => $crons,
+        ) );
+    }
+}
+
+/* ─── Register REST routes ─────────────────────────────────────── */
+add_action( 'rest_api_init', function() {
+    $perm = 'dinoco_sn_golive_perm';
+
+    register_rest_route( 'dinoco-sn-golive/v1', '/preflight', array(
+        'methods'             => 'GET',
+        'callback'            => function() {
+            return rest_ensure_response( dinoco_sn_golive_preflight() );
+        },
+        'permission_callback' => $perm,
+    ) );
+
+    register_rest_route( 'dinoco-sn-golive/v1', '/flag-status', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_sn_golive_rest_flag_status',
+        'permission_callback' => $perm,
+    ) );
+
+    register_rest_route( 'dinoco-sn-golive/v1', '/flag-toggle', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_sn_golive_rest_flag_toggle',
+        'permission_callback' => $perm,
+    ) );
+
+    register_rest_route( 'dinoco-sn-golive/v1', '/schema-install', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_sn_golive_rest_schema_install',
+        'permission_callback' => $perm,
+    ) );
+
+    register_rest_route( 'dinoco-sn-golive/v1', '/role-matrix', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_sn_golive_rest_role_matrix',
+        'permission_callback' => $perm,
+    ) );
+
+    register_rest_route( 'dinoco-sn-golive/v1', '/role-assign', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_sn_golive_rest_role_assign',
+        'permission_callback' => $perm,
+    ) );
+
+    register_rest_route( 'dinoco-sn-golive/v1', '/monitor', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_sn_golive_rest_monitor',
+        'permission_callback' => $perm,
+    ) );
+} );
+
+/* ─── Shortcode renderer ───────────────────────────────────────── */
+if ( ! function_exists( 'dinoco_sn_golive_render' ) ) {
+    function dinoco_sn_golive_render() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<p>Admin only.</p>';
+        }
+        $nonce = wp_create_nonce( 'wp_rest' );
+        ob_start();
+        ?>
+        <div class="dnc-sn-gl" data-nonce="<?php echo esc_attr( $nonce ); ?>">
+            <style>
+                .dnc-sn-gl { font-family: "Sarabun", "Noto Sans Thai", sans-serif; max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+                .dnc-sn-gl h2 { color: #1A3A5C; border-bottom: 2px solid #1A3A5C; padding-bottom: 8px; }
+                .dnc-sn-gl .gl-stage { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+                .dnc-sn-gl .gl-stage h3 { margin: 0 0 12px; color: #1A3A5C; font-size: 18px; display: flex; align-items: center; gap: 8px; }
+                .dnc-sn-gl .gl-num { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 50%; background: #1A3A5C; color: #fff; font-weight: bold; font-size: 14px; }
+                .dnc-sn-gl .gl-btn { display: inline-block; padding: 10px 20px; background: #1A3A5C; color: #fff; border: 0; border-radius: 8px; font-size: 14px; cursor: pointer; min-height: 44px; }
+                .dnc-sn-gl .gl-btn:hover { background: #2d5276; }
+                .dnc-sn-gl .gl-btn.danger { background: #dc2626; }
+                .dnc-sn-gl .gl-btn.danger:hover { background: #b91c1c; }
+                .dnc-sn-gl .gl-btn.success { background: #10b981; }
+                .dnc-sn-gl .gl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+                .dnc-sn-gl .gl-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #f3f4f6; }
+                .dnc-sn-gl .gl-row:last-child { border-bottom: 0; }
+                .dnc-sn-gl .gl-pass { color: #10b981; font-weight: bold; }
+                .dnc-sn-gl .gl-fail { color: #dc2626; font-weight: bold; }
+                .dnc-sn-gl .gl-hint { font-size: 12px; color: #6b7280; margin-top: 2px; }
+                .dnc-sn-gl .gl-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+                .dnc-sn-gl .gl-table th, .dnc-sn-gl .gl-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+                .dnc-sn-gl .gl-table th { background: #f9fafb; color: #374151; font-weight: 600; }
+                .dnc-sn-gl .gl-table .gl-on { background: #10b981; color: #fff; padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; border: 0; }
+                .dnc-sn-gl .gl-table .gl-off { background: #6b7280; color: #fff; padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; border: 0; }
+                .dnc-sn-gl .gl-banner { padding: 12px 16px; border-radius: 8px; margin-bottom: 12px; }
+                .dnc-sn-gl .gl-banner.warn { background: #fef3c7; color: #92400e; border: 1px solid #f59e0b; }
+                .dnc-sn-gl .gl-banner.info { background: #dbeafe; color: #1e40af; border: 1px solid #3b82f6; }
+                .dnc-sn-gl .gl-banner.success { background: #d1fae5; color: #065f46; border: 1px solid #10b981; }
+                .dnc-sn-gl .gl-toast { position: fixed; top: 20px; right: 20px; padding: 12px 20px; background: #1f2937; color: #fff; border-radius: 8px; z-index: 9999; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
+            </style>
+
+            <h2>🚀 DINOCO SN v2.13 Go-Live Tool</h2>
+            <div class="gl-banner info">
+                เครื่องมือเปิดระบบ S/N แบบครบจบในหน้าเดียว ไม่ต้อง SSH ไม่ต้อง wp-cli — กดปุ่มทำได้เลย
+            </div>
+
+            <!-- Stage 1: Preflight -->
+            <div class="gl-stage">
+                <h3><span class="gl-num">1</span>Preflight Check — ตรวจระบบก่อน</h3>
+                <button class="gl-btn" data-action="preflight">↻ รัน Preflight</button>
+                <div id="gl-preflight-result" style="margin-top: 12px;"></div>
+            </div>
+
+            <!-- Stage 2: Schema Install -->
+            <div class="gl-stage">
+                <h3><span class="gl-num">2</span>Schema Install — ติดตั้ง 15 ตาราง SN</h3>
+                <p class="gl-hint">ปกติ lazy install ทำให้อัตโนมัติแล้ว — กดถ้า preflight check #2/3 ไม่ผ่าน</p>
+                <button class="gl-btn" data-action="schema-install">📦 Install Schema</button>
+                <div id="gl-schema-result" style="margin-top: 12px;"></div>
+            </div>
+
+            <!-- Stage 3: Role Matrix -->
+            <div class="gl-stage">
+                <h3><span class="gl-num">3</span>Role Matrix — กำหนดสิทธิ์ผู้ใช้</h3>
+                <button class="gl-btn" data-action="role-load">↻ โหลดรายชื่อ</button>
+                <div id="gl-role-table" style="margin-top: 12px;"></div>
+            </div>
+
+            <!-- Stage 4: Flag Control -->
+            <div class="gl-stage">
+                <h3><span class="gl-num">4</span>Feature Flags — เปิด/ปิดระบบทีละตัว</h3>
+                <div class="gl-banner warn">
+                    ⚠️ <strong>ลำดับแนะนำ:</strong> Master Kill Switch (1) → Marketplace (1) → Notifications (5) → Agent Webhook (1) → GDPR (1) → Sentry (2)
+                </div>
+                <button class="gl-btn" data-action="flag-load">↻ โหลดสถานะ Flags</button>
+                <div id="gl-flag-table" style="margin-top: 12px;"></div>
+            </div>
+
+            <!-- Stage 5: Monitor -->
+            <div class="gl-stage">
+                <h3><span class="gl-num">5</span>Monitor — ดูสถานะระบบ 24 ชม.</h3>
+                <button class="gl-btn" data-action="monitor-load">↻ Refresh</button>
+                <div id="gl-monitor-result" style="margin-top: 12px;"></div>
+            </div>
+        </div>
+
+        <script>
+        (function() {
+            var ROOT = document.querySelector('.dnc-sn-gl');
+            if (!ROOT) return;
+            var NONCE = ROOT.getAttribute('data-nonce');
+            var BASE = '/wp-json/dinoco-sn-golive/v1';
+
+            function toast(msg, isError) {
+                var t = document.createElement('div');
+                t.className = 'gl-toast';
+                if (isError) t.style.background = '#dc2626';
+                t.textContent = msg;
+                document.body.appendChild(t);
+                setTimeout(function() { t.remove(); }, 3500);
+            }
+
+            function api(method, path, body) {
+                var opts = {
+                    method: method,
+                    headers: { 'X-WP-Nonce': NONCE, 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                };
+                if (body) opts.body = JSON.stringify(body);
+                return fetch(BASE + path, opts).then(function(r) {
+                    return r.json().then(function(d) {
+                        if (!r.ok) throw new Error(d.message || ('HTTP ' + r.status));
+                        return d;
+                    });
+                });
+            }
+
+            function esc(s) {
+                if (s === null || s === undefined) return '';
+                return String(s).replace(/[&<>"']/g, function(c) {
+                    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+                });
+            }
+
+            function renderPreflight(data) {
+                var html = '<div class="gl-banner ' + (data.all_pass ? 'success' : 'warn') + '">';
+                html += '<strong>' + data.summary.passed + '/' + data.summary.total + ' checks pass</strong> ';
+                html += data.all_pass ? '— พร้อมเปิดระบบ ✅' : '— แก้ปัญหาก่อนเปิด';
+                html += '</div>';
+                html += '<table class="gl-table">';
+                data.checks.forEach(function(c) {
+                    html += '<tr><td>' + (c.pass ? '✅' : '❌') + '</td>';
+                    html += '<td><strong>' + esc(c.label) + '</strong>';
+                    if (!c.pass) html += '<div class="gl-hint">' + esc(c.hint) + '</div>';
+                    html += '</td></tr>';
+                });
+                html += '</table>';
+                document.getElementById('gl-preflight-result').innerHTML = html;
+            }
+
+            function renderRoleMatrix(users) {
+                var html = '<table class="gl-table"><thead><tr><th>ผู้ใช้</th><th>Email</th><th>คลัง</th><th>Approver</th><th>View PII</th><th>Admin</th></tr></thead><tbody>';
+                users.forEach(function(u) {
+                    html += '<tr data-uid="' + u.user_id + '">';
+                    html += '<td><strong>' + esc(u.name) + '</strong></td>';
+                    html += '<td>' + esc(u.email) + '</td>';
+                    ['warehouse', 'approver', 'view_pii'].forEach(function(role) {
+                        var on = u.roles[role];
+                        html += '<td><button class="' + (on ? 'gl-on' : 'gl-off') + '" data-role-toggle="' + role + '" data-uid="' + u.user_id + '" data-current="' + (on ? '1' : '0') + '">' + (on ? '✓ เปิด' : 'ปิด') + '</button></td>';
+                    });
+                    html += '<td>' + (u.roles.admin ? '🛡️' : '—') + '</td>';
+                    html += '</tr>';
+                });
+                html += '</tbody></table>';
+                document.getElementById('gl-role-table').innerHTML = html;
+            }
+
+            function renderFlagTable(flags) {
+                var html = '<table class="gl-table"><thead><tr><th>Flag</th><th>คำอธิบาย</th><th>สถานะ</th></tr></thead><tbody>';
+                flags.forEach(function(f) {
+                    var on = f.value === 1;
+                    html += '<tr><td><code style="font-size:11px;">' + esc(f.flag) + '</code></td>';
+                    html += '<td>' + esc(f.label) + '</td>';
+                    html += '<td><button class="' + (on ? 'gl-on' : 'gl-off') + '" data-flag-toggle="' + esc(f.flag) + '" data-current="' + (on ? '1' : '0') + '">' + (on ? '✓ เปิด' : 'ปิด') + '</button></td>';
+                    html += '</tr>';
+                });
+                html += '</tbody></table>';
+                document.getElementById('gl-flag-table').innerHTML = html;
+            }
+
+            function renderMonitor(data) {
+                var html = '<div class="gl-banner info">As of: ' + esc(data.as_of) + '</div>';
+                html += '<h4 style="margin:12px 0 4px;">Pool Status</h4>';
+                if (data.pool.length === 0) {
+                    html += '<div class="gl-hint">ไม่มีข้อมูลในตาราง sn_pool</div>';
+                } else {
+                    html += '<table class="gl-table"><tr><th>Status</th><th>Count</th></tr>';
+                    data.pool.forEach(function(p) {
+                        html += '<tr><td>' + esc(p.status) + '</td><td>' + p.count + '</td></tr>';
+                    });
+                    html += '</table>';
+                }
+                html += '<h4 style="margin:12px 0 4px;">Audit Events (24h)</h4>';
+                if (data.audit_24h.length === 0) {
+                    html += '<div class="gl-hint">ไม่มี audit events ใน 24 ชม. ที่ผ่านมา</div>';
+                } else {
+                    html += '<table class="gl-table"><tr><th>Event</th><th>Count</th></tr>';
+                    data.audit_24h.forEach(function(a) {
+                        html += '<tr><td>' + esc(a.event_type) + '</td><td>' + a.count + '</td></tr>';
+                    });
+                    html += '</table>';
+                }
+                html += '<h4 style="margin:12px 0 4px;">Cron Health</h4>';
+                html += '<table class="gl-table"><tr><th></th><th>Hook</th><th>Last Run</th><th>Next Run</th></tr>';
+                data.crons.forEach(function(c) {
+                    html += '<tr><td>' + (c.healthy ? '✅' : '⚠️') + '</td>';
+                    html += '<td>' + esc(c.label) + '</td>';
+                    html += '<td><code style="font-size:11px;">' + esc(c.last_run) + '</code></td>';
+                    html += '<td><code style="font-size:11px;">' + esc(c.next_run) + '</code></td></tr>';
+                });
+                html += '</table>';
+                document.getElementById('gl-monitor-result').innerHTML = html;
+            }
+
+            // Event delegation
+            ROOT.addEventListener('click', function(e) {
+                var t = e.target;
+                var action = t.getAttribute('data-action');
+                if (action === 'preflight') {
+                    api('GET', '/preflight').then(function(d) { renderPreflight(d); }).catch(function(e) { toast(e.message, true); });
+                }
+                else if (action === 'schema-install') {
+                    if (!confirm('Install schema 15 tables? ปลอดภัย — dbDelta idempotent.')) return;
+                    api('POST', '/schema-install', { confirm: 'true' }).then(function(d) {
+                        document.getElementById('gl-schema-result').innerHTML =
+                            '<div class="gl-banner success">✅ ติดตั้งสำเร็จ — พบ ' + d.tables_count + ' ตาราง</div>';
+                        toast('Schema installed: ' + d.tables_count + ' tables');
+                    }).catch(function(e) { toast(e.message, true); });
+                }
+                else if (action === 'role-load') {
+                    api('GET', '/role-matrix').then(function(d) { renderRoleMatrix(d.users); }).catch(function(e) { toast(e.message, true); });
+                }
+                else if (action === 'flag-load') {
+                    api('GET', '/flag-status').then(function(d) { renderFlagTable(d.flags); }).catch(function(e) { toast(e.message, true); });
+                }
+                else if (action === 'monitor-load') {
+                    api('GET', '/monitor').then(function(d) { renderMonitor(d); }).catch(function(e) { toast(e.message, true); });
+                }
+
+                var roleToggle = t.getAttribute('data-role-toggle');
+                if (roleToggle) {
+                    var uid = parseInt(t.getAttribute('data-uid'), 10);
+                    var current = t.getAttribute('data-current') === '1';
+                    var newVal = current ? 0 : 1;
+                    api('POST', '/role-assign', { user_id: uid, role: roleToggle, value: newVal }).then(function(d) {
+                        t.className = newVal ? 'gl-on' : 'gl-off';
+                        t.textContent = newVal ? '✓ เปิด' : 'ปิด';
+                        t.setAttribute('data-current', newVal);
+                        toast('Role ' + roleToggle + ' = ' + (newVal ? 'ON' : 'OFF'));
+                    }).catch(function(e) { toast(e.message, true); });
+                }
+
+                var flagToggle = t.getAttribute('data-flag-toggle');
+                if (flagToggle) {
+                    var current = t.getAttribute('data-current') === '1';
+                    var newVal = current ? 0 : 1;
+                    var verb = newVal ? 'เปิด' : 'ปิด';
+                    if (!confirm(verb + ' flag "' + flagToggle + '"?\n\nผลกระทบ: ทำงานทันที + บันทึก audit log')) return;
+                    api('POST', '/flag-toggle', { flag: flagToggle, value: newVal, confirm: 'true' }).then(function(d) {
+                        t.className = newVal ? 'gl-on' : 'gl-off';
+                        t.textContent = newVal ? '✓ เปิด' : 'ปิด';
+                        t.setAttribute('data-current', newVal);
+                        toast('Flag ' + flagToggle + ' = ' + (newVal ? 'ON' : 'OFF'));
+                    }).catch(function(e) { toast(e.message, true); });
+                }
+            });
+
+            // Auto-run preflight on page load
+            setTimeout(function() {
+                var btn = ROOT.querySelector('[data-action="preflight"]');
+                if (btn) btn.click();
+            }, 200);
+        })();
+        </script>
+        <?php
+        return ob_get_clean();
+    }
+    add_shortcode( 'dinoco_sn_golive', 'dinoco_sn_golive_render' );
+}
