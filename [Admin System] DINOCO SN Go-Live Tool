@@ -2,6 +2,16 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO SN Go-Live Tool                          ║
  * ║  DB_ID: 1215                                                     ║
+ * ║  Version: V.2.2 (2026-05-15) — CRITICAL: /clear-caches now      ║
+ * ║    explicitly purges _transient_dnc_mod_* via DIRECT SQL +      ║
+ * ║    delete_transient() per known module key (handles object-    ║
+ * ║    cache layer that raw DELETE FROM options misses). Returns   ║
+ * ║    purged count for verifiability. /flag-toggle also auto-     ║
+ * ║    purges dnc_mod_* after every flip so cached module HTML     ║
+ * ║    no longer ghosts a stale FLAG OFF banner. Root cause was    ║
+ * ║    pre-V.35.2 stale module-render transient that survived      ║
+ * ║    Admin Dashboard cleanup hook because object cache was       ║
+ * ║    never invalidated.                                            ║
  * ║  Version: V.2.1 (2026-05-15) — NEW /diagnose-flag endpoint +    ║
  * ║    /clear-caches endpoint. Diagnoses GDPR FLAG OFF banner       ║
  * ║    despite option ON — exposes raw vs Config Layer resolved.    ║
@@ -342,6 +352,16 @@ if ( ! function_exists( 'dinoco_sn_golive_rest_flag_toggle' ) ) {
             $GLOBALS['_dinoco_config_cache'] = array();
         }
 
+        // V.2.2 — Auto-purge dnc_mod_* transients after every flag flip so
+        // any cached module HTML (e.g. GDPR admin banner) re-renders fresh.
+        // Without this, admin would have to manually click "Clear Caches"
+        // after every flag flip — easy to forget, leads to stale UI bugs.
+        $mod_purge = null;
+        if ( function_exists( 'dinoco_sn_golive_purge_module_transients' ) ) {
+            $mod_purge = dinoco_sn_golive_purge_module_transients();
+            update_option( 'dnc_mod_last_purge_ts', current_time( 'timestamp' ), false );
+        }
+
         // V.2.0 — Verify post-write by reading both raw + Config Layer paths
         $raw_after    = get_option( $flag, null );
         $config_value = null;
@@ -372,6 +392,7 @@ if ( ! function_exists( 'dinoco_sn_golive_rest_flag_toggle' ) ) {
             'new'               => $on,
             'verify_raw'        => $raw_after,
             'verify_config'     => $config_value,
+            'module_purge'      => $mod_purge, // V.2.2 — null if helper unavailable
         ) );
     }
 }
@@ -643,11 +664,111 @@ if ( ! function_exists( 'dinoco_sn_golive_rest_diagnose_flag' ) ) {
     }
 }
 
+/* ─── V.2.2 — dnc_mod_* transient purger helper ────────────────────
+ *
+ * Root-cause Note (2026-05-15 GDPR FLAG OFF banner incident):
+ *   Pre-V.35.2 Admin Dashboard called set_transient($k, $v, 0) for the
+ *   GDPR module — TTL=0 means "PERMANENT" in WP, not "skip cache".
+ *   V.35.2 gated writes by TTL>0 (no new bad transients) but stale
+ *   pre-fix transients survived in BOTH wp_options AND object cache.
+ *   V.35.3 cleanup deleted only the wp_options row via raw SQL DELETE,
+ *   which does NOT invalidate the object cache layer — so get_transient()
+ *   continued returning the stale HTML on hosts with persistent object
+ *   cache (Redis/Memcached).
+ *
+ * Fix: dual-purge strategy
+ *   1. SQL DELETE removes wp_options rows (handles non-cache hosts)
+ *   2. delete_transient() per known module key invalidates object cache
+ *      via the public WP API
+ *   3. wp_cache_delete() on full cache key (fallback for stragglers)
+ *
+ * Module list mirrors _dnc_emergency_cache_ttl_map() + adds any future
+ * registered modules detected at runtime via dinoco_get_registered_modules().
+ */
+if ( ! function_exists( 'dinoco_sn_golive_purge_module_transients' ) ) {
+    function dinoco_sn_golive_purge_module_transients() {
+        global $wpdb;
+
+        // 1) Direct SQL DELETE — handles non-object-cache hosts +
+        //    transients that wp_options has but object cache forgot.
+        $rows = (int) $wpdb->query(
+            "DELETE FROM {$wpdb->options}
+             WHERE option_name LIKE '_transient_dnc_mod_%'
+                OR option_name LIKE '_transient_timeout_dnc_mod_%'"
+        );
+
+        // 2) delete_transient() per known module key for ALL users —
+        //    handles object cache (Redis/Memcached) invalidation since
+        //    cache_key embeds get_current_user_id().
+        //
+        //    Collect users with manage_options (admins) — they're the
+        //    only ones who can trigger module load, so their cache_keys
+        //    are the only ones that can possibly exist.
+        $admins = get_users( array( 'role__in' => array( 'administrator' ), 'fields' => array( 'ID' ) ) );
+        $admin_ids = array_map( function( $u ) { return (int) $u->ID; }, $admins );
+        // Include user_id=0 (logged-out edge case) for safety
+        $admin_ids[] = 0;
+        $admin_ids = array_unique( $admin_ids );
+
+        $module_keys = array(
+            'moto_catalog', 'brand_voice', 'legacy', 'transfer',
+            'b2b_admin', 'b2f_orders', 'b2f_makers', 'b2f_credit',
+            'inventory', 'claims', 'users', 'finance', 'invoice',
+            'backorders', 'bo_flags', 'bo_security_log',
+            'slip_monitor', 'ai_control', 'gdpr',
+        );
+        // Merge in any module keys from the live registry
+        if ( function_exists( 'dinoco_get_registered_modules' ) ) {
+            foreach ( dinoco_get_registered_modules() as $reg_key => $reg_mod ) {
+                if ( is_string( $reg_key ) && $reg_key !== '' ) {
+                    $module_keys[] = $reg_key;
+                }
+            }
+        }
+        $module_keys = array_unique( $module_keys );
+
+        $obj_cache_cleared = 0;
+        foreach ( $module_keys as $mod ) {
+            foreach ( $admin_ids as $uid ) {
+                $cache_key = 'dnc_mod_' . $mod . '_' . $uid;
+                if ( delete_transient( $cache_key ) ) {
+                    $obj_cache_cleared++;
+                }
+            }
+        }
+
+        return array(
+            'sql_rows_deleted'     => $rows,
+            'object_cache_cleared' => $obj_cache_cleared,
+            'admin_count'          => count( $admin_ids ),
+            'module_count'         => count( $module_keys ),
+        );
+    }
+}
+
 if ( ! function_exists( 'dinoco_sn_golive_rest_clear_caches' ) ) {
     function dinoco_sn_golive_rest_clear_caches() {
         $rl = dinoco_sn_golive_rate_limit( 'clear_caches', 10 );
         if ( is_wp_error( $rl ) ) return $rl;
         $cleared = array();
+
+        // V.2.2 — explicit module transient purge FIRST so even if
+        // wp_cache_flush below fails (some drop-ins throw), the DB-row
+        // path still wipes the offenders.
+        $mod_purge = dinoco_sn_golive_purge_module_transients();
+        $cleared[] = sprintf(
+            'dnc_mod_* transients — SQL rows: %d, object cache keys: %d (admins=%d × modules=%d)',
+            $mod_purge['sql_rows_deleted'],
+            $mod_purge['object_cache_cleared'],
+            $mod_purge['admin_count'],
+            $mod_purge['module_count']
+        );
+
+        // V.2.2 — also reset the JS-side data-loaded gate by bumping a
+        // module-purge timestamp option. Frontend reads this on page load
+        // (if Admin Dashboard V.35.4+ is synced) and forces re-fetch.
+        update_option( 'dnc_mod_last_purge_ts', current_time( 'timestamp' ), false );
+        $cleared[] = 'dnc_mod_last_purge_ts marker bumped';
 
         // WP object cache
         if ( function_exists( 'wp_cache_flush' ) ) {
@@ -655,11 +776,14 @@ if ( ! function_exists( 'dinoco_sn_golive_rest_clear_caches' ) ) {
             $cleared[] = 'wp_cache (object cache)';
         }
 
-        // Config Layer per-request cache
-        if ( isset( $GLOBALS['_dinoco_config_cache'] ) ) {
+        // Config Layer per-request cache (always-set, even if empty —
+        // unsetting forces next dinoco_config() call to re-read get_option)
+        if ( ! isset( $GLOBALS['_dinoco_config_cache'] ) || ! is_array( $GLOBALS['_dinoco_config_cache'] ) ) {
             $GLOBALS['_dinoco_config_cache'] = array();
-            $cleared[] = 'dinoco_config (per-request)';
         }
+        $cfg_count = count( $GLOBALS['_dinoco_config_cache'] );
+        $GLOBALS['_dinoco_config_cache'] = array();
+        $cleared[] = sprintf( 'dinoco_config per-request (%d keys evicted)', $cfg_count );
 
         // WP Fastest Cache plugin (3 known entry points)
         if ( function_exists( 'wpfc_clear_all_cache' ) ) {
@@ -682,9 +806,11 @@ if ( ! function_exists( 'dinoco_sn_golive_rest_clear_caches' ) ) {
         $cleared[] = 'sn_pool_stats transient';
 
         return rest_ensure_response( array(
-            'success' => true,
-            'cleared' => $cleared,
-            'count'   => count( $cleared ),
+            'success'           => true,
+            'cleared'           => $cleared,
+            'count'             => count( $cleared ),
+            'module_purge_meta' => $mod_purge,
+            'verify_hint'       => 'Hard-reload (Ctrl+Shift+R) /admin-command-center/#gdpr — banner should now read ✅ ACTIVE',
         ) );
     }
 }

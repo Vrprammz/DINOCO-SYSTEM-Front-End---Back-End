@@ -2,6 +2,19 @@
  * Template Name: [Admin System] DINOCO Admin Dashboard
  * Shortcode: [dinoco_admin_dashboard]
  * Description: Mission Control — Hero strip + Today's Queue + Quick Actions + Reference Stats
+ * Version: V.35.4 (2026-05-15) — Object-cache-aware cleanup + GDPR shortcode bypass.
+ *   1. Cleanup hook now uses delete_transient() loop per known module key
+ *      instead of raw SQL DELETE only — DELETE FROM wp_options does NOT
+ *      invalidate persistent object cache (Redis/Memcached). Without the
+ *      API-level delete, get_transient() still returned stale HTML.
+ *   2. JS lazy-load: Reads `dnc_mod_last_purge_ts` option (bumped by
+ *      Go-Live Tool /clear-caches and /flag-toggle V.2.2+) and forces
+ *      data-loaded=false + cache-busting query param ?_pts= so a fresh
+ *      AJAX always fires when a flag was recently toggled.
+ *   3. Defensive: GDPR module render call now ALSO clears Config Layer
+ *      per-request cache for 'gdpr.enabled' before dispatching shortcode
+ *      so the flag value is re-read fresh (belt-and-braces against any
+ *      stale cache entry in the same request lifecycle).
  * Version: V.35.3 (2026-05-15) — Cleanup hook fix: admin_init → init.
  *   admin-command-center is frontend page so admin_init never fires.
  *   New flag option key (dnc_mod_cache_purged_v35_3) forces fresh purge.
@@ -1179,6 +1192,20 @@ add_action('init', function () {
                 }
             }
 
+            // V.35.4 — Defensive Config Layer cache bust for flag-driven modules.
+            //   GDPR (+ future similar modules) reads dinoco_config('gdpr.enabled')
+            //   which has a per-request memo. Although per-request scope means
+            //   it's normally fresh, if any other code earlier in this same
+            //   request (e.g. init hooks) cached it as false BEFORE the flag was
+            //   flipped within this request, the shortcode would render stale.
+            //   Bust the cache so do_shortcode below always re-reads the option.
+            if ( isset( $GLOBALS['_dinoco_config_cache'] ) && is_array( $GLOBALS['_dinoco_config_cache'] ) ) {
+                $flag_driven = array( 'gdpr.enabled', 'obs.sentry_enabled', 'obs.correlation_enabled' );
+                foreach ( $flag_driven as $_dotk ) {
+                    unset( $GLOBALS['_dinoco_config_cache'][ $_dotk ] );
+                }
+            }
+
             $html = do_shortcode($module_map[$module]);
             $elapsed = round((microtime(true) - $t_start) * 1000);
             header('X-DNC-Cache: ' . ( $has_cache ? 'MISS' : 'BYPASS' ));
@@ -1208,20 +1235,55 @@ add_action('init', function () {
 // ─────────────────────────────────────────────────────────────────────────────
 // V.35.2 ONE-SHOT cleanup — evicts pre-fix stale dnc_mod_* transients
 // that were written with TTL=0 (= permanent). Runs once per snippet
-// version bump via flag option `dnc_mod_cache_purged_v35_2`.
+// version bump via flag option `dnc_mod_cache_purged_v35_*`.
 //
 // V.35.3 FIX: hook 'init' (not 'admin_init') because admin-command-center
-// is a FRONTEND page (uses [dinoco_admin_dashboard] shortcode) — admin_init
-// only fires inside /wp-admin/. 'init' fires on every request (frontend +
-// admin + ajax + REST) so cleanup runs on next visit regardless of page.
+// is a FRONTEND page (uses [dinoco_admin_dashboard] shortcode).
+//
+// V.35.4 FIX: Object-cache-aware purge.
+//   delete_transient() per known module key is REQUIRED to invalidate
+//   persistent object cache (Redis/Memcached). Raw SQL DELETE alone
+//   only removes the wp_options row — get_transient() still hits stale
+//   object cache. Symptom: GDPR FLAG OFF banner persists after V.35.3
+//   "cleanup" because object cache layer still returned old HTML.
+//   Bumped option key forces fresh re-run.
 // ─────────────────────────────────────────────────────────────────────────────
 add_action( 'init', function() {
-    if ( get_option( 'dnc_mod_cache_purged_v35_3' ) ) return;
+    if ( get_option( 'dnc_mod_cache_purged_v35_4' ) ) return;
     global $wpdb;
-    $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_dnc_mod_%' OR option_name LIKE '_transient_timeout_dnc_mod_%'" );
-    update_option( 'dnc_mod_cache_purged_v35_3', current_time( 'mysql' ), false );
+
+    // (a) SQL DELETE — handles non-cache hosts + stragglers
+    $rows = (int) $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_dnc_mod_%' OR option_name LIKE '_transient_timeout_dnc_mod_%'" );
+
+    // (b) delete_transient() per known module key per admin — invalidates object cache
+    $module_keys = array_keys( _dnc_emergency_cache_ttl_map() );
+    if ( function_exists( 'dinoco_get_registered_modules' ) ) {
+        foreach ( dinoco_get_registered_modules() as $reg_key => $_reg ) {
+            $module_keys[] = $reg_key;
+        }
+    }
+    $module_keys = array_unique( $module_keys );
+
+    $admins = get_users( array( 'role__in' => array( 'administrator' ), 'fields' => array( 'ID' ) ) );
+    $admin_ids = array_map( function( $u ) { return (int) $u->ID; }, $admins );
+    $admin_ids[] = 0; // safety: covers any logged-out edge case
+    $admin_ids = array_unique( $admin_ids );
+
+    $obj_cleared = 0;
+    foreach ( $module_keys as $mod ) {
+        foreach ( $admin_ids as $uid ) {
+            if ( delete_transient( 'dnc_mod_' . $mod . '_' . $uid ) ) {
+                $obj_cleared++;
+            }
+        }
+    }
+
+    update_option( 'dnc_mod_cache_purged_v35_4', current_time( 'mysql' ), false );
     if ( function_exists( 'b2b_log' ) ) {
-        b2b_log( '[AdminDashboard] V.35.3 — purged stale dnc_mod_* transients (TTL=0 permanent cache bug)' );
+        b2b_log( sprintf(
+            '[AdminDashboard] V.35.4 — purged stale dnc_mod_* transients (SQL rows: %d, object cache keys: %d)',
+            $rows, $obj_cleared
+        ) );
     }
 }, 5 );
 
@@ -4472,7 +4534,18 @@ body {
 <!-- PART 3 END -->
 
 <!-- Lazy-load nonce + skeleton (V.32.0) -->
-<script>var dncModuleNonce = '<?php echo wp_create_nonce("dnc_lazy_load_module"); ?>';</script>
+<!-- V.35.4 — purge timestamp drives cache-busting in switchTab below. Set by Go-Live Tool /clear-caches + /flag-toggle V.2.2. -->
+<script>
+var dncModuleNonce = '<?php echo wp_create_nonce("dnc_lazy_load_module"); ?>';
+var dncModulePurgeTs = <?php echo (int) get_option('dnc_mod_last_purge_ts', 0); ?>;
+var dncModuleLastSeenPurgeTs = (function(){
+    try { return parseInt(sessionStorage.getItem('dnc_mod_last_seen_purge_ts') || '0', 10) || 0; } catch(e) { return 0; }
+})();
+// Mark current purge as seen for THIS tab session so subsequent switches don't refetch all tabs.
+try { sessionStorage.setItem('dnc_mod_last_seen_purge_ts', String(dncModulePurgeTs)); } catch(e) {}
+// True if there's been a purge since this tab session started (e.g. boss clicked /clear-caches in another tab).
+var dncModuleStaleCheck = (dncModulePurgeTs > dncModuleLastSeenPurgeTs);
+</script>
 
 <script>
 jQuery(document).ready(function($) {
@@ -4869,6 +4942,16 @@ jQuery(document).ready(function($) {
         var $wrapper = $('#tab-wrapper-' + tab);
         if (!$wrapper.length) return;
         $wrapper.addClass('active');
+
+        // V.35.4 — If a cache purge happened since page load, invalidate
+        // ALL data-loaded flags so next tab activation refetches fresh HTML.
+        // This catches the case where boss flips a flag in another tab
+        // (Go-Live Tool) and switches back to Admin Dashboard expecting
+        // banner to update.
+        if (window.dncModuleStaleCheck) {
+            $('.section-view[data-loaded="true"]').attr('data-loaded', 'false');
+            window.dncModuleStaleCheck = false; // one-shot — subsequent switches use cache normally
+        }
 
         // V.32.0 — AJAX lazy-load on demand
         if ($wrapper.attr('data-loaded') === 'true') {
