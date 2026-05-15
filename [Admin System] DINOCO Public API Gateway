@@ -1,6 +1,16 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Public API Gateway                       ║
+ * ║  Version: V.0.5 (2026-05-15) — Round 55 Idempotency on 2 admin POSTs:║
+ * ║    - POST /api-tokens (issue) — CRITICAL security; admin double-click │
+ * ║      = orphan secret risk (api_secret shown ONCE only) + duplicate    │
+ * ║      active tokens. Body shape via dinoco_sn_with_idempotency() →     │
+ * ║      {partner_name, partner_type, scopes, rate_limit_per_min,         │
+ * ║       ip_allowlist, expires_at, _actor_user_id}.                      │
+ * ║    - POST /api-tokens/{id}/disable — destructive admin op audit/notif │
+ * ║      spam guard. {id, _actor_user_id} via SN central wrapper.         │
+ * ║  Note: feature still flag-gated OFF (Q22 boss DEFERRED) — wrap is     │
+ * ║  defense-in-depth for when flag flips ON.                              │
  * ║  Version: V.0.4 (2026-05-12) — R11 BLOCKER-1: 1 wrong-signature ║
  * ║    dinoco_obs_capture( $e, ... ) → _capture_exception().         ║
  * ║  Version: V.0.3 (2026-05-05) — Q22 OVERRIDE: F#15 DEFERRED      ║
@@ -675,18 +685,35 @@ add_action( 'rest_api_init', function() {
 
 if ( ! function_exists( 'dinoco_sn_pubapi_admin_issue' ) ) {
     function dinoco_sn_pubapi_admin_issue( $request ) {
-        $result = dinoco_sn_pubapi_issue_token( array(
-            'partner_name'       => $request->get_param( 'partner_name' ),
-            'partner_type'       => $request->get_param( 'partner_type' ),
-            'scopes'             => $request->get_param( 'scopes' ),
-            'rate_limit_per_min' => $request->get_param( 'rate_limit_per_min' ),
-            'ip_allowlist'       => $request->get_param( 'ip_allowlist' ),
-            'expires_at'         => $request->get_param( 'expires_at' ),
-        ) );
-        if ( is_wp_error( $result ) ) return $result;
-        return rest_ensure_response( array_merge( $result, array(
-            'note' => 'api_secret shown ONCE — save it now, cannot retrieve later',
-        ) ) );
+        // Round 55 (2026-05-15) — Idempotency-Key wrapper. CRITICAL security-sensitive
+        // endpoint — admin "ออก token" double-click on slow wp_generate_password + bcrypt
+        // hash + INSERT → 2× tokens issued (orphan secret risk: api_secret is shown ONCE,
+        // admin remembers the first response only; 2nd token's secret is lost forever +
+        // database has duplicate "active" tokens). Body hash includes scopes sorted +
+        // actor_user_id. Different partner_name mid-retry → 409 catches admin form re-edit.
+        // Layered defense over dinoco_sn_with_idempotency() (same namespace — reuse).
+        $handler = function( $req ) {
+            $result = dinoco_sn_pubapi_issue_token( array(
+                'partner_name'       => $req->get_param( 'partner_name' ),
+                'partner_type'       => $req->get_param( 'partner_type' ),
+                'scopes'             => $req->get_param( 'scopes' ),
+                'rate_limit_per_min' => $req->get_param( 'rate_limit_per_min' ),
+                'ip_allowlist'       => $req->get_param( 'ip_allowlist' ),
+                'expires_at'         => $req->get_param( 'expires_at' ),
+            ) );
+            if ( is_wp_error( $result ) ) return $result;
+            return rest_ensure_response( array_merge( $result, array(
+                'note' => 'api_secret shown ONCE — save it now, cannot retrieve later',
+            ) ) );
+        };
+
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $request, 'pubapi-tokens-issue',
+                array( 'partner_name', 'partner_type', 'scopes', 'rate_limit_per_min',
+                       'ip_allowlist', 'expires_at' ),
+                $handler );
+        }
+        return $handler( $request );
     }
 }
 
@@ -718,17 +745,30 @@ if ( ! function_exists( 'dinoco_sn_pubapi_admin_list' ) ) {
 
 if ( ! function_exists( 'dinoco_sn_pubapi_admin_disable' ) ) {
     function dinoco_sn_pubapi_admin_disable( $request ) {
-        $id = (int) $request->get_param( 'id' );
-        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'api_tokens' ) ) {
-            return new WP_Error( 'schema_not_ready', '', array( 'status' => 503 ) );
+        // Round 55 (2026-05-15) — Idempotency-Key wrapper. Destructive admin op double-click
+        // guard. UPDATE is_active=0 is idempotent at DB level but cached idempotency replay
+        // extends across full TTL preventing audit row spam + downstream notification storm.
+        // Body hash {id, actor_user_id}; different id mid-retry → 409 catches admin
+        // accidentally disabling wrong token.
+        $handler = function( $req ) {
+            $id = (int) $req->get_param( 'id' );
+            if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'api_tokens' ) ) {
+                return new WP_Error( 'schema_not_ready', '', array( 'status' => 503 ) );
+            }
+            global $wpdb;
+            $tbl = dinoco_sn_pubapi_table( 'api_tokens' );
+            $upd = $wpdb->update( $tbl, array( 'is_active' => 0 ), array( 'id' => $id ) );
+            if ( $upd === false ) {
+                return new WP_Error( 'update_failed', '', array( 'status' => 500 ) );
+            }
+            return rest_ensure_response( array( 'success' => true, 'id' => $id, 'is_active' => false ) );
+        };
+
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $request, 'pubapi-tokens-disable',
+                array( 'id' ), $handler );
         }
-        global $wpdb;
-        $tbl = dinoco_sn_pubapi_table( 'api_tokens' );
-        $upd = $wpdb->update( $tbl, array( 'is_active' => 0 ), array( 'id' => $id ) );
-        if ( $upd === false ) {
-            return new WP_Error( 'update_failed', '', array( 'status' => 500 ) );
-        }
-        return rest_ensure_response( array( 'success' => true, 'id' => $id, 'is_active' => false ) );
+        return $handler( $request );
     }
 }
 

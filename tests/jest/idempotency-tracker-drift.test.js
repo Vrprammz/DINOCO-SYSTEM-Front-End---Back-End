@@ -176,8 +176,14 @@ describe("Idempotency tracker drift", () => {
             const filePath = path.join(REPO_ROOT, filename);
             const content = fs.readFileSync(filePath, "utf8");
             // F1 class detection: file lists N integrated endpoints but
-            // contains ZERO `dinoco_idempotency_check` calls = pure drift.
-            if (!content.includes("dinoco_idempotency_check")) {
+            // contains ZERO wrapper call sites = pure drift.
+            // Accept either the central helper `dinoco_idempotency_check` (direct
+            // wrap pattern Rounds 19-54) OR the SN namespace wrapper
+            // `dinoco_sn_with_idempotency` (Round 55+ — internally calls the central
+            // helper after building body hash from declared keys + actor).
+            const hasDirect = content.includes("dinoco_idempotency_check");
+            const hasSnWrapper = content.includes("dinoco_sn_with_idempotency");
+            if (!hasDirect && !hasSnWrapper) {
                 drifted.push({
                     file: filename,
                     endpoints,

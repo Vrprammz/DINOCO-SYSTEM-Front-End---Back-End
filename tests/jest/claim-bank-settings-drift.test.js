@@ -50,8 +50,10 @@ describe('Claim Bank Settings — Sprint 9 Phase 1 Task 1.9 drift detector', () 
         // Outer dispatcher acquires lock + delegates to _inner via try/finally
         expect(SC).toMatch(/function dinoco_claim_bank_rest_save\([\s\S]*?\$lock_key\s*=\s*'dnc_claim_bank_save'[\s\S]*?GET_LOCK[\s\S]*?\$lock_key[\s\S]*?,\s*5/);
         expect(SC).toMatch(/function _dinoco_claim_bank_rest_save_inner/);
-        // try/finally with RELEASE_LOCK
-        expect(SC).toMatch(/try\s*\{[\s\S]*?return _dinoco_claim_bank_rest_save_inner[\s\S]*?\}\s*finally\s*\{[\s\S]*?RELEASE_LOCK/);
+        // try/finally with RELEASE_LOCK. R55 (2026-05-15) refactor: response captured into
+        // $resp_obj for Idempotency-Key store before return inside try; detector accepts
+        // either direct-return (pre-R55) or capture-then-return (R55+) pattern.
+        expect(SC).toMatch(/try\s*\{[\s\S]*?_dinoco_claim_bank_rest_save_inner[\s\S]*?return[\s\S]*?\}\s*finally\s*\{[\s\S]*?RELEASE_LOCK/);
         // 503 + retry_after on acquire fail
         expect(SC).toMatch(/'claim_bank_save_busy'[\s\S]*?'status'\s*=>\s*503[\s\S]*?'retry_after'\s*=>\s*5/);
     });
