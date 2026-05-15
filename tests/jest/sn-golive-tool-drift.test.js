@@ -142,10 +142,12 @@ describe("SN Go-Live Tool — admin activation shortcode (V.1.0)", () => {
     });
 
     test("7 cron heartbeats tracked (F#1/F#4/F#10/QW-7/F#9/marketplace/audit)", () => {
+      // V.1.5: real hook names — expiry_schedule (not expiry_reminder),
+      // anniversary_schedule (not just anniversary).
       const fn = content.match(/function\s+dinoco_sn_golive_rest_monitor[\s\S]{0,3000}/);
       expect(fn).toBeTruthy();
-      expect(fn[0]).toMatch(/dinoco_sn_expiry_reminder_cron/);
-      expect(fn[0]).toMatch(/dinoco_sn_anniversary_cron/);
+      expect(fn[0]).toMatch(/dinoco_sn_expiry_schedule_cron/);
+      expect(fn[0]).toMatch(/dinoco_sn_anniversary_schedule_cron/);
       expect(fn[0]).toMatch(/dinoco_sn_review_request_cron/);
       expect(fn[0]).toMatch(/dinoco_sn_service_reminder_cron/);
       expect(fn[0]).toMatch(/dinoco_sn_ltv_snapshot_cron/);
