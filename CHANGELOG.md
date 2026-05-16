@@ -10,6 +10,42 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Fixed — Config Layer H7 + H8 canonical fix (2026-05-16)
+
+Closes root-cause class of GDPR FLAG OFF incident (2026-05-16) at the source —
+`[Admin System] DINOCO Config Layer` V.1.2 → V.1.3.
+
+**Two fixes in `dinoco_config()` reader** (lines 295-317):
+
+1. **H7 alloptions bust** — once-per-request static guard
+   `wp_cache_delete('alloptions','options')` busts the Redis/Memcached
+   `alloptions` snapshot at the first call within a request. Defeats
+   external-object-cache snapshot split where `get_option()` returns a
+   pre-`update_option()` value baked into the cached array. Mirrors the
+   same fix applied earlier today to GDPR V.4.6 + Observability V.1.2 +
+   B2F V.7.7 + SN helpers — but now applied at the canonical reader so
+   ALL Config-Layer-based helpers inherit the fix automatically.
+
+2. **H8 don't-cache-when-def-null** — cache write moved INSIDE the
+   `if ($def)` branch. Previously, pre-`init:25` hooks calling
+   `dinoco_config('x.y', false)` would see `$def=null` → cache caller
+   default `false` → `init:25` later registers the schema def → next
+   read still returns cached `false` even though DB stores `'1'`. Now
+   unregistered-key reads bypass the cache entirely so the next call
+   after schema registration picks up the correctly-typed value.
+
+**Impact**: `b2b_bo_flag_enabled()` (Snippet 16, wraps
+`dinoco_config('bo.flag_enabled')`) and any future Config-Layer-based
+helper become defensive against both classes of stale-read bug WITHOUT
+per-helper bypass code. `b2f_is_flag_enabled()` (V.7.7) already uses raw
+`get_option()` — unaffected.
+
+**Backward compat**: Flag-OFF behavior unchanged (cache miss → DB read →
+return current value). `dinoco_config_set()` per-key cache bust pattern
+(line ~374-375 `unset $GLOBALS['_dinoco_config_cache'][$key]`) still works.
+
+**Commit**: see git log V.1.3 bump.
+
 ### Added — F#8 non-VAT scope refactor + Boss 6-decisions close (2026-05-15)
 
 Boss closed all 6 pending SN system decisions in single round. ZERO boss-blocked
