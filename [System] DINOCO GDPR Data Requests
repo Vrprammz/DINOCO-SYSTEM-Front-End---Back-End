@@ -1,6 +1,34 @@
 /**
  * File: [System] DINOCO GDPR Data Requests
  * Description: GDPR / Thai PDPA compliance — self-service data export + deletion
+ * Version: V.4.6 — (2026-05-16): Bypass Config Layer + alloptions cache for flag
+ *   truth read. Boss reported V.4.5 cache-bust reload CTA + ?_cb= still showed
+ *   ⏸ FLAG OFF badge despite diagnose REST returning verdict=TRUE on ALL 4 paths
+ *   (raw / strict / Config Layer / dinoco_gdpr_is_enabled).
+ *   Root cause hypothesis (one of 2):
+ *     H7 — alloptions cache split: Redis/Memcached `wp_options.alloptions` group
+ *       holds stale '0' snapshot; raw `get_option()` (singular key path) reads
+ *       fresh '1'. Different code paths hit different cache layers.
+ *     H8 — Config Layer early-fire cache poison: A hook firing BEFORE init:25
+ *       (Config Layer def registration) calls `dinoco_config('gdpr.enabled',
+ *       false)` → def not yet registered → returns caller default `false` →
+ *       poisons `$GLOBALS['_dinoco_config_cache']` for the rest of the request.
+ *       Later AJAX shortcode render re-uses cached `false`.
+ *   FIX: `dinoco_gdpr_is_enabled()` no longer routes through Config Layer.
+ *     It strips `alloptions` + key-level WP object cache then reads raw DB via
+ *     `get_option()`. Overhead is minimal — function is called once per HTTP
+ *     request from the shortcode + each REST endpoint.
+ *   ADDITIONAL: render-time truth check in `dinoco_admin_gdpr_render()` logs
+ *     `[GDPR-Drift]` to error_log whenever Config Layer state != raw DB state
+ *     + emits HTML render snapshot `<!-- V.4.6 render snapshot: ... -->` for
+ *     page-source inspection.
+ *   Paired with SN Go-Live Tool V.2.5 which adds 2 new Diagnose paths:
+ *     Path 5 alloptions_cache (proves/disproves H7)
+ *     Path 6 config_layer_per_request_cache (proves/disproves H8)
+ *   Risk: LOW — flag read path was the same `get_option()` call before Config
+ *     Layer migration in V.1.3; this restores pre-V.1.3 semantics for this
+ *     ONE check while V.4.1+ Config Layer integration remains for all other
+ *     config consumers.
  * Version: V.4.5 — (2026-05-16): Cache-bust reload CTA when diagnose verdict = TRUE.
  *   Boss reported GDPR FLAG OFF banner stuck on /admin-command-center/#gdpr even
  *   after flipping dinoco_gdpr_enabled to '1' and diagnose returns verdict = TRUE.
@@ -178,11 +206,27 @@ if ( ! function_exists( 'dinoco_gdpr_is_enabled' ) ) {
      * @return bool
      */
     function dinoco_gdpr_is_enabled() {
-        // V.1.3: Phase 4c — Config Layer with raw fallback
-        if ( function_exists( 'dinoco_config' ) ) {
-            return (bool) dinoco_config( 'gdpr.enabled', false );
+        // V.4.6 — bypass Config Layer per-request cache. Direct option
+        // read. Config Layer can return cached false from early-fire
+        // hooks before init:25 def registration, OR alloptions cache
+        // split between Redis/raw paths. This is the truth-source check.
+        //
+        // Strip alloptions group cache + key-level cache before read
+        // to guarantee DB hit (overhead minimal — function called once
+        // per HTTP request from shortcode + REST endpoints).
+        //
+        // Reason for full revert (V.1.3 → V.4.6): boss flipped option
+        // to '1' and diagnose-flag REST proved all 4 read paths return
+        // TRUE, yet AJAX shortcode render still showed FLAG OFF banner.
+        // Either alloptions snapshot was stale (H7) or Config Layer
+        // per-request cache was poisoned by early-fire hook (H8). Both
+        // bypassed here by clearing object cache + reading raw DB.
+        if ( function_exists( 'wp_cache_delete' ) ) {
+            wp_cache_delete( 'alloptions', 'options' );
+            wp_cache_delete( 'dinoco_gdpr_enabled', 'options' );
         }
-        return get_option( 'dinoco_gdpr_enabled', '0' ) === '1';
+        $raw = get_option( 'dinoco_gdpr_enabled', '0' );
+        return ( $raw === '1' || $raw === 1 || $raw === true );
     }
 }
 
@@ -3441,12 +3485,33 @@ if ( ! function_exists( 'dinoco_admin_gdpr_render' ) ) {
             return '<p>' . esc_html__( 'คุณไม่มีสิทธิ์ดูหน้านี้', 'dinoco' ) . '</p>';
         }
 
+        // V.4.6 — render-time truth check. Log when Config Layer state
+        // diverges from raw DB state (H7/H8 drift). Helps post-incident
+        // diagnosis without needing to reproduce via diagnose-flag REST.
+        $raw_db = get_option( 'dinoco_gdpr_enabled', '0' );
+        $truth  = ( $raw_db === '1' || $raw_db === 1 || $raw_db === true );
+        $cfg_layer = null;
+        if ( function_exists( 'dinoco_config' ) ) {
+            $cfg_layer = (bool) dinoco_config( 'gdpr.enabled', false );
+            if ( function_exists( 'error_log' ) && $cfg_layer !== $truth ) {
+                error_log( sprintf(
+                    '[GDPR-Drift] flag=dinoco_gdpr_enabled raw=%s cfg_layer=%s truth=%s context=%s',
+                    var_export( $raw_db, true ),
+                    var_export( $cfg_layer, true ),
+                    var_export( $truth, true ),
+                    wp_doing_ajax() ? 'ajax' : ( defined( 'REST_REQUEST' ) && REST_REQUEST ? 'rest' : 'page' )
+                ) );
+            }
+        }
+
         $flag_enabled = function_exists( 'dinoco_gdpr_is_enabled' ) ? dinoco_gdpr_is_enabled() : false;
+        $render_ctx   = wp_doing_ajax() ? 'ajax' : ( defined( 'REST_REQUEST' ) && REST_REQUEST ? 'rest' : 'page' );
         $nonce        = wp_create_nonce( 'wp_rest' );
         $rest_base    = esc_url_raw( rest_url( 'dinoco-gdpr/v1/admin' ) );
 
         ob_start();
         ?>
+        <!-- V.4.6 render snapshot: raw=<?php echo esc_html( var_export( $raw_db, true ) ); ?> cfg_layer=<?php echo esc_html( var_export( $cfg_layer, true ) ); ?> flag_enabled=<?php echo $flag_enabled ? 'true' : 'false'; ?> ts=<?php echo esc_html( current_time( 'mysql' ) ); ?> ctx=<?php echo esc_html( $render_ctx ); ?> -->
         <div class="dinoco-gdpr-admin" data-rest-base="<?php echo esc_attr( $rest_base ); ?>" data-nonce="<?php echo esc_attr( $nonce ); ?>">
             <style>
                 /* Scoped CSS — .dnc-gdpr-* prefix to avoid conflict */

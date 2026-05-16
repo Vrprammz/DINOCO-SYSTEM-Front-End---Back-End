@@ -2,6 +2,16 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO SN Go-Live Tool                          ║
  * ║  DB_ID: 1215                                                     ║
+ * ║  Version: V.2.5 (2026-05-16) — Diagnose /diagnose-flag adds 2   ║
+ * ║    new paths (alloptions_cache + config_layer_per_request_cache) ║
+ * ║    to pin-point GDPR FLAG OFF banner cause when raw + strict +  ║
+ * ║    Config Layer + dinoco_gdpr_is_enabled all return TRUE but    ║
+ * ║    shortcode render still shows FLAG OFF. Pairs with GDPR V.4.6 ║
+ * ║    which bypasses Config Layer per-request cache + alloptions   ║
+ * ║    group cache. Renders matches_db column in alloptions row →   ║
+ * ║    false = H7 drift (object cache split). per_request_cache     ║
+ * ║    cached=true with value=false = H8 (early-fire Config Layer   ║
+ * ║    cache poison).                                                ║
  * ║  Version: V.2.4 (2026-05-15) — UI button "🔬 วินิจฉัย GDPR Flag" ║
  * ║    in Stage 5 Monitor. Calls /diagnose-flag?flag=                ║
  * ║    dinoco_gdpr_enabled (existing V.2.1 REST endpoint) + renders  ║
@@ -671,6 +681,41 @@ if ( ! function_exists( 'dinoco_sn_golive_rest_diagnose_flag' ) ) {
             );
         }
 
+        // V.2.5 — Path 5: alloptions cache state (H7 hypothesis — object cache split).
+        // If wp_options has flag='1' but alloptions snapshot still says '0' → Redis/
+        // Memcached layer never invalidated → some code paths read fresh DB, others
+        // pull stale snapshot. matches_db column makes the drift obvious.
+        if ( function_exists( 'wp_cache_get' ) ) {
+            $alloptions = wp_cache_get( 'alloptions', 'options' );
+            $has_flag   = is_array( $alloptions ) && array_key_exists( $flag, $alloptions );
+            $result['paths']['alloptions_cache'] = array(
+                'cached'       => is_array( $alloptions ),
+                'has_flag'     => $has_flag,
+                'cached_value' => $has_flag ? $alloptions[ $flag ] : null,
+                'matches_db'   => $has_flag && ( $alloptions[ $flag ] === $raw ),
+            );
+        }
+
+        // V.2.5 — Path 6: Config Layer per-request cache state (H8 hypothesis —
+        // early-fire poison). If $GLOBALS['_dinoco_config_cache'][$dot_key] is
+        // already cached as `false` before init:25 def registration, every later
+        // call to dinoco_config() in same request reuses the cached false →
+        // banner shows OFF despite truth = ON.
+        if ( isset( $config_keys[ $flag ] ) ) {
+            $dot_key = $config_keys[ $flag ];
+            $per_request = array(
+                'cached'       => false,
+                'cached_value' => null,
+            );
+            if ( isset( $GLOBALS['_dinoco_config_cache'] )
+                 && is_array( $GLOBALS['_dinoco_config_cache'] )
+                 && array_key_exists( $dot_key, $GLOBALS['_dinoco_config_cache'] ) ) {
+                $per_request['cached']       = true;
+                $per_request['cached_value'] = $GLOBALS['_dinoco_config_cache'][ $dot_key ];
+            }
+            $result['paths']['config_layer_per_request_cache'] = $per_request;
+        }
+
         return rest_ensure_response( $result );
     }
 }
@@ -1181,6 +1226,65 @@ if ( ! function_exists( 'dinoco_sn_golive_render' ) ) {
                             pass: gdprRet,
                             label: '<code>dinoco_gdpr_is_enabled()</code> returns',
                             detail: '<strong>' + (gdprRet ? '✅ TRUE (banner ควร ACTIVE)' : '❌ FALSE (banner จะแสดง FLAG OFF)') + '</strong>'
+                        });
+                    }
+                }
+
+                // V.2.5 — 5) alloptions cache (H7 — object cache split)
+                if (paths.alloptions_cache) {
+                    var allo = paths.alloptions_cache;
+                    if (allo.cached) {
+                        var hasFlagAllo = !!allo.has_flag;
+                        if (hasFlagAllo) {
+                            var matches = !!allo.matches_db;
+                            var allValDisplay = (allo.cached_value === null || allo.cached_value === undefined) ? '(null)' : JSON.stringify(allo.cached_value);
+                            verdicts.push({
+                                pass: matches,
+                                label: '<strong>H7</strong> — alloptions cache matches DB',
+                                detail: matches
+                                    ? 'alloptions snapshot value <code>' + esc(allValDisplay) + '</code> = raw DB ' + esc(rawValDisplay) + ' → ไม่มี object cache split'
+                                    : '<strong style="color:#dc2626;">DRIFT FOUND!</strong> alloptions <code>' + esc(allValDisplay) + '</code> ≠ raw DB <code>' + esc(rawValDisplay) + '</code> — Redis/Memcached เก็บ snapshot เก่า. ใช้ <code>wp_cache_delete(\'alloptions\', \'options\')</code> หรือกด Clear Caches'
+                            });
+                        } else {
+                            verdicts.push({
+                                pass: true,
+                                label: '<strong>H7</strong> — alloptions cache (flag absent)',
+                                detail: 'alloptions snapshot cached แต่ไม่มี <code>' + esc(data.flag) + '</code> key (ปกติ — เป็น autoload=no option)'
+                            });
+                        }
+                    } else {
+                        verdicts.push({
+                            pass: true,
+                            label: '<strong>H7</strong> — alloptions cache',
+                            detail: 'ไม่มี object cache layer (host ไม่ใช้ Redis/Memcached) — H7 ตัดทิ้งได้'
+                        });
+                    }
+                }
+
+                // V.2.5 — 6) Config Layer per-request cache (H8 — early-fire poison)
+                if (paths.config_layer_per_request_cache) {
+                    var perReq = paths.config_layer_per_request_cache;
+                    var perReqCached = !!perReq.cached;
+                    var perReqVal = perReq.cached_value;
+                    var perReqValDisplay = JSON.stringify(perReqVal);
+                    var perReqIsFalse = (perReqVal === false || perReqVal === 'false' || perReqVal === 0 || perReqVal === '0');
+                    if (perReqCached && perReqIsFalse) {
+                        verdicts.push({
+                            pass: false,
+                            label: '<strong>H8</strong> — Config Layer per-request cache poisoned',
+                            detail: '<strong style="color:#dc2626;">CONFIRMED!</strong> <code>$GLOBALS[\'_dinoco_config_cache\'][\'gdpr.enabled\']</code> = <code>' + esc(perReqValDisplay) + '</code> — early-fire hook ก่อน init:25 register def → caller default <code>false</code> ถูก cache → ทุก call หลังเรียก dinoco_config() คืน cached false. แก้: V.4.6 bypass Config Layer ใน dinoco_gdpr_is_enabled() เรียบร้อย'
+                        });
+                    } else if (perReqCached) {
+                        verdicts.push({
+                            pass: true,
+                            label: '<strong>H8</strong> — Config Layer per-request cache',
+                            detail: 'cached value = <code>' + esc(perReqValDisplay) + '</code> — ไม่ใช่ false ดังนั้น H8 ตัดทิ้งได้'
+                        });
+                    } else {
+                        verdicts.push({
+                            pass: true,
+                            label: '<strong>H8</strong> — Config Layer per-request cache',
+                            detail: 'ยังไม่ cached ใน request นี้ — H8 ตัดทิ้งได้'
                         });
                     }
                 }
