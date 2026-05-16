@@ -49,7 +49,7 @@ describe("H7 + H8 cache hardening pattern lock-in (2026-05-16 incident)", () => 
 
         test("H7: dinoco_config() busts alloptions cache once per request", () => {
             const fnMatch = src.match(
-                /function\s+dinoco_config\s*\([\s\S]*?\n    \}/
+                /function\s+dinoco_config\s*\([\s\S]*?\n {4}\}/
             );
             expect(fnMatch).not.toBeNull();
             const fnBody = fnMatch[0];
@@ -63,7 +63,7 @@ describe("H7 + H8 cache hardening pattern lock-in (2026-05-16 incident)", () => 
 
         test("H8: cache write is INSIDE if($def) branch, NOT in else", () => {
             const fnMatch = src.match(
-                /function\s+dinoco_config\s*\([\s\S]*?\n    \}/
+                /function\s+dinoco_config\s*\([\s\S]*?\n {4}\}/
             );
             expect(fnMatch).not.toBeNull();
             const fnBody = fnMatch[0];
@@ -111,7 +111,7 @@ describe("H7 + H8 cache hardening pattern lock-in (2026-05-16 incident)", () => 
 
         test("dinoco_gdpr_is_enabled() busts alloptions + key-level cache", () => {
             const fnMatch = src.match(
-                /function\s+dinoco_gdpr_is_enabled\s*\([\s\S]*?\n    \}/
+                /function\s+dinoco_gdpr_is_enabled\s*\([\s\S]*?\n {4}\}/
             );
             expect(fnMatch).not.toBeNull();
             const fnBody = fnMatch[0];
@@ -135,7 +135,7 @@ describe("H7 + H8 cache hardening pattern lock-in (2026-05-16 incident)", () => 
             // If a future refactor adds dinoco_config back, this will fail
             // — re-introducing H8 vulnerability.
             const fnMatch = src.match(
-                /function\s+dinoco_gdpr_is_enabled\s*\([\s\S]*?\n    \}/
+                /function\s+dinoco_gdpr_is_enabled\s*\([\s\S]*?\n {4}\}/
             );
             expect(fnMatch).not.toBeNull();
             const fnBody = fnMatch[0];
@@ -157,7 +157,7 @@ describe("H7 + H8 cache hardening pattern lock-in (2026-05-16 incident)", () => 
 
         test("dinoco_obs_is_enabled() uses static guard + alloptions bust", () => {
             const fnMatch = src.match(
-                /function\s+dinoco_obs_is_enabled\s*\([\s\S]*?\n    \}/
+                /function\s+dinoco_obs_is_enabled\s*\([\s\S]*?\n {4}\}/
             );
             expect(fnMatch).not.toBeNull();
             const fnBody = fnMatch[0];
