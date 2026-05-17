@@ -81,19 +81,29 @@ WHERE p.post_type = 'b2f_maker_product'
 
 ### Check 2 — No code reads CPT directly
 
+ทำในเครื่อง local ที่มี repo clone (ไม่ใช่บน production server):
+
 ```bash
 cd /Users/pavornthavornchan/Projects/DINOCO-SYSTEM-Front-End---Back-End
 
-# Direct WP_Query for b2f_maker_product CPT
-grep -rln "post_type.*b2f_maker_product\|'b2f_maker_product'" \
-  --include="*.php" --include="\[*\]*" 2>/dev/null | grep -v _archive
-
-# get_posts() with b2f_maker_product
-grep -rln "get_posts.*b2f_maker_product\|get_post_type.*b2f_maker_product" \
-  --include="*.php" --include="\[*\]*" 2>/dev/null
+# WP snippet files don't have .php extension — search all files except specific dirs
+# Pattern matches: post_type=b2f_maker_product, 'b2f_maker_product' literal, get_posts/get_post_type calls
+grep -rln "b2f_maker_product" . \
+  --exclude-dir=node_modules \
+  --exclude-dir=_archive-superseded \
+  --exclude-dir=docs \
+  --exclude-dir=.git \
+  --exclude="*.md" \
+  2>/dev/null
 ```
 
-**Expected**: Only `[B2F] Snippet 0` (CPT registration) + `[B2F] Snippet 0.5` (dual-write hook) + `[Admin System] B2F Migration Audit` (reads CPT for parity/drift checks)
+**Expected ALLOWED hits**:
+- `[B2F] Snippet 0: CPT & ACF Registration` (CPT register_post_type — needed until Step 7)
+- `[B2F] Snippet 0.5: Maker Product Dual-Write` (dual-write hook — kept until shadow_write OFF)
+- `[Admin System] B2F Migration Audit` (audit/parity tools — kept for monitoring)
+- `[B2F] Snippet 2: REST API` (HAS fallback path when `b2f_flag_read_from_junction=false`)
+
+**⚠️ Snippet 2 fallback caveat** — เพราะ Snippet 2 อ่าน CPT ใน fallback path ถ้า `b2f_flag_read_from_junction` ถูก revert ระหว่างทำ Step 6 → API จะคืน 0 rows ทันที. **Add explicit verify ก่อน Step 6** (see Step 5.5 below).
 
 ถ้ามี snippet อื่น reading CPT → ต้อง migrate ก่อน
 
@@ -117,35 +127,33 @@ LIMIT 10;
 
 ## Step 1 — Backup (MANDATORY, ~15 min)
 
-### 1.1 — Full junction + CPT mysqldump
+### 1.1 — Full junction + CPT dump
+
+**ใช้ WP CLI (recommended — ปลอดภัยกว่า grep cut)** — `wp db` รัน mysqldump โดยอ่าน credentials จาก wp-config.php ตรงๆ ผ่าน WP loader, ไม่ต้อง parse password manually:
 
 ```bash
-# SSH เข้า server, cd ที่ working dir
+# SSH เข้า server
 ssh root@<wp-server>
 mkdir -p /var/backups/b2f-cpt-retirement-2026-05-16
 cd /var/backups/b2f-cpt-retirement-2026-05-16
 
-# DB credentials from wp-config.php
-DB_USER=$(grep DB_USER /var/www/dinoco.in.th/wp-config.php | cut -d "'" -f 4)
-DB_PASS=$(grep DB_PASSWORD /var/www/dinoco.in.th/wp-config.php | cut -d "'" -f 4)
-DB_NAME=$(grep DB_NAME /var/www/dinoco.in.th/wp-config.php | cut -d "'" -f 4)
+# Path WP install (adjust ถ้า path ต่างจากนี้)
+WP_PATH=/var/www/dinoco.in.th
 
-# Backup junction table (canonical)
-mysqldump -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
-  wp_dinoco_product_makers \
-  wp_dinoco_maker_product_observations \
-  > junction-tables-2026-05-16.sql
+# Backup junction tables (canonical) — wp db cli auto-loads credentials
+wp --path=$WP_PATH db export junction-tables-2026-05-16.sql \
+  --tables=wp_dinoco_product_makers,wp_dinoco_maker_product_observations
 
-# Backup CPT data (posts + postmeta for b2f_maker_product)
-mysqldump -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
-  --where="post_type='b2f_maker_product'" wp_posts \
-  > cpt-posts-2026-05-16.sql
+# Backup CPT posts + postmeta
+wp --path=$WP_PATH db export cpt-posts-2026-05-16.sql \
+  --tables=wp_posts \
+  --where="post_type='b2f_maker_product'"
 
-mysqldump -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
-  --where="post_id IN (SELECT ID FROM wp_posts WHERE post_type='b2f_maker_product')" wp_postmeta \
-  > cpt-postmeta-2026-05-16.sql
+wp --path=$WP_PATH db export cpt-postmeta-2026-05-16.sql \
+  --tables=wp_postmeta \
+  --where="post_id IN (SELECT ID FROM wp_posts WHERE post_type='b2f_maker_product')"
 
-# Verify sizes
+# Verify sizes — ต้องไม่ใช่ 0 bytes
 ls -lh
 # Expected: junction ~50KB, cpt-posts ~50KB, cpt-postmeta ~500KB-1MB
 ```
@@ -163,15 +171,36 @@ scp root@<wp-server>:/var/backups/b2f-cpt-retirement-2026-05-16/b2f-cpt-retireme
 ### 1.3 — Verify backup integrity
 
 ```bash
-# Quick sanity check
+# Quick gzip layer check
 gunzip -t b2f-cpt-retirement-2026-05-16.tar.gz && echo "Tarball OK"
+
+# List contents
 tar -tzf b2f-cpt-retirement-2026-05-16.tar.gz
 # Expected: 3 .sql files listed
 
+# Verify each SQL file actually contains valid SQL (not error message)
+for f in *.sql; do
+  echo "=== $f ==="
+  head -5 "$f"
+  echo "..."
+  tail -3 "$f"
+  wc -l "$f"
+done
+# Expected per file:
+#   Lines start with "-- MySQL dump" / "-- Host:" / etc.
+#   File size > 1KB (junction can be small but >0)
+#   Last lines: "-- Dump completed on ..." or trailing INSERT
+
+# Sanity check row count matches DB
+echo "=== Row count sanity ==="
+grep -c "^INSERT INTO" cpt-posts-2026-05-16.sql || echo "0 INSERT lines (multi-row INSERT pattern)"
+
 # Test restore on staging DB (optional but recommended)
-mysql -u staging_user -p staging_db < junction-tables-2026-05-16.sql
-# verify junction data round-trips
+# wp --path=$STAGING_WP_PATH db import junction-tables-2026-05-16.sql
+# wp --path=$STAGING_WP_PATH db query "SELECT COUNT(*) FROM wp_dinoco_product_makers"
 ```
+
+⚠️ **DO NOT proceed to Step 2** until all 3 .sql files verified non-empty + valid SQL syntax.
 
 ## Step 2 — Disable shadow_write (1 min)
 
@@ -235,6 +264,33 @@ UPDATE wp_options SET option_value = '1' WHERE option_name = 'b2f_flag_shadow_wr
 ```
 
 (Plus debug code issue)
+
+## Step 5.5 — Pre-DROP flag verification (MANDATORY, ~1 min)
+
+⚠️ **ก่อนทำ Step 6** — ยืนยันว่า `b2f_flag_read_from_junction` ยัง ON. ถ้า flag ถูก revert (accident หรือ rollback) → Snippet 2 V.10.0+ จะ fallback อ่าน CPT → ตอนนี้ CPT ถูก soft-delete อยู่ → API จะคืน 0 makers → LIFF B2B B2F E-Catalog + Admin Makers tab จะแสดงข้อมูลว่าง
+
+```bash
+# Verify flag is ON
+wp --path=$WP_PATH option get b2f_flag_read_from_junction
+# Expected: '1'
+
+# Also verify shadow_write is OFF (per Step 2)
+wp --path=$WP_PATH option get b2f_flag_shadow_write
+# Expected: '0'
+```
+
+ถ้าผลไม่ตรง → **STOP, restore Step 2 state + investigate** ก่อนทำต่อ.
+
+นอกจากนี้ smoke test endpoint อ่านจริง:
+
+```bash
+# Should return non-empty array
+curl -sH "X-WP-Nonce: ADMIN_NONCE" -H "Cookie: ..." \
+  "https://dinoco.in.th/wp-json/b2f/v1/makers" | jq '.data | length'
+# Expected: > 0 (number of makers in junction)
+```
+
+ถ้าได้ 0 → API ทำงานผิด — investigate ก่อน DROP
 
 ## Step 6 — Hard delete CPT (~5 min)
 
@@ -341,3 +397,14 @@ wp option update b2f_flag_shadow_write '1'
 - [`[Admin System] B2F Migration Audit`](../../%5BAdmin%20System%5D%20B2F%20Migration%20Audit) V.3.X (audit tools)
 - `B2F-ARCHITECTURE-PLAN.md` (Option F 4-phase plan)
 - `B2F-SCHEMA-V10.sql` (junction canonical schema)
+
+## Audit notes
+
+This runbook was **revised V.2 (2026-05-17)** after audit found V.1 had:
+
+- ❌ Fragile DB password extraction via `grep DB_USER ... | cut -d "'" -f 4` (failed silently with double-quote configs → 0-byte backup) → replaced with `wp db export` (safer)
+- ❌ Grep pattern `--include="\[*\]*"` worked on macOS but not on remote Linux ssh → simplified to `grep -rln "b2f_maker_product" .`
+- ❌ `gunzip -t` only validated gzip layer, not SQL content → added `head`/`tail`/`grep INSERT` verify per file
+- ❌ Missing pre-DROP flag verification (Snippet 2 has CPT fallback path → if flag reverted mid-runbook, soft-deleted CPT returns 0 makers to LIFF) → added Step 5.5 mandatory flag verify
+
+V.2 corrected to wp-cli safer commands + content verification + Step 5.5 flag guard. Verified flag names + Snippet 2 fallback path via grep against `[B2F] Snippet 2: REST API` V.10.0+.

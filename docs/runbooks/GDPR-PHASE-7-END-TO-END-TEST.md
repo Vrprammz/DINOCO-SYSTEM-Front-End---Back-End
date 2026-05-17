@@ -6,6 +6,7 @@
 > **Pre-req**: GDPR flag ON (verified 2026-05-16 commit `3640d16` + ✅ ACTIVE banner)
 > **Time to complete**: ~30-45 นาที (export flow + delete flow + admin review)
 > **Risk**: ต่ำ — ใช้ test account (admin), data export/delete กระทบเฉพาะ account ทดสอบ
+> **Revision history**: V.2 (2026-05-16) — corrected after audit found wrong cron name + wrong download URL + wrong cancellation method
 
 ---
 
@@ -33,45 +34,68 @@ wp option get dinoco_gdpr_enabled
 ```sql
 SHOW TABLES LIKE 'wp_dinoco_gdpr_%';
 -- Expected: wp_dinoco_gdpr_requests + wp_dinoco_gdpr_audit_log
+
+-- Schema v2.0 columns (added Phase 6)
+SHOW COLUMNS FROM wp_dinoco_gdpr_requests LIKE 'download_token';
+SHOW COLUMNS FROM wp_dinoco_gdpr_requests LIKE 'scope_json';
+SHOW COLUMNS FROM wp_dinoco_gdpr_requests LIKE 'expires_at';
+SHOW COLUMNS FROM wp_dinoco_gdpr_requests LIKE 'cancellation_window_at';
+-- All 4 must exist
 ```
 
-### Check 3 — Cron worker scheduled
+### Check 3 — Crons scheduled
 
 ```bash
 wp cron event list | grep gdpr
-# Expected: dinoco_gdpr_process_queue_cron (hourly)
-#           dinoco_gdpr_retention_cron (daily)
+# Expected:
+#   dinoco_gdpr_retention_cron        (daily 03:30 - anonymize >90 day rows)
+#   dinoco_gdpr_export_cleanup_cron   (daily - prune >7 day ZIP files)
+#   dinoco_gdpr_sla_reminder_cron     (daily 09:00 - notify stale queued requests)
 ```
 
-### Check 4 — OpenClaw agent reachable (สำหรับ LINE messages export)
+**⚠️ หมายเหตุ**: ไม่มี `dinoco_gdpr_process_queue_cron` — ระบบใช้ `wp_schedule_single_event('dinoco_gdpr_process_request', [$request_id])` ที่ schedule เฉพาะตอน admin กด Approve (กับ 30s undo window). ไม่ใช่ queue cron แบบ batch.
+
+### Check 4 — Private uploads dir writable + protected
 
 ```bash
-curl -H "Authorization: Bearer $LIFF_AI_AGENT_KEY" \
-  https://dinoco.in.th/agent/api/health
+ls -la /var/www/dinoco.in.th/wp-content/uploads/gdpr/
+# Expected: directory exists, owned by webserver user
+cat /var/www/dinoco.in.th/wp-content/uploads/gdpr/.htaccess
+# Expected: "deny from all" or similar — prevents direct access without token
+```
+
+### Check 5 — OpenClaw agent reachable (สำหรับ LINE messages export)
+
+```bash
+# From WP server SSH
+curl -sH "Authorization: Bearer $LIFF_AI_AGENT_KEY" \
+  http://localhost:3000/api/health
 # Expected: 200 OK, { "status": "ok" }
 ```
 
-ถ้า agent ไม่ตอบ → LINE messages export จะคืน placeholder `unavailable=true` (graceful degradation)
+ถ้า agent ไม่ตอบ → LINE messages export จะคืน placeholder `unavailable=true` (graceful degradation). ส่วนอื่นๆ ของ export ยังทำงานปกติ
 
 ## Test 1 — Data Export Flow
 
-### Step 1.1 — Use test account (สมัครก่อน ถ้าไม่มี)
+### Step 1.1 — Use test account
 
 ใช้ test account ของ admin ที่มี:
 - user_meta `dinoco_line_uid` set
-- มี warranty registrations + claims + B2B orders (data ครบ)
+- มี warranty registrations + claims + B2B orders (data ครบ → ZIP จะมีไฟล์ครบทุก source)
 
-### Step 1.2 — Submit export request
-
-**ทาง A — REST API (สำหรับ admin test)**:
+### Step 1.2 — Submit export request (customer-facing endpoint)
 
 ```bash
-# Login first to get nonce (browser, then copy cookie + nonce)
+# Get nonce from logged-in browser session first:
+#   - Login as test user at https://dinoco.in.th
+#   - DevTools → Network → find any wp-json call → copy 'X-WP-Nonce' header
+#   - Copy 'wordpress_logged_in_*' cookie
+
 curl -X POST \
   -H "Content-Type: application/json" \
-  -H "Cookie: wordpress_logged_in_XXX=..." \
-  -H "X-WP-Nonce: ..." \
-  -d '{"scope":"all","format":"zip","reason":"e2e test by admin"}' \
+  -H "Cookie: wordpress_logged_in_XXX=YOUR_COOKIE" \
+  -H "X-WP-Nonce: YOUR_NONCE" \
+  -d '{"format":"zip","reason":"e2e test by admin"}' \
   https://dinoco.in.th/wp-json/dinoco-gdpr/v1/my-data-export
 ```
 
@@ -81,13 +105,9 @@ curl -X POST \
   "request_id": 123,
   "status": "pending",
   "estimated_complete_at": "2026-05-16T13:00:00+07:00",
-  "cancellation_window_at": "2026-05-16T12:30:00+07:00",
-  "message": "คำขอ export ได้รับแล้ว — รอ admin review ภายใน 30 นาที"
+  "message": "คำขอ export ได้รับแล้ว — รอ admin review"
 }
 ```
-
-**ทาง B — LIFF (สำหรับ real customer flow simulation)**:
-เปิด LIFF GDPR page (ถ้ามี) หรือ Member Dashboard → Settings → "ขอ export ข้อมูลของฉัน"
 
 ### Step 1.3 — Verify request created
 
@@ -103,40 +123,102 @@ ORDER BY id DESC LIMIT 1;
 
 ไป `/admin-command-center/#gdpr` → tab "Pending Review" → ต้องเห็น row ใหม่
 
-**Action 1 — Approve**:
-- คลิก "Approve" → ระบบ schedule cron processing
-- Status → 'approved' → 'processing'
-
-**Action 2 — รอ cron (~1 นาที) หรือ trigger manual**:
+**Action — Approve** (จะ schedule worker single event):
 
 ```bash
-wp cron event run dinoco_gdpr_process_queue_cron
+# REST call as admin (or click in UI):
+curl -X POST \
+  -H "Cookie: wordpress_logged_in_XXX=ADMIN_COOKIE" \
+  -H "X-WP-Nonce: ADMIN_NONCE" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"approved by admin"}' \
+  https://dinoco.in.th/wp-json/dinoco-gdpr/v1/admin/request/123/approve
 ```
 
-### Step 1.5 — Verify export ZIP generated
+**Expected response**:
+```json
+{
+  "success": true,
+  "status": "approved",
+  "cancellation_window_at": "2026-05-16T12:30:30+07:00",
+  "message": "Approved. Worker จะ run อัตโนมัติใน 30 วินาที (undo ได้ภายใน window นี้)"
+}
+```
+
+หลังจากนี้:
+- Status DB: `'pending'` → `'approved'`
+- WP schedules `wp_schedule_single_event('dinoco_gdpr_process_request', [123])` to fire at `cancellation_window_at`
+- Admin มี 30s ที่จะกด Undo
+
+**Undo (within 30s window)**:
+```bash
+curl -X POST \
+  -H "Cookie: ..." -H "X-WP-Nonce: ..." \
+  https://dinoco.in.th/wp-json/dinoco-gdpr/v1/admin/request/123/undo
+# → Status: 'pending' again, scheduled event cancelled
+```
+
+### Step 1.5 — รอ 30s + worker fires automatically
+
+After cancellation_window_at:
+- WP-Cron fires `dinoco_gdpr_process_request` action with `[123]`
+- Handler runs `dinoco_gdpr_build_export($user_id)`:
+  - Creates ZIP at `wp-content/uploads/gdpr/{user_id}/dinoco-export-{timestamp}.zip`
+  - Generates `download_token` (random 64-char)
+  - Updates `wp_dinoco_gdpr_requests` row: status='ready', download_token, expires_at=NOW()+7d
+
+**OR trigger immediately (skip undo wait)** — admin can use manual-export:
+
+```bash
+curl -X POST \
+  -H "Cookie: ..." -H "X-WP-Nonce: ..." \
+  https://dinoco.in.th/wp-json/dinoco-gdpr/v1/admin/request/123/manual-export
+# → Runs worker synchronously (heavy I/O, response may take 5-10s)
+```
+
+### Step 1.6 — Verify export ZIP generated
 
 ```sql
-SELECT id, status, processed_at, download_token, file_size_bytes
+SELECT id, status, processed_at, download_token, expires_at, scope_json
 FROM wp_dinoco_gdpr_requests
 WHERE id = 123;
 ```
 
-→ status='ready', `download_token` set, `file_size_bytes` > 0
+→ status='ready', `download_token` set (64 chars), `expires_at` ~7 days from now, `scope_json` contains record counts
 
-### Step 1.6 — Download ZIP
+### Step 1.7 — Download ZIP
 
-```bash
-curl -o test-export.zip \
-  "https://dinoco.in.th/wp-json/dinoco-gdpr/v1/admin/download/123?token={download_token}"
+Download URL pattern (NOT a REST endpoint — direct uploads URL with token):
 ```
+https://dinoco.in.th/wp-content/uploads/gdpr/{user_id}/dinoco-export-{timestamp}.zip?token={download_token}
+```
+
+Server-side `.htaccess` validates token before serving (or `/wp-content/uploads/gdpr/serve.php` proxy).
+
+**Get full download URL**: ดูใน admin UI tab "Ready" → ปุ่ม "Download" หรือ:
+
+```sql
+SELECT
+  CONCAT(
+    'https://dinoco.in.th/wp-content/uploads/gdpr/', user_id, '/',
+    -- zip filename pattern: dinoco-export-{request_id}-{timestamp}.zip
+    -- exact filename stored in scope_json or admin UI
+    '?token=', download_token
+  ) AS download_url
+FROM wp_dinoco_gdpr_requests
+WHERE id = 123;
+```
+
+Or just download via admin UI button.
 
 **Verify ZIP contents**:
 ```bash
+curl -o test-export.zip "https://dinoco.in.th/wp-content/uploads/gdpr/.../?token=..."
 unzip -l test-export.zip
 ```
 
 Expected files:
-- `user-profile.json` (wp_users + wp_usermeta)
+- `user-profile.json` (wp_users + wp_usermeta whitelist)
 - `warranties.json` (warranty CPT)
 - `claims.json` (claim_ticket CPT)
 - `b2b-orders.json` (B2B orders)
@@ -145,13 +227,13 @@ Expected files:
 - `audit-trail.json` (gdpr request audit)
 - `README.txt` (cover letter)
 
-**Sanity check**:
 ```bash
-unzip -p test-export.zip user-profile.json | jq .
+# Sanity check
+unzip -p test-export.zip user-profile.json | jq '.'
 # ต้องเห็น email, display_name, registered_date ฯลฯ
 ```
 
-### Step 1.7 — Verify audit log
+### Step 1.8 — Verify audit log
 
 ```sql
 SELECT created_at, request_id, action, actor_id, success
@@ -160,16 +242,22 @@ WHERE request_id = 123
 ORDER BY id;
 ```
 
-Expected actions: `submitted`, `approved_by_admin`, `processing_started`, `export_completed`, `download_link_issued`
+Expected actions sequence:
+1. `submitted` (actor = test user)
+2. `approved_by_admin` (actor = admin)
+3. `processing_started` (actor = worker / system 0)
+4. `export_completed` (actor = worker)
+5. `download_link_issued` (actor = worker)
+6. `downloaded` (actor = user, only if downloaded)
 
-### Step 1.8 — Test download expiry
+### Step 1.9 — Test download expiry
 
 Wait 7 days OR manually update DB:
 ```sql
 UPDATE wp_dinoco_gdpr_requests SET expires_at = NOW() - INTERVAL 1 HOUR WHERE id = 123;
 ```
 
-Try download again → ต้องคืน 410 Gone with message "Download link expired"
+Try download again → server denies with 403/410 + message "Download link expired"
 
 ---
 
@@ -180,8 +268,8 @@ Try download again → ต้องคืน 410 Gone with message "Download lin
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
-  -H "Cookie: wordpress_logged_in_XXX=..." \
-  -H "X-WP-Nonce: ..." \
+  -H "Cookie: wordpress_logged_in_XXX=USER_COOKIE" \
+  -H "X-WP-Nonce: USER_NONCE" \
   -d '{"reason":"e2e test deletion","confirm":"DELETE_MY_ACCOUNT"}' \
   https://dinoco.in.th/wp-json/dinoco-gdpr/v1/my-data-delete
 ```
@@ -191,25 +279,11 @@ curl -X POST \
 {
   "request_id": 124,
   "status": "pending",
-  "cancellation_window_at": "2026-05-16T13:00:00+07:00",
-  "message": "คำขอลบบัญชีได้รับ — มี grace period 30 นาทีก่อน admin review"
+  "message": "คำขอลบบัญชีได้รับ — Admin จะ review ก่อนดำเนินการ"
 }
 ```
 
-### Step 2.2 — Test cancellation window
-
-ภายใน 30 นาที — ลูกค้ายกเลิกได้:
-
-```bash
-curl -X DELETE \
-  -H "Cookie: wordpress_logged_in_XXX=..." \
-  -H "X-WP-Nonce: ..." \
-  https://dinoco.in.th/wp-json/dinoco-gdpr/v1/my-data-status/124
-```
-
-→ status='cancelled'. ทดสอบเสร็จ submit ใหม่สำหรับ Step 2.3
-
-### Step 2.3 — Admin review delete request
+### Step 2.2 — Admin review delete request
 
 `/admin-command-center/#gdpr` → tab "Pending Review" → row ใหม่ type='delete'
 
@@ -218,37 +292,59 @@ Admin จะเห็น **erasure decision matrix** (per `docs/compliance/GDPR-
 - ข้อมูลที่ anonymize (legal retention): order records (tax 5y), warranty (legal duration), claim ticket (audit trail)
 - ข้อมูลที่เก็บ (legitimate interest): aggregated analytics (no PII)
 
-### Step 2.4 — Approve + execute
-
-Admin click "Approve + Execute" → cron process:
+### Step 2.3 — Approve
 
 ```bash
-wp cron event run dinoco_gdpr_process_queue_cron
+curl -X POST \
+  -H "Cookie: ..." -H "X-WP-Nonce: ..." \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"approved deletion", "mode":"anonymize"}' \
+  https://dinoco.in.th/wp-json/dinoco-gdpr/v1/admin/request/124/approve
+```
+
+`mode`:
+- `"anonymize"` — keep records for legal retention, scrub PII (recommended for orders/warranties)
+- `"hard_delete"` — DROP all data (only for users with NO legal-retention obligation; requires 2nd admin approval per Q15)
+
+### Step 2.4 — รอ 30s undo window + worker fires
+
+หรือ manual-export to skip wait:
+
+```bash
+curl -X POST \
+  -H "Cookie: ..." -H "X-WP-Nonce: ..." \
+  https://dinoco.in.th/wp-json/dinoco-gdpr/v1/admin/request/124/manual-export
 ```
 
 ### Step 2.5 — Verify deletion
 
 ```sql
--- User row should be either deleted or anonymized
+-- User row check
 SELECT ID, user_login, user_email, display_name FROM wp_users WHERE ID = {test_user_id};
--- Expected: row deleted OR user_email = 'anonymized-XXX@deleted.local'
+-- mode='anonymize': row exists, user_email pattern 'anonymized-XXX@deleted.local'
+-- mode='hard_delete': row deleted
 
--- User meta personal fields cleared
-SELECT meta_key, meta_value FROM wp_usermeta WHERE user_id = {test_user_id};
--- Expected: dinoco_line_uid removed, profile fields cleared
+-- User meta personal fields cleared (anonymize mode)
+SELECT meta_key, LEFT(meta_value, 50) AS meta_preview
+FROM wp_usermeta WHERE user_id = {test_user_id};
+-- Expected: dinoco_line_uid + first_name + last_name + billing_* removed
+-- Kept: roles, capabilities, language preference
 
 -- Orders should remain (legal retention) but PII anonymized
 SELECT ID, post_title FROM wp_posts WHERE post_type = 'b2b_order' AND post_author = {test_user_id};
--- Expected: posts remain, but linked user data anonymized
+-- Expected: posts remain (5-year tax retention), author replaced with anonymized user
 ```
 
 ### Step 2.6 — Verify audit trail (immutable)
 
 ```sql
-SELECT * FROM wp_dinoco_gdpr_audit_log WHERE request_id = 124 ORDER BY id;
+SELECT created_at, action, actor_id, payload_preview
+FROM wp_dinoco_gdpr_audit_log
+WHERE request_id = 124
+ORDER BY id;
 ```
 
-Audit trail ต้องอยู่ครบ — PDPA §39 บังคับ retention
+Audit trail ต้องอยู่ครบ — PDPA §39 บังคับ retention 90 days minimum (configurable)
 
 ---
 
@@ -258,16 +354,16 @@ Audit trail ต้องอยู่ครบ — PDPA §39 บังคับ r
 
 `/admin-command-center/#gdpr` — verify all 5 tabs load:
 - Pending Review (count = N)
-- Processing (count = N)
-- Ready (download links live)
-- Failed (cron errors if any)
+- Processing (count = N) — type='approved' หรือ 'processing'
+- Ready (download links live, type='ready' && expires_at > NOW())
+- Failed (status='failed' — cron errors if any)
 - Audit Log (immutable trail)
 
 ### 3.2 — Filter + search
 
-Search by user_id, request_id, type, date range → results filtered correctly
+Filter by user_id, request_id, type (export/delete), status, date range → results filtered correctly
 
-### 3.3 — Bulk actions
+### 3.3 — Bulk actions (ถ้ามี)
 
 Select multiple → bulk approve / reject → confirm modal → execute
 
@@ -275,11 +371,12 @@ Select multiple → bulk approve / reject → confirm modal → execute
 
 Tab "Audit Log" → button "📥 Export CSV" → download → verify columns
 
-### 3.5 — Refund decision UI (delete flow)
+### 3.5 — Undo workflow
 
-When approving delete, admin sees:
-- ✅ "Anonymize ข้อมูลส่วนตัว, เก็บ orders 5 ปี (tax law)" (default)
-- ⚠️ "Hard delete ทุกอย่าง" (advanced, requires 2nd admin approval per Q15)
+1. Approve a test request → status='approved', cancellation_window_at = NOW()+30s
+2. กดปุ่ม "Undo" ภายใน 30s
+3. Status → 'pending', scheduled event cancelled
+4. หลัง 30s กด "Undo" → error 410 Gone "undo window expired"
 
 ## Test data cleanup
 
@@ -291,15 +388,14 @@ DELETE FROM wp_dinoco_gdpr_audit_log WHERE request_id IN (123, 124);
 DELETE FROM wp_dinoco_gdpr_requests WHERE id IN (123, 124);
 
 -- Delete test export ZIP file
--- (path stored in row before deletion — note it for manual rm)
+-- ดู file path จาก scope_json column ก่อนลบ row
+-- เช่น: rm /var/www/dinoco.in.th/wp-content/uploads/gdpr/{user_id}/dinoco-export-*.zip
 ```
 
-หรือใช้ WP CLI helper:
+หรือใช้ cron cleanup (ZIP files >7 days auto-delete):
 ```bash
-wp dinoco gdpr cleanup-test-data --request-ids=123,124
+wp cron event run dinoco_gdpr_export_cleanup_cron
 ```
-
-(ถ้า helper command ยังไม่มี — manual SQL OK)
 
 ## Failure scenarios to verify
 
@@ -308,15 +404,16 @@ wp dinoco gdpr cleanup-test-data --request-ids=123,124
 | Submit export while user not logged in | 401 Unauthorized |
 | Submit 2 exports within 1 hour same user | 429 Too Many Requests (rate limited) |
 | Admin reject request | status='rejected', user notified via LINE, audit logged |
-| Cron crashes mid-processing | status='failed', error_message stored, admin sees in Failed tab |
+| Worker crashes mid-processing | status='failed', error_message stored, admin sees in Failed tab |
 | OpenClaw agent down during export | line-messages-UNAVAILABLE.txt placeholder, rest of export proceeds |
-| Download token expired | 410 Gone with friendly Thai message |
+| Download token expired (>7 days) | 410 Gone with friendly Thai message |
 | Hard delete user with active subscriptions | 409 Conflict (block until subscriptions handled) |
+| Approve, then admin tries Undo after 30s | 410 Gone "undo window expired" |
 
 ## Production readiness checklist
 
 หลังเทสผ่าน:
-- [ ] All 3 flows green
+- [ ] All 3 flows green (export + delete + admin review)
 - [ ] Audit log entries verified
 - [ ] LINE notifications to user verified (export ready / delete completed)
 - [ ] Email notifications (if configured)
@@ -331,3 +428,12 @@ wp dinoco gdpr cleanup-test-data --request-ids=123,124
 - [`docs/compliance/GDPR-PHASE-6-DESIGN.md`](../compliance/GDPR-PHASE-6-DESIGN.md) — erasure decision matrix
 - [`docs/compliance/PDPA-BASICS.md`](../compliance/PDPA-BASICS.md) — Thai PDPA §30-39 reference
 - OpenClaw agent: `/api/gdpr/line-messages` route
+
+## Audit notes
+
+This runbook was **rewritten V.2 (2026-05-16)** after audit found V.1 referenced:
+- ❌ `dinoco_gdpr_process_queue_cron` (doesn't exist) → actual: `wp_schedule_single_event('dinoco_gdpr_process_request', [$id])` per approval
+- ❌ `GET /dinoco-gdpr/v1/admin/download/{id}` (doesn't exist) → actual: direct `wp-content/uploads/gdpr/.../?token=...` URL with .htaccess token check
+- ❌ `DELETE /my-data-status/{id}` for customer cancellation (no DELETE handler) → actual: admin-only `/admin/request/{id}/undo` within 30s window
+
+V.2 corrected to actual REST routes + worker mechanism + download pattern. Verified via grep against `[System] DINOCO GDPR Data Requests` V.4.6+ snippet.

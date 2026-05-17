@@ -29,24 +29,56 @@
 
 ### Step 2 — Install Sentry PHP SDK บน WP server (5 นาที)
 
+⚠️ **สำคัญ**: WordPress install ไม่มี `composer.json` ที่ root โดย default → ติดตั้ง composer require ที่ root อาจจะสร้าง `composer.json` + `vendor/` ใหม่ที่ WP root ซึ่ง autoload จะไม่ถูกพิจารณาเว้นแต่จะ require ตรง.
+
+**Observability snippet V.1.2 มี `require_once vendor/autoload.php` แล้ว** (line ~104-107 ของ snippet — explicit `file_exists` guard + load) — รองรับ 2 path:
+
+1. `wp-content/vendor/autoload.php` (recommended location)
+2. `wp-content/plugins/sentry/vendor/autoload.php` (alternative)
+
+**Option A — Install ที่ `wp-content/` (recommended — ตรงกับ snippet expectation)**:
+
 SSH เข้า WP server แล้วรัน:
 
 ```bash
-cd /var/www/dinoco.in.th    # adjust ตาม path จริงของบอส
+cd /var/www/dinoco.in.th/wp-content   # ปรับ path ถ้าต่าง
+
+# ติดตั้ง composer ถ้ายังไม่มี
+if ! command -v composer &>/dev/null; then
+    curl -sS https://getcomposer.org/installer | php
+    mv composer.phar /usr/local/bin/composer
+    chmod +x /usr/local/bin/composer
+fi
+
+# ติดตั้ง Sentry SDK
 composer require sentry/sentry
+
+# Verify autoload + class loaded
+php -r "require 'vendor/autoload.php'; echo class_exists('\\Sentry\\Client') ? 'OK\\n' : 'FAIL\\n';"
+# Expected: OK
 ```
 
-ถ้ายังไม่มี composer:
+**Option B — Install เป็น mu-plugin (alternative)**:
+
 ```bash
-cd /var/www/dinoco.in.th
-curl -sS https://getcomposer.org/installer | php
-php composer.phar require sentry/sentry
+mkdir -p /var/www/dinoco.in.th/wp-content/mu-plugins/sentry-bootstrap
+cd /var/www/dinoco.in.th/wp-content/mu-plugins/sentry-bootstrap
+composer require sentry/sentry
+# จากนั้นเพิ่มไฟล์ loader.php ที่ require '../wp-content/mu-plugins/sentry-bootstrap/vendor/autoload.php';
 ```
 
-Verify install:
+(Option A เร็วและตรงกับ snippet code path ปัจจุบัน — แนะนำ unless มี constraint ที่ใส่ที่ `wp-content/vendor/` ไม่ได้)
+
+**Verify ก่อนไป Step 3**:
+
 ```bash
-ls -la vendor/sentry/sentry/
-# ต้องเห็น folder + composer.json
+# Check class exists from WP context (loads wp-config.php + plugins)
+wp --path=/var/www/dinoco.in.th eval 'echo class_exists("\\Sentry\\Client") ? "OK" : "FAIL — vendor autoload path mismatch";'
+# Expected: OK
+
+# Check Observability snippet has proper autoload code
+wp --path=/var/www/dinoco.in.th eval 'echo function_exists("dinoco_obs_capture") ? "OK" : "FAIL — Observability snippet not active";'
+# Expected: OK
 ```
 
 ### Step 3 — เพิ่ม DSN constant ใน wp-config.php (2 นาที)
@@ -96,44 +128,52 @@ ON DUPLICATE KEY UPDATE option_value = '1';
 
 ### Step 5 — Verify (5 นาที)
 
-**Test 1 — Trigger test event**:
+**Test 1 — Trigger test event via WP CLI** (ไม่ต้องสร้างไฟล์ — ปลอดภัยกว่า):
 
-สร้างไฟล์ test ชั่วคราว `/var/www/dinoco.in.th/wp-content/sentry-test.php`:
-
-```php
-<?php
-require_once dirname(__DIR__) . '/wp-load.php';
-
-if ( ! current_user_can( 'manage_options' ) ) {
-    die( 'admin only' );
-}
-
-if ( function_exists( 'dinoco_obs_capture' ) ) {
-    dinoco_obs_capture( 'error', 'Sentry test from boss — ' . current_time( 'mysql' ), array(
-        'context' => 'manual_test',
-        'ip'      => $_SERVER['REMOTE_ADDR'] ?? 'unknown',
-    ) );
-    echo 'Sent! Check Sentry dashboard ภายใน 1 นาที';
+```bash
+# Run จาก SSH session
+wp --path=/var/www/dinoco.in.th eval '
+if ( function_exists( "dinoco_obs_capture" ) ) {
+    dinoco_obs_capture( "error", "Sentry test " . current_time( "mysql" ), array( "context" => "boss_manual_test" ) );
+    echo "Sent! Check Sentry dashboard ภายใน 1 นาที\\n";
 } else {
-    echo 'ERROR: dinoco_obs_capture not found — Observability snippet ไม่ sync';
+    echo "ERROR: dinoco_obs_capture not found — Observability snippet ไม่ sync\\n";
 }
+'
 ```
 
-เปิด URL: `https://dinoco.in.th/wp-content/sentry-test.php` (login as admin first)
+✅ Pattern นี้ปลอดภัยกว่า "drop test PHP file ใน wp-content" เพราะ:
+
+- ไม่มี publicly-accessible file ค้าง (race condition กับ bot scan)
+- ไม่มี risk ของ wp-load.php path สมมุติผิด (multisite / Bedrock / hardened install)
+- WP CLI โหลด full WP context ครบ + ไม่ต้องลบไฟล์ทีหลัง
 
 **Test 2 — เช็ค Sentry dashboard**:
-- ไป https://sentry.io → project `dinoco-wp` → Issues
-- ภายใน 30 วินาที จะเห็น event "Sentry test from boss — ..."
+
+- ไป <https://sentry.io> → project `dinoco-wp` → Issues
+- ภายใน 30 วินาที จะเห็น event "Sentry test ..."
 
 **Test 3 — เช็ค X-Request-ID header** (correlation):
+
 ```bash
+# Test ทั้ง authenticated + unauthenticated paths
+# Unauthenticated (จะคืน 401 — แต่ header X-Request-ID ก็ต้อง emit):
 curl -I https://dinoco.in.th/wp-json/dinoco-stock/v1/stock/list?per_page=1
+
+# Authenticated (ต้อง pass nonce + cookie):
+curl -I -H "Cookie: wordpress_logged_in_XXX=..." \
+     -H "X-WP-Nonce: ..." \
+     https://dinoco.in.th/wp-json/dinoco-stock/v1/stock/list?per_page=1
+
 # Response headers ต้องมี:  X-Request-ID: req_XXXXXXXX
+# Header นี้ emit ผ่าน rest_post_dispatch filter ใน Observability snippet
+# — fire บน ทั้ง 200 และ 401/403/4xx responses
 ```
 
-**Test 4 — ลบไฟล์ test**:
+**หมายเหตุ cache layer**: หลัง flip flag `dinoco_obs_correlation_enabled='1'` Observability snippet V.1.2 มี H7 alloptions cache bust (static guard) — แต่ถ้า WordPress cache plugin มี aggressive caching ที่ stale value → flush manually:
+
 ```bash
-rm /var/www/dinoco.in.th/wp-content/sentry-test.php
+wp --path=/var/www/dinoco.in.th cache flush
 ```
 
 ## Troubleshooting
@@ -179,3 +219,15 @@ wp option update dinoco_obs_correlation_enabled '0'
 - [`[Admin System] DINOCO Observability`](../../%5BAdmin%20System%5D%20DINOCO%20Observability) V.1.2+ (H7-safe)
 - [Original setup runbook](./SENTRY-ACTIVATION.md) (more technical detail)
 - [`docs/compliance/PDPA-BASICS.md`](../compliance/PDPA-BASICS.md) (PII redact rules — already wired in `dinoco_obs_redact_context()`)
+
+## Audit notes
+
+This runbook was **revised V.2 (2026-05-17)** after audit found V.1 had:
+
+- ⚠️ Vague composer install location (assumed WP root has `composer.json` — most installs don't) → V.2 specifies `wp-content/vendor/` ตรงกับ Observability snippet expectation + Option B alternative
+- ⚠️ Test file drop in `wp-content/sentry-test.php` posed security risk (publicly-accessible PHP, race condition with bot scans, wp-load.php path assumption) → V.2 uses `wp cli eval` instead (no file artifact, full WP context, no cleanup needed)
+- ⚠️ Missing pre-Step 3 verify (class_exists + function_exists check) → V.2 adds `wp eval` smoke test after install
+- ⚠️ Missing cache flush note after flag flip (alloptions cache may serve stale '0') → V.2 adds `wp cache flush` step
+- ⚠️ Test 3 curl assumed authenticated but didn't pass nonce → V.2 documents both auth + unauth paths (header should emit on both)
+
+V.2 corrected to safer install pattern + WP CLI testing + cache flush awareness. Verified Observability snippet V.1.2 autoload code path (line ~104-107 file_exists guard) + H7 alloptions bust (line ~58-60 static guard).

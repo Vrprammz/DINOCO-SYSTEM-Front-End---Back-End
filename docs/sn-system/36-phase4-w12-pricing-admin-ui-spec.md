@@ -2,10 +2,61 @@
 
 [← SN System docs](./README.md)
 
-> **Status**: SPEC · Boss-binding inputs locked (Q8 R2 + 2026-05-15 final decisions). Ready to dev when Phase 4 W12 starts.
+> **Status**: ⚠️ **MOSTLY SUPERSEDED** by Phase 5 W15.1 shipped 2026-05-07 (V.0.34 SN Manager + REST endpoint live in production). Original W12 work scope **already done**. Re-scoped 2026-05-16 to **additive features only** (~10-12h remaining).
+> **Audit finding (2026-05-16)**: Spec proposed schema/REST/UI that already exists in production. See "What's actually built" below before reading the rest.
 > **Boss decisions referenced**: Q6 / Q7 / Q8 / Q15 / Q20 / 2026-05-15 #1 (non-VAT บัญชีบุคคล)
-> **Effort estimate**: ~24-30h dev (UI + REST + DB ALTER + tests + drift detector)
+> **Effort estimate (revised)**: ~10-12h additive (grace_days field + terms_url + Inventory modal cross-link + pricing summary tab improvements)
 > **Replaces / supersedes**: parts of `08-f8-extension-marketplace-q6-q8-q7-q20-replan.md` §"UX/UI (Phase 4 W12)" + `35-boss-final-decisions-2026-05-15.md` #1
+
+---
+
+## ⚠️ Audit Notice (2026-05-16)
+
+ระหว่าง audit สเปคทั้งหมดวันที่ 2026-05-16 พบว่า **งานหลักของ Phase 4 W12 shipped ไปแล้วใน Phase 5 W15.1 (V.0.34, 2026-05-07)** ก่อนเขียน spec นี้
+
+### What's ALREADY built (production, V.0.34+)
+
+| Component | Location | Status |
+|---|---|---|
+| Schema columns `sn_ext_price_1y/2y/3y` (DECIMAL 10,2) | `[Admin System] DINOCO Production SN Manager` line ~2010-2012 (ALTER TABLE) | ✅ Live |
+| Index `idx_sn_ext_enabled` | SN Manager line ~2042 | ✅ Live |
+| REST `GET /dinoco-sn/v1/marketplace/pricing` (list) | `[System] DINOCO SN REST API` line ~2410+ + SN Manager line 4748 | ✅ Live |
+| REST `POST /dinoco-sn/v1/marketplace/pricing/{sku}` (upsert) | SN REST API line 2432 + handler `dinoco_sn_rest_marketplace_pricing_save` (line 10840-10920) | ✅ Live |
+| Audit event `marketplace_pricing_updated` via `dinoco_sn_audit_log()` | SN REST handler | ✅ Live |
+| Admin UI Tab 11 "Marketplace" in SN Manager | SN Manager line 2964 (tab def) + line 4736 (render) | ✅ Live |
+| Customer-facing helper `dinoco_sn_get_extension_price()` | `[System] DINOCO SN REST API` line 9804 (NOT B2B Snippet 1 as originally written) | ✅ Live |
+| Customer marketplace quote endpoint | `GET /dinoco-sn/v1/marketplace/quote` (not `/extension/pricing/{sku}` as originally proposed) | ✅ Live |
+| Helper `dinoco_sn_ext_pricing_columns_exist()` lazy ALTER | Already in SN Manager via INFORMATION_SCHEMA precheck pattern | ✅ Pattern reused |
+
+→ **Sections 3 (DB schema), 4 (REST contracts), 5 (UI mockups Tab 11), 6 (LIFF read flow), 7.5 (drift detector for existing UI) ของสเปคนี้ — ทำแล้วในโค้ดจริง**
+
+### What's STILL additive (in-scope for new W12 work)
+
+| Item | Effort | Boss-pending? |
+|---|---|---|
+| **`sn_ext_grace_days` column** per SKU (override default grace period for past-expiry purchase) | ~1h schema + ~2h UI | Yes — Q-W12-new-1 (default value? 0 vs 7 vs 30?) |
+| **`sn_ext_terms_url` column** per SKU (link to T&C — non-VAT บัญชีบุคคล clarity) | ~30min schema + ~1h UI | Yes — Q-W12-new-2 (single global URL vs per-SKU?) |
+| **Inventory Product Edit modal cross-link** to Marketplace Tab 11 pricing for current SKU | ~2-3h JS + UX | No |
+| **Pricing summary widget** in SN Manager Tab 11 (top of page): "X SKUs enabled / Y SKUs disabled, avg price ฿Z" | ~1-2h SQL + render | No |
+| **Bulk import CSV** (upload pricing for many SKUs at once) | ~3-4h endpoint + UI | Yes — Q-W12-new-3 (CSV format? validation rules?) |
+| **Drift detector test** for V.0.34 marketplace endpoints (gap — no `tests/jest/sn-marketplace-pricing-drift.test.js` yet) | ~30min | No |
+
+**Total revised effort**: ~10-12h (down from original 24-30h)
+
+### Action items
+
+1. **Boss decides**: Do additive items (grace_days, terms_url, bulk CSV) get shipped now in W12.A sprint, OR defer to W12.B?
+2. **Boss decides Q-W12-new-1/2/3** before dev kickoff
+3. **Skip Sections 3, 4, 5, 6, 7.5 of this spec** — refer to V.0.34 production code as source of truth
+4. **Re-write Section 7 (test plan)** to add drift detector for existing V.0.34 endpoints + new tests for additive features
+
+### Why this happened
+
+Spec was written 2026-05-16 based on `08-f8-extension-marketplace-q6-q8-q7-q20-replan.md` (2026-05-07 plan) without verifying current code state. V.0.34 SN Manager + V.0.34 SN REST API shipped same day as plan but spec author wasn't aware. Future specs should run grep verify against codebase before assuming work is pending.
+
+---
+
+## ⬇️ ORIGINAL SPEC BELOW (kept for reference — verify each section against V.0.34 code before implementing) ⬇️
 
 ---
 
