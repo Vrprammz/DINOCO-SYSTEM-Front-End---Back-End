@@ -1,5 +1,14 @@
 /**
  * claim-flow.js — Manual claim flow, AI-powered claim detection + KB-aware questions
+ * V.4.2 — P0.4 from Dead-Workflow Remediation Spec V.1.0 (2026-05-18).
+ *         + composeOcrMisreadCustomerMessage(): friendly Thai message when
+ *           validatePhotoSerial flags ocr_misread_suspect (excluded chars I/L/O/U).
+ *           Previously customer got NO feedback when OCR misread their photo
+ *           → claim flow appeared stuck. Now: reset status=photo_rejected +
+ *           ask customer to retry photo OR type S/N manually (2-option message).
+ *         + Wired into photo_requested case after runPhotoOcrValidation.
+ *         + Sensitive flags (fake_sn / sensitive_state / fraud) STAY admin-only
+ *           per §15.14.5 — only misread_suspect surfaces to customer.
  * V.4.1 — Phase 4 W14.5 Round 3 (chatbot-rules.md §15.14): OCR_SN_REGEX strict Crockford
  *         alphabet (excludes I/L/O/U) — prevents OCR misread false positives
  *         (DNCO0123 → "O" ambiguous, DNCL1234 → "L" ambiguous). Validation chain now
@@ -184,6 +193,39 @@ async function runPhotoOcrValidation(analysisText, claim, sourceId) {
     if (v.flag) flags.push({ sn: v.sn, status: v.status, flag: v.flag, at: new Date() });
   }
   return { extractedSerials: extracted, validationFlags: flags };
+}
+
+/**
+ * V.4.2 (P0.4 — Dead-Workflow Remediation Spec V.1.0)
+ *
+ * Compose customer-facing message when OCR validation flagged ocr_misread_suspect.
+ * Previously customers got NO feedback when their photo had OCR-ambiguous chars
+ * (I/L/O/U Crockford exclusions) → claim flow appeared stuck. Now we surface a
+ * friendly message + invite manual S/N input as fallback.
+ *
+ * Returns null if no misread suspected (caller continues normal flow).
+ * Returns string (Thai message) if at least one flag === 'ocr_misread_suspect'.
+ *
+ * IMPORTANT: Per §15.14.5 AI rule, we NEVER reveal validation result to customer
+ * (fraud / voided / mismatch are admin's call). Only ocr_misread_suspect (which
+ * is a benign noise classification) gets surfaced — and only as a hint, not a
+ * confirmation. Caller should set claim.status='photo_rejected' so further
+ * photos retry the flow.
+ */
+function composeOcrMisreadCustomerMessage(ocr) {
+  if (!ocr || !Array.isArray(ocr.validationFlags) || ocr.validationFlags.length === 0) return null;
+  const hasMisread = ocr.validationFlags.some(f => f && f.flag === 'ocr_misread_suspect');
+  if (!hasMisread) return null;
+  return [
+    "📸 ระบบอ่านเลข S/N บนภาพไม่ค่อยชัดเจนค่ะ",
+    "อาจมีตัวเลขที่อ่านสับสนได้ เช่น 1↔I↔L หรือ 0↔O",
+    "",
+    "รบกวนเลือกอย่างใดอย่างหนึ่งนะคะ:",
+    "1️⃣ ส่งภาพอีกครั้งโดยให้เห็นเลข S/N ชัดๆ (ถ่ายใกล้ + แสงเพียงพอ)",
+    "2️⃣ หรือพิมพ์เลข S/N ที่อยู่บนเพลทมาก็ได้ค่ะ (เช่น DNCSS1234567)",
+    "",
+    "ขอบคุณค่ะ 🙏",
+  ].join("\n");
 }
 
 // Forward declarations
@@ -492,6 +534,7 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
         if (analysis) {
           // V.4.0 — chatbot-rules.md §15.14.5 Photo OCR fraud validation
           // Best-effort + non-blocking on alerts; never break claim flow on failure.
+          let ocrMisreadMessage = null;
           try {
             const ocr = await runPhotoOcrValidation(analysis, claim, sourceId);
             if (ocr.extractedSerials.length > 0 || ocr.validationFlags.length > 0) {
@@ -504,8 +547,19 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
                 }
               );
             }
+            // V.4.2 P0.4 — surface customer-facing feedback for ocr_misread_suspect.
+            // Other flags (fake_sn / sensitive_state / fraud) stay admin-only per §15.14.5.
+            ocrMisreadMessage = composeOcrMisreadCustomerMessage(ocr);
           } catch (ocrErr) {
             console.error("[ClaimOCR] photo_requested validation error:", ocrErr.message);
+          }
+          // V.4.2 P0.4 — if OCR misread suspected, ask customer to retry photo OR
+          // type S/N manually. Reset status to photo_rejected so next photo retries.
+          if (ocrMisreadMessage) {
+            await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+              $set: { status: "photo_rejected", aiAnalysis: analysis, updatedAt: new Date() },
+            });
+            return ocrMisreadMessage;
           }
           const isBlurry = /ไม่ชัด|ขอถ่ายใหม่|มืด|เบลอ/.test(analysis);
           if (isBlurry) {
@@ -684,4 +738,6 @@ module.exports = {
   validatePhotoSerial,
   runPhotoOcrValidation,
   OCR_SN_REGEX,
+  // V.4.2 P0.4 — Dead-Workflow Remediation Spec V.1.0 customer feedback helper
+  composeOcrMisreadCustomerMessage,
 };
