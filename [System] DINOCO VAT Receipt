@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO VAT Receipt                                     ║
+ * ║  Version: V.1.4 (2026-05-18) — code-reviewer remediation:        ║
+ * ║    • H-1: static per-request memo on assemble_data() — saves 1   ║
+ * ║      DB roundtrip per receipt (Flex builder + PNG both call it). ║
+ * ║    • H-2: removed 10s wp_remote_get fallback (DoS+latency vector)║
+ * ║      → hard-require b2b_inv_get_logo_gd from Snippet 10. Skip   ║
+ * ║      logo + log warning if missing.                              ║
+ * ║    • M-3: receipt_date formatted via dinoco_format_date('admin') ║
+ * ║      (Thai d/m/Y H:i instead of MySQL DATETIME)                  ║
+ * ║    • M-4: address truncated 80→60 chars (avoid x=580 receipt_no  ║
+ * ║      horizontal collision at y=100)                              ║
+ * ║    • L-1: docblock "base64 data URL" → "raw PNG binary"          ║
+ * ║    • L-2: imagealphablending($img, true) before logo composite   ║
+ * ║                                                                   ║
  * ║  Version: V.1.3 (2026-05-18) — DINOCO logo + canonical branding: ║
  * ║    PNG renderer now embeds DINOCO logo top-right (120×60 max,    ║
  * ║    aspect-preserved). Reuses b2b_inv_get_logo_gd() from B2B      ║
@@ -172,6 +185,14 @@ if ( ! function_exists( 'dinoco_vat_receipt_assemble_data' ) ) {
     function dinoco_vat_receipt_assemble_data( $extension_id ) {
         global $wpdb;
         $extension_id = (int) $extension_id;
+        // V.1.3 H-1 fix: per-request static memo — both Flex builder + PNG
+        // renderer call this per push, hitting same row data twice. Saves
+        // 1 DB roundtrip + 1 user_meta lookup + 1 catalog lookup per receipt.
+        // Mirrors DINOCO_Catalog::get_by_sku() pattern (CLAUDE.md PERF-H1).
+        static $memo = array();
+        if ( $extension_id > 0 && array_key_exists( $extension_id, $memo ) ) {
+            return $memo[ $extension_id ];
+        }
         if ( $extension_id <= 0 ) return null;
 
         $eligible = dinoco_vat_receipt_extension_is_eligible( $extension_id );
@@ -244,7 +265,7 @@ if ( ! function_exists( 'dinoco_vat_receipt_assemble_data' ) ) {
             $plate_count > 1 ? sprintf( ' (ชุด %d ชิ้น)', $plate_count ) : ''
         );
 
-        return array(
+        $result = array(
             'receipt_no'       => dinoco_vat_receipt_generate_receipt_no( $extension_id ),
             'receipt_date'     => ! empty( $ext->paid_at ) ? $ext->paid_at : $ext->created_at,
             'extension_id'     => $extension_id,
@@ -279,6 +300,11 @@ if ( ! function_exists( 'dinoco_vat_receipt_assemble_data' ) ) {
             'payment_method'   => (string) $ext->payment_method,
             'payment_ref'      => (string) $ext->payment_ref,
         );
+        // V.1.3 H-1: write to per-request memo for downstream callers
+        if ( $extension_id > 0 ) {
+            $memo[ $extension_id ] = $result;
+        }
+        return $result;
     }
 }
 
@@ -486,8 +512,9 @@ html, body { margin: 0; padding: 0; background: #fff; color: #111; font-family: 
 
 if ( ! function_exists( 'dinoco_vat_receipt_render_png' ) ) {
     /**
-     * Render PNG receipt (in-memory) + return base64 data URL.
-     * For server-side caching, callers should write to wp_upload_dir().
+     * Render PNG receipt (in-memory) + return raw PNG binary string.
+     * (V.1.3 L-1: docblock fixed — function returns PNG bytes from ob_get_clean,
+     *  NOT a data URL. Callers persist via file_put_contents or stream directly.)
      *
      * @param int $extension_id
      * @return string PNG binary, or '' on failure
@@ -541,36 +568,22 @@ if ( ! function_exists( 'dinoco_vat_receipt_render_png' ) ) {
             @imagettftext( $img, $size, 0, (int) $x, (int) $y, $color, $font, (string) $text );
         };
 
-        // V.1.2 — DINOCO logo (canonical brand presence on every receipt)
-        // Reuses cached logo from [B2B] Snippet 10 (b2b_inv_get_logo_gd —
-        // 24hr file cache in wp-uploads/b2b-fonts/logo_cache.png). Falls back
-        // to raw download if Snippet 10 not synced. Position: top-right corner
-        // so it doesn't overlap company name text on the left.
+        // V.1.3 H-2 fix: prefer cached logo from [B2B] Snippet 10
+        // (b2b_inv_get_logo_gd — 24hr disk cache, no network per call).
+        // Removed wp_remote_get fallback — 10s timeout on render path
+        // created 50×10s=8min cron stall under burst load + DoS surface
+        // if logo URL slow. If Snippet 10 unavailable → skip logo embed
+        // (receipt still valid, just no brand mark). Log warning so admin
+        // knows to verify Snippet 10 sync.
         $logo_resource = null;
         if ( function_exists( 'b2b_inv_get_logo_gd' ) ) {
             $logo_resource = b2b_inv_get_logo_gd( 'default' );
-        }
-        if ( ! $logo_resource ) {
-            // Fallback: download directly using brand_logo helper
-            $logo_fallback_url = '';
-            if ( function_exists( 'dinoco_brand_logo_url' ) ) {
-                $logo_fallback_url = (string) dinoco_brand_logo_url( 'default' );
-            }
-            if ( $logo_fallback_url === '' && function_exists( 'b2b_get_logo_url' ) ) {
-                $logo_fallback_url = (string) b2b_get_logo_url();
-            }
-            if ( $logo_fallback_url !== '' ) {
-                $resp = wp_remote_get( $logo_fallback_url, array( 'timeout' => 10 ) );
-                if ( ! is_wp_error( $resp ) ) {
-                    $body = wp_remote_retrieve_body( $resp );
-                    if ( strlen( $body ) > 500 ) {
-                        $logo_resource = @imagecreatefromstring( $body );
-                        if ( $logo_resource ) {
-                            imagealphablending( $logo_resource, true );
-                            imagesavealpha( $logo_resource, true );
-                        }
-                    }
-                }
+        } else {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'vat_receipt_logo_helper_missing', array(
+                    'extension_id' => $extension_id,
+                    'hint'         => '[B2B] Snippet 10 V.31.1+ not synced — b2b_inv_get_logo_gd unavailable. Receipt renders without DINOCO logo brand mark.',
+                ) );
             }
         }
         if ( $logo_resource ) {
@@ -587,6 +600,10 @@ if ( ! function_exists( 'dinoco_vat_receipt_render_png' ) ) {
                 }
                 $logo_x = $W - $target_w - 30; // 30px right margin
                 $logo_y = 20;
+                // V.1.3 L-2: enable alphablending on destination so logo with
+                // alpha channel composites correctly over white background
+                // (prevents edge artifacts on transparent PNG logos).
+                imagealphablending( $img, true );
                 imagecopyresampled(
                     $img, $logo_resource,
                     $logo_x, $logo_y, 0, 0,
@@ -602,10 +619,17 @@ if ( ! function_exists( 'dinoco_vat_receipt_render_png' ) ) {
             $put( 11, 30, 60, $gray, $d['company_name_en'] );
         }
         $put( 10, 30, 82, $black, 'เลขประจำตัวผู้เสียภาษี: ' . $d['tax_id'] . '  สาขา: ' . $d['branch_code'] );
-        $put( 10, 30, 100, $black, mb_substr( $d['address'], 0, 80 ) );
+        // V.1.3 M-4: address truncated 80→60 to avoid horizontal collision
+        // with receipt_no at x=580 (80 Thai chars ≈ 640px → reaches x=670 →
+        // overlapped receipt_no at x=580)
+        $put( 10, 30, 100, $black, mb_substr( $d['address'], 0, 60 ) );
         // V.1.2 — receipt no / date moved below logo (logo at y=20-80, top-right)
         $put( 14, 580, 100, $black, $d['receipt_no'] );
-        $put( 10, 580, 118, $gray, (string) $d['receipt_date'] );
+        // V.1.3 M-3: format receipt_date Thai-friendly (was raw MySQL DATETIME)
+        $receipt_date_display = function_exists( 'dinoco_format_date' )
+            ? dinoco_format_date( $d['receipt_date'], 'admin' )
+            : (string) $d['receipt_date'];
+        $put( 10, 580, 118, $gray, $receipt_date_display );
 
         imageline( $img, 30, 135, $W - 30, 135, $black );
 
