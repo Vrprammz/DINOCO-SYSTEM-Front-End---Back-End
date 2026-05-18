@@ -19,18 +19,48 @@ DINOCO operates as **non-VAT บัญชีบุคคล** (boss decision 202
 
 ### Q1 — Tax records retention (ปกติบังคับเก็บ 5 ปี)
 
-**Boss answer**: ❌ **ไม่ต้องเก็บ**
+**Boss answer (REVISED 2026-05-18)**: ✅ **เก็บ 5 ปี สำหรับ B2C marketplace orders** + ❌ **ไม่เก็บ สำหรับ B2B distributor orders**
 
-**Reasoning**:
-- DINOCO **ไม่ได้จำหน่าย B2C ตรง** — ไม่มี POS / online checkout
-- **B2B = non-VAT บัญชีบุคคล** — ไม่ได้รับ VAT, ไม่ออกใบกำกับภาษี
-- กฎหมาย retention 5 ปี (รัฐประมวลรัษฎากร §83/4) ใช้กับ VAT registrant — DINOCO อยู่นอกขอบ
+#### Background revise
 
-**Implementation**:
-- Delete flow → orders ของลูกค้า hard-delete ได้ (ไม่ต้อง anonymize เก็บ 5y)
-- ลบ "tax retention" warning จาก admin review UI
-- Erasure decision matrix → orders cell = `delete` (ไม่ใช่ `anonymize_keep_5y`)
-- Exception: ถ้า future-เปลี่ยนเป็น VAT registrant → re-evaluate
+ตอน 2026-05-15 บอสตอบ "ไม่ต้องเก็บ" — แต่ระหว่างเตรียม F#8 Marketplace launch บอสสรุปกับบัญชี (2026-05-18) → revise policy:
+
+| Order context | VAT treatment | Tax retention |
+|---|---|---|
+| B2C marketplace (ขายต่อประกัน F#8) | **VAT 7%** (นิติบุคคล — บริษัท พีพีที กรุ๊ป คอร์ปอเรชั่น จํากัด, Tax ID 0105564033573) | **5 ปี (PDPA + 83/4)** |
+| B2B distributor orders | **non-VAT** (บัญชีบุคคล แยก) | **ไม่เก็บ** (delete ได้) |
+| B2F Maker PO (factory purchasing) | **non-VAT** (internal) | **ไม่เก็บ** |
+| Manual Invoice B2B | **non-VAT** | **ไม่เก็บ** |
+
+#### Reasoning (revised)
+
+- บริษัท พีพีที กรุ๊ป จด VAT registrant แยก สำหรับ B2C marketplace
+- สรรพากรสุ่มตรวจ — ต้องมีใบกำกับภาษี + record 5 ปี (ป.รัษฎากร §83/4)
+- B2B distributor ยังคงผ่านบัญชีบุคคล non-VAT (ไม่กระทบ)
+- Order context flag `_dinoco_order_context` แยก B2C marketplace ออกจาก B2B/B2F
+
+#### Implementation (REVISED)
+
+- **B2C marketplace orders** (`sn_warranty_extensions` table):
+  - Erasure matrix → `anonymize_keep_5y` (เก็บ record, anonymize PII)
+  - User export: receipt + warranty data
+  - User delete: anonymize email/phone/line_uid → keep order record + receipt for 5y
+- **B2B distributor orders** (`b2b_order` CPT):
+  - Erasure matrix → `delete` (hard delete OK)
+  - No tax retention obligation
+- **B2F Maker PO** + **Manual Invoice**: same as B2B (delete OK)
+- Admin review UI:
+  - Tab "Erasure" → แสดง count per context (B2C เก็บ 5y vs B2B/B2F/Manual ลบได้)
+  - Warning banner เมื่อ admin try hard-delete B2C order < 5y → block + suggest anonymize
+- Cron `dinoco_gdpr_retention_cron` (daily 03:30):
+  - Scan B2C marketplace orders `paid_at < NOW() - 5 YEAR` → auto hard-delete eligible (after PDPA boss approval)
+  - B2B/B2F/Manual orders → no scan needed (delete on request)
+
+#### NEW infrastructure required
+
+- **Order context column** in relevant tables — `_dinoco_order_context` postmeta (`'b2c_marketplace' | 'b2b_distributor' | 'b2f_factory' | 'manual_invoice'`)
+- **VAT-compliant receipt** + admin export tool (see `project_vat_policy_split.md` memory)
+- **Constants in wp-config**: Tax ID + company name + address (boss provided 2026-05-18 — pending wp-config write)
 
 ---
 
