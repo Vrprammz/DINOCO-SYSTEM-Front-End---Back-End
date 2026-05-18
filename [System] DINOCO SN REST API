@@ -2,6 +2,18 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.54 (2026-05-18) — Renewal-as-bundle ENFORCEMENT:   ║
+ * ║    /marketplace/quote + /marketplace/checkout now resolve         ║
+ * ║    renewable_sku via V.0.53 helper (top_set_sku else linked_sku). ║
+ * ║    SET-context plates price + extend at SET SKU level.            ║
+ * ║    apply_warranty_extension() fans out to ALL SET-context         ║
+ * ║    sibling plates (same owner, status=registered) within same     ║
+ * ║    transaction — sn_pool_meta join + FOR UPDATE lock. NEW         ║
+ * ║    response fields: is_set_context, plate_count, renewable_sku,   ║
+ * ║    set_siblings_extended, total_plates_extended. NEW audit        ║
+ * ║    event 'warranty_extended_set_sibling' per sibling extended.    ║
+ * ║    Backward-compat: linked_sku field retained in response.        ║
+ * ║                                                                   ║
  * ║  Version: V.0.53 (2026-05-18) — Boss "Extension Renewal Policy": ║
  * ║    NEW 3 helpers: dinoco_sn_get_renewable_sku() (top_set_sku else ║
  * ║    linked_sku) + dinoco_sn_get_renewable_product_name() (resolve  ║
@@ -10212,10 +10224,31 @@ if ( ! function_exists( 'dinoco_sn_rest_marketplace_quote' ) ) {
         }
 
         $linked_sku = strtoupper( (string) ( $row->linked_sku ?? '' ) );
-        $available = function_exists( 'dinoco_sn_extension_available' ) ? dinoco_sn_extension_available( $linked_sku ) : array();
+
+        // V.0.54 — Boss decision 2026-05-18 (project_extension_renewal_policy.md):
+        //   "ไม่ต้องต่อทีละชิ้นถ้าเป็นชุดก็ต่ออายุเป็นชุด"
+        //   SET-context plates (top_set_sku populated) → renew at SET SKU.
+        //   Single-purchase leaves (top_set_sku NULL) → renew at linked_sku.
+        // Helper from V.0.53 resolves top_set_sku else linked_sku.
+        $renewable_sku = function_exists( 'dinoco_sn_get_renewable_sku' )
+            ? strtoupper( (string) dinoco_sn_get_renewable_sku( $row ) )
+            : $linked_sku;
+        $is_set_context  = ( $renewable_sku !== '' && $renewable_sku !== $linked_sku );
+        $plate_count     = function_exists( 'dinoco_sn_get_renewable_plate_count' )
+            ? (int) dinoco_sn_get_renewable_plate_count( $row )
+            : 1;
+
+        $available = function_exists( 'dinoco_sn_extension_available' )
+            ? dinoco_sn_extension_available( $renewable_sku )
+            : array();
 
         $product_name = '';
-        if ( $linked_sku !== '' && class_exists( 'DINOCO_Catalog' ) ) {
+        if ( $renewable_sku !== '' && class_exists( 'DINOCO_Catalog' ) ) {
+            $prod = DINOCO_Catalog::get_by_sku( $renewable_sku );
+            if ( $prod && isset( $prod->title ) ) $product_name = (string) $prod->title;
+        }
+        // Fallback to leaf name if SET SKU has no catalog title (shouldn't happen but defensive)
+        if ( $product_name === '' && $linked_sku !== '' && class_exists( 'DINOCO_Catalog' ) ) {
             $prod = DINOCO_Catalog::get_by_sku( $linked_sku );
             if ( $prod && isset( $prod->title ) ) $product_name = (string) $prod->title;
         }
@@ -10245,7 +10278,13 @@ if ( ! function_exists( 'dinoco_sn_rest_marketplace_quote' ) ) {
             'found'                          => true,
             'sn'                             => $sn,
             'product_name'                   => $product_name,
+            // V.0.54 — `linked_sku` kept for backward-compat (LIFF UI reads it).
+            // NEW `renewable_sku` = SKU used for pricing + warranty extension.
+            // `is_set_context`=true means SET-bundle renewal (admin pricing at SET).
             'linked_sku'                     => $linked_sku,
+            'renewable_sku'                  => $renewable_sku,
+            'is_set_context'                 => $is_set_context,
+            'plate_count'                    => $plate_count,
             'current_warranty_end'           => $current_end,
             'warranty_status'                => $warranty_status,
             'options'                        => $options,
@@ -10279,15 +10318,18 @@ if ( ! function_exists( 'dinoco_sn_rest_marketplace_checkout' ) ) {
         $years_for_price = (int) $req->get_param( 'years' );
         $amount_cents = 0;
         if ( $sn_for_price !== '' && in_array( $years_for_price, array( 1, 2, 3 ), true ) ) {
-            $linked_sku = '';
+            $price_sku = '';
             if ( function_exists( 'dinoco_sn_get_plate_data' ) ) {
                 $row_for_price = dinoco_sn_get_plate_data( $sn_for_price );
                 if ( $row_for_price ) {
-                    $linked_sku = strtoupper( (string) ( $row_for_price->linked_sku ?? '' ) );
+                    // V.0.54 — renewal-as-bundle: SET-context plates price at SET SKU.
+                    $price_sku = function_exists( 'dinoco_sn_get_renewable_sku' )
+                        ? strtoupper( (string) dinoco_sn_get_renewable_sku( $row_for_price ) )
+                        : strtoupper( (string) ( $row_for_price->linked_sku ?? '' ) );
                 }
             }
-            if ( $linked_sku !== '' && function_exists( 'dinoco_sn_get_extension_price' ) ) {
-                $base_price = dinoco_sn_get_extension_price( $linked_sku, $years_for_price );
+            if ( $price_sku !== '' && function_exists( 'dinoco_sn_get_extension_price' ) ) {
+                $base_price = dinoco_sn_get_extension_price( $price_sku, $years_for_price );
                 if ( $base_price !== null && is_numeric( $base_price ) ) {
                     // Cents to avoid float drift across retry boundaries.
                     $amount_cents = (int) round( ( (float) $base_price ) * 100, 0 );
@@ -10348,11 +10390,18 @@ if ( ! function_exists( 'dinoco_sn_handler_marketplace_checkout' ) ) {
         }
 
         $linked_sku = strtoupper( (string) ( $row->linked_sku ?? '' ) );
-        $base_price = function_exists( 'dinoco_sn_get_extension_price' ) ? dinoco_sn_get_extension_price( $linked_sku, $years ) : null;
+        // V.0.54 — Boss decision 2026-05-18 (project_extension_renewal_policy.md):
+        //   "ไม่ต้องต่อทีละชิ้นถ้าเป็นชุดก็ต่ออายุเป็นชุด"
+        //   SET-context plates price + warranty extend at SET SKU level.
+        $renewable_sku = function_exists( 'dinoco_sn_get_renewable_sku' )
+            ? strtoupper( (string) dinoco_sn_get_renewable_sku( $row ) )
+            : $linked_sku;
+        $base_price = function_exists( 'dinoco_sn_get_extension_price' ) ? dinoco_sn_get_extension_price( $renewable_sku, $years ) : null;
         if ( $base_price === null ) {
             return new WP_Error( 'not_available',
                 sprintf( __( 'Extension %dy not offered for this SKU', 'dinoco-sn' ), $years ),
-                array( 'status' => 422, 'sku' => $linked_sku, 'years' => $years ) );
+                // Admin must price at SET SKU when sn is SET-context (top_set_sku populated).
+                array( 'status' => 422, 'sku' => $renewable_sku, 'linked_sku' => $linked_sku, 'years' => $years ) );
         }
 
         // Coupon resolution — V.0.47 (Phase 6 QW-5 finish): real redemption via Lifecycle Notifier
@@ -11417,6 +11466,64 @@ if ( ! function_exists( 'dinoco_sn_apply_warranty_extension' ) ) {
                 update_post_meta( $warranty_id, 'warranty_until', $new_end );
             }
 
+            // V.0.54 — Boss decision 2026-05-18 (project_extension_renewal_policy.md):
+            //   "ถ้าเป็นชุดก็ต่ออายุเป็นชุด"
+            //   Fan-out: if this SN belongs to a SET context (top_set_sku populated),
+            //   extend ALL sibling plates owned by the same user that share the same
+            //   top_set_sku context. Within the same transaction so all-or-nothing.
+            //   Uses sn_pool_meta join (V.0.53 helper pattern).
+            $set_siblings_extended = 0;
+            $tbl_meta = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'pool_meta' ) : '';
+            if ( $tbl_meta && function_exists( 'dinoco_sn_get_renewable_sku' ) ) {
+                $top_set_sku = '';
+                $meta_row = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT top_set_sku FROM {$tbl_meta} WHERE sn = %s LIMIT 1", $sn
+                ) );
+                if ( $meta_row && ! empty( $meta_row->top_set_sku ) ) {
+                    $top_set_sku = strtoupper( (string) $meta_row->top_set_sku );
+                }
+                if ( $top_set_sku !== '' ) {
+                    // Find SET-context siblings: same top_set_sku, same owner, registered, not this SN.
+                    // Lock for UPDATE to serialize against concurrent renewals on sibling plates.
+                    $siblings = $wpdb->get_results( $wpdb->prepare(
+                        "SELECT p.sn, p.registered_warranty_id
+                           FROM {$tbl_pool} p
+                           INNER JOIN {$tbl_meta} m ON BINARY UPPER(m.sn) = BINARY UPPER(p.sn)
+                          WHERE BINARY UPPER(m.top_set_sku) = %s
+                            AND p.registered_user_id = %d
+                            AND p.status = 'registered'
+                            AND BINARY UPPER(p.sn) != %s
+                          FOR UPDATE",
+                        $top_set_sku, (int) $pool->registered_user_id, $sn
+                    ) );
+                    if ( is_array( $siblings ) ) {
+                        foreach ( $siblings as $sib ) {
+                            $sib_wid = (int) $sib->registered_warranty_id;
+                            if ( $sib_wid > 0 ) {
+                                // Read sibling current warranty_until + extend by same years
+                                $sib_current = (string) get_post_meta( $sib_wid, 'warranty_until', true );
+                                if ( $sib_current === '' ) $sib_current = $current_end;
+                                $sib_new = dinoco_sn_marketplace_compute_new_warranty_end( $sib_current, $years );
+                                if ( $sib_new ) {
+                                    update_post_meta( $sib_wid, 'warranty_until', $sib_new );
+                                    $set_siblings_extended++;
+                                    if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                                        dinoco_sn_audit_log( (string) $sib->sn, 'warranty_extended_set_sibling', null, null, array(
+                                            'extension_id'        => $extension_id,
+                                            'parent_sn'           => $sn,
+                                            'top_set_sku'         => $top_set_sku,
+                                            'warranty_until_old'  => $sib_current,
+                                            'warranty_until_new'  => $sib_new,
+                                            'years_added'         => $years,
+                                        ), (int) $ext->user_id, null, '', 'apply_warranty_extension_set_fanout', true );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // UPDATE extensions row — ensure warranty_until_old/new accurate + paid_at if not set
             $now = current_time( 'mysql' );
             $upd_data = array(
@@ -11434,11 +11541,13 @@ if ( ! function_exists( 'dinoco_sn_apply_warranty_extension' ) ) {
 
             if ( function_exists( 'dinoco_sn_audit_log' ) ) {
                 dinoco_sn_audit_log( $sn, 'warranty_extended', null, null, array(
-                    'extension_id'        => $extension_id,
-                    'warranty_id'         => $warranty_id,
-                    'warranty_until_old'  => $current_end,
-                    'warranty_until_new'  => $new_end,
-                    'years_added'         => $years,
+                    'extension_id'           => $extension_id,
+                    'warranty_id'            => $warranty_id,
+                    'warranty_until_old'     => $current_end,
+                    'warranty_until_new'     => $new_end,
+                    'years_added'            => $years,
+                    // V.0.54 — record SET fan-out count for forensics
+                    'set_siblings_extended'  => $set_siblings_extended,
                 ), (int) $ext->user_id, null, '', 'apply_warranty_extension', true );
             }
 
@@ -11457,12 +11566,15 @@ if ( ! function_exists( 'dinoco_sn_apply_warranty_extension' ) ) {
             }
 
             return array(
-                'success'           => true,
-                'extension_id'      => $extension_id,
-                'sn'                => $sn,
-                'new_warranty_end'  => $new_end,
-                'warranty_until_old'=> $current_end,
-                'years_added'       => $years,
+                'success'              => true,
+                'extension_id'         => $extension_id,
+                'sn'                   => $sn,
+                'new_warranty_end'     => $new_end,
+                'warranty_until_old'   => $current_end,
+                'years_added'          => $years,
+                // V.0.54 — total plates affected = 1 (this SN) + siblings (SET fan-out)
+                'set_siblings_extended' => $set_siblings_extended,
+                'total_plates_extended' => 1 + $set_siblings_extended,
             );
         } catch ( \Throwable $e ) {
             $wpdb->query( 'ROLLBACK' );
