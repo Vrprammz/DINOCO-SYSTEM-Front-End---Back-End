@@ -96,24 +96,19 @@ describe("SN Marketplace customer LIFF — 4-stage flow (V.0.6+)", () => {
     });
   });
 
-  describe("V.0.6 non-VAT scope (boss 2026-05-15)", () => {
-    test("dinoco_sn_mpx_compute_total — vat forced to 0", () => {
-      const fn = content.match(
-        /function\s+dinoco_sn_mpx_compute_total[\s\S]{0,1500}/
-      );
-      expect(fn).toBeTruthy();
-      expect(fn[0]).toMatch(/\$vat\s*=\s*0\.0/);
-      expect(fn[0]).toMatch(/non.?VAT|บัญชีบุคคล/i);
+  describe("V.0.8 B2C VAT 7% restored (boss 2026-05-18 revise — MED-1 fix)", () => {
+    test("dinoco_sn_mpx_compute_total — uses dinoco_vat_get for rate (not hardcoded 0)", () => {
+      // V.0.8 reverted V.0.6's hardcoded $vat = 0.0
+      // Boss decision 2026-05-18: B2C marketplace = VAT 7% (PPT Group Corp)
+      expect(content).toMatch(/function\s+dinoco_sn_mpx_compute_total/);
+      // Helper from Marketplace Tools V.1.2 is source of truth
+      expect(content).toContain("dinoco_vat_get");
     });
 
-    test("UI does NOT show VAT 7% row in stage 1/2", () => {
-      // V.0.5 had data-role="total-vat" + "VAT 7%" label
-      // V.0.6 removed the row — defensive JS guard exists
-      const liffJs = content.match(/data-role="total-vat"[\s\S]{0,400}/);
-      // Either no element OR guarded with if (vatEl) before setting textContent
-      if (liffJs) {
-        expect(content).toMatch(/var vatEl[\s\S]{0,100}if\s*\(\s*vatEl\s*\)/);
-      }
+    test("UI shows VAT 7% row in stage 1/2 (MED-1 restore)", () => {
+      // V.0.8 restored row hidden in V.0.6
+      expect(content).toMatch(/data-role=["']total-vat-line["']/);
+      expect(content).toMatch(/data-role=["']total-vat["']/);
     });
   });
 

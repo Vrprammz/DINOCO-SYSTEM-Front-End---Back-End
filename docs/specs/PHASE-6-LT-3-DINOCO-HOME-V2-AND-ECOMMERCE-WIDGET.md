@@ -1,6 +1,6 @@
 # Phase 6 LT-3 · DINOCO Home V2 + Lead-Gen Site — Mega Spec
 
-[← Specs index](./README.md) · [← Phase 6 backlog tracker](../sn-system/34-phase6-backlog-tracker.md)
+[← Phase 6 backlog tracker](../sn-system/34-phase6-backlog-tracker.md) · [LT-3 Implementation Plan](./LT-3-IMPLEMENTATION-PLAN.md)
 
 > **Status**: DESIGN SPEC · Boss-binding inputs locked (2026-05-15 + 2026-05-16 + 2026-05-18) · Awaiting final approval for phasing kickoff
 > **Boss vision (2026-05-16)**: "ทำ web home dinoco.in.th ใหม่ และใช้ [Admin System] DINOCO Global Inventory Database ใช้ login ด้วย line ร่างสเปคเทพๆ มาหน่อยให้ link กับระบบทั้งหมดของ dinoco"
