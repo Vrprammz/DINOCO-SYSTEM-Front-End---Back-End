@@ -1,0 +1,534 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO VAT Monthly Export                        ║
+ * ║  Version: V.1.0 (2026-05-18)                                     ║
+ * ║  DB_ID: (assign after creation in WP)                            ║
+ * ║                                                                   ║
+ * ║  Purpose:                                                         ║
+ * ║    Generate monthly VAT report (รายงานภาษีขาย) for accountant     ║
+ * ║    to file PP30 (ภ.พ.30) with Thai Revenue Department.              ║
+ * ║                                                                   ║
+ * ║  Boss directive 2026-05-18 (project_vat_policy_split.md):        ║
+ * ║    B2C marketplace orders contribute to VAT obligation —          ║
+ * ║    monthly report MUST list all paid extensions for tax filing.   ║
+ * ║                                                                   ║
+ * ║  Scope:                                                           ║
+ * ║    - wp_dinoco_sn_extensions WHERE payment_status='paid' AND      ║
+ * ║      paid_at BETWEEN month_start AND month_end                    ║
+ * ║    - One row per extension = one receipt for accountant           ║
+ * ║                                                                   ║
+ * ║  Entry points:                                                    ║
+ * ║    - dinoco_vat_export_query($year, $month) → assoc array rows   ║
+ * ║    - dinoco_vat_export_to_csv($year, $month) → string CSV         ║
+ * ║                                                                   ║
+ * ║  Admin UI (shortcode):                                            ║
+ * ║    [dinoco_vat_monthly_export]                                    ║
+ * ║      - Year + Month picker (default = previous month)             ║
+ * ║      - "ดาวน์โหลด CSV" button (UTF-8 BOM for Thai Excel)            ║
+ * ║      - Summary table: row count + subtotal + VAT + grand total    ║
+ * ║      - Per-row preview (first 50 rows) for sanity check           ║
+ * ║                                                                   ║
+ * ║  REST endpoints (admin only):                                     ║
+ * ║    GET /dinoco-vat/v1/export/csv?year=2026&month=05               ║
+ * ║      → text/csv with Content-Disposition attachment               ║
+ * ║    GET /dinoco-vat/v1/export/summary?year=2026&month=05           ║
+ * ║      → JSON summary (count + totals) for UI preview               ║
+ * ║                                                                   ║
+ * ║  Permission: manage_options + dinoco_sn_view_pii cap recommended  ║
+ * ║                                                                   ║
+ * ║  CSV columns (Thai labels — accountant friendly):                ║
+ * ║    เลขที่ใบกำกับ / วันที่ / ชื่อลูกค้า / S/N / รายการ / SKU / มูลค่าก่อน VAT /║
+ * ║    VAT 7% / รวมทั้งสิ้น / วิธีชำระ / เลขอ้างอิง                          ║
+ * ║                                                                   ║
+ * ║  Dependencies (defensive function_exists):                        ║
+ * ║    - dinoco_sn_table (Manager V.0.32+)                           ║
+ * ║    - dinoco_vat_receipt_generate_receipt_no (VAT Receipt V.1.0)  ║
+ * ║    - dinoco_vat_get (Marketplace Tools V.1.0)                    ║
+ * ║                                                                   ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. QUERY — paid extensions in [year, month) window
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_export_query' ) ) {
+    /**
+     * Return paid extensions in the specified month, enriched with
+     * receipt_no + customer + SKU + price breakdown.
+     *
+     * @param int $year  4-digit year (e.g. 2026)
+     * @param int $month 1..12
+     * @return array list of assoc rows
+     */
+    function dinoco_vat_export_query( $year, $month ) {
+        global $wpdb;
+        $year = (int) $year;
+        $month = (int) $month;
+        if ( $year < 2024 || $year > 2099 || $month < 1 || $month > 12 ) return array();
+
+        $tbl_ext  = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'extensions' ) : '';
+        $tbl_pool = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'pool' ) : '';
+        if ( $tbl_ext === '' ) return array();
+
+        $month_start = sprintf( '%04d-%02d-01 00:00:00', $year, $month );
+        $next_month = $month === 12 ? array( $year + 1, 1 ) : array( $year, $month + 1 );
+        $month_end = sprintf( '%04d-%02d-01 00:00:00', $next_month[0], $next_month[1] );
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, sn, user_id, extension_months, price_paid,
+                    payment_method, payment_ref, paid_at, created_at
+               FROM {$tbl_ext}
+              WHERE payment_status = %s
+                AND paid_at >= %s
+                AND paid_at <  %s
+              ORDER BY paid_at ASC",
+            'paid', $month_start, $month_end
+        ), ARRAY_A );
+        if ( empty( $rows ) ) return array();
+
+        // VAT rate (constant or option)
+        $rate = (float) ( function_exists( 'dinoco_vat_get' ) ? dinoco_vat_get( 'rate', '0.07' ) : 0.07 );
+        if ( $rate < 0 || $rate > 1 ) $rate = 0.07;
+
+        // Prime user + sn_pool lookups in bulk to avoid N+1
+        $uids = array();
+        $sns  = array();
+        foreach ( $rows as $r ) {
+            $uids[ (int) $r['user_id'] ] = true;
+            $sns[ strtoupper( (string) $r['sn'] ) ] = true;
+        }
+        unset( $uids[0] );
+        if ( ! empty( $uids ) && function_exists( 'update_meta_cache' ) ) {
+            update_meta_cache( 'user', array_keys( $uids ) );
+        }
+        // Pool batch fetch
+        $pool_map = array();
+        if ( $tbl_pool !== '' && ! empty( $sns ) ) {
+            $placeholders = implode( ',', array_fill( 0, count( $sns ), '%s' ) );
+            $sql = $wpdb->prepare(
+                "SELECT sn, linked_sku FROM {$tbl_pool} WHERE sn IN ({$placeholders})",
+                array_keys( $sns )
+            );
+            $pool_rows = $wpdb->get_results( $sql, ARRAY_A );
+            foreach ( (array) $pool_rows as $pr ) {
+                $pool_map[ strtoupper( (string) $pr['sn'] ) ] = (string) $pr['linked_sku'];
+            }
+        }
+
+        $out = array();
+        foreach ( $rows as $r ) {
+            $sn = strtoupper( (string) $r['sn'] );
+            $grand = (float) $r['price_paid'];
+            $subtotal = $rate > 0 ? round( $grand / ( 1 + $rate ), 2 ) : $grand;
+            $vat = round( $grand - $subtotal, 2 );
+
+            // Receipt number
+            $receipt_no = function_exists( 'dinoco_vat_receipt_generate_receipt_no' )
+                ? dinoco_vat_receipt_generate_receipt_no( (int) $r['id'] )
+                : ( 'EXT-' . str_pad( (string) $r['id'], 7, '0', STR_PAD_LEFT ) );
+
+            // Customer
+            $customer_name = '';
+            $uid = (int) $r['user_id'];
+            if ( $uid > 0 ) {
+                $u = get_userdata( $uid );
+                if ( $u ) {
+                    $customer_name = trim( $u->display_name ?: ( $u->first_name . ' ' . $u->last_name ) );
+                    if ( $customer_name === '' ) $customer_name = $u->user_login;
+                }
+            }
+
+            // SKU + product (SET-aware via V.0.53 helper if available)
+            $linked_sku = isset( $pool_map[ $sn ] ) ? $pool_map[ $sn ] : '';
+            $renewable_sku = $linked_sku;
+            if ( function_exists( 'dinoco_sn_get_renewable_sku' ) && $linked_sku !== '' ) {
+                // synthesize minimal row shape for helper
+                $renewable_sku = strtoupper( (string) dinoco_sn_get_renewable_sku( (object) array(
+                    'sn'         => $sn,
+                    'linked_sku' => $linked_sku,
+                ) ) );
+            }
+            $product_name = '';
+            if ( $renewable_sku !== '' && class_exists( 'DINOCO_Catalog' ) ) {
+                $prod = DINOCO_Catalog::get_by_sku( $renewable_sku );
+                if ( $prod && isset( $prod->title ) ) $product_name = (string) $prod->title;
+            }
+            $years = (int) max( 1, round( ( (int) $r['extension_months'] ) / 12 ) );
+            $item_desc = sprintf( 'ต่ออายุประกัน %d ปี — %s', $years, $product_name ?: $renewable_sku );
+
+            $out[] = array(
+                'receipt_no'     => $receipt_no,
+                'paid_at'        => (string) $r['paid_at'],
+                'extension_id'   => (int) $r['id'],
+                'sn'             => $sn,
+                'customer_name'  => $customer_name,
+                'customer_uid'   => $uid,
+                'item_desc'      => $item_desc,
+                'sku'            => $renewable_sku,
+                'subtotal_excl'  => $subtotal,
+                'vat_amount'     => $vat,
+                'grand_total'    => $grand,
+                'vat_rate'       => $rate,
+                'payment_method' => (string) $r['payment_method'],
+                'payment_ref'    => (string) $r['payment_ref'],
+            );
+        }
+        return $out;
+    }
+}
+
+if ( ! function_exists( 'dinoco_vat_export_summary' ) ) {
+    /**
+     * Aggregated totals for the month (cheap query for UI preview).
+     *
+     * @param int $year
+     * @param int $month
+     * @return array
+     */
+    function dinoco_vat_export_summary( $year, $month ) {
+        $rows = dinoco_vat_export_query( $year, $month );
+        $count = count( $rows );
+        $sub_sum = 0.0;
+        $vat_sum = 0.0;
+        $grand_sum = 0.0;
+        foreach ( $rows as $r ) {
+            $sub_sum   += (float) $r['subtotal_excl'];
+            $vat_sum   += (float) $r['vat_amount'];
+            $grand_sum += (float) $r['grand_total'];
+        }
+        return array(
+            'year'         => (int) $year,
+            'month'        => (int) $month,
+            'count'        => $count,
+            'subtotal_excl_vat' => round( $sub_sum, 2 ),
+            'vat_amount'   => round( $vat_sum, 2 ),
+            'grand_total'  => round( $grand_sum, 2 ),
+        );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. CSV RENDERER — Thai-Excel-friendly (UTF-8 BOM + RFC 4180 escape)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_export_csv_escape' ) ) {
+    function dinoco_vat_export_csv_escape( $v ) {
+        $v = (string) $v;
+        // Always quote — safest for Thai content + commas/newlines
+        return '"' . str_replace( '"', '""', $v ) . '"';
+    }
+}
+
+if ( ! function_exists( 'dinoco_vat_export_to_csv' ) ) {
+    /**
+     * Build CSV string with UTF-8 BOM. 11 columns matching accountant's
+     * standard ภาษีขาย report shape.
+     *
+     * @param int $year
+     * @param int $month
+     * @return string
+     */
+    function dinoco_vat_export_to_csv( $year, $month ) {
+        $rows = dinoco_vat_export_query( $year, $month );
+        $headers = array(
+            'เลขที่ใบกำกับ',
+            'วันที่',
+            'ชื่อลูกค้า',
+            'S/N',
+            'รายการ',
+            'SKU',
+            'มูลค่าก่อน VAT',
+            'VAT 7%',
+            'รวมทั้งสิ้น',
+            'วิธีชำระ',
+            'เลขอ้างอิง',
+        );
+
+        $out = "\xEF\xBB\xBF"; // UTF-8 BOM
+        $out .= implode( ',', array_map( 'dinoco_vat_export_csv_escape', $headers ) ) . "\r\n";
+
+        foreach ( $rows as $r ) {
+            $line = array(
+                $r['receipt_no'],
+                $r['paid_at'],
+                $r['customer_name'],
+                $r['sn'],
+                $r['item_desc'],
+                $r['sku'],
+                number_format( $r['subtotal_excl'], 2, '.', '' ),
+                number_format( $r['vat_amount'], 2, '.', '' ),
+                number_format( $r['grand_total'], 2, '.', '' ),
+                $r['payment_method'],
+                $r['payment_ref'],
+            );
+            $out .= implode( ',', array_map( 'dinoco_vat_export_csv_escape', $line ) ) . "\r\n";
+        }
+
+        // Footer totals row
+        $sum = dinoco_vat_export_summary( $year, $month );
+        $totals = array(
+            '', '', '', '', '', 'รวม',
+            number_format( $sum['subtotal_excl_vat'], 2, '.', '' ),
+            number_format( $sum['vat_amount'], 2, '.', '' ),
+            number_format( $sum['grand_total'], 2, '.', '' ),
+            '', '',
+        );
+        $out .= implode( ',', array_map( 'dinoco_vat_export_csv_escape', $totals ) ) . "\r\n";
+
+        return $out;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. ADMIN UI SHORTCODE — [dinoco_vat_monthly_export]
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! shortcode_exists( 'dinoco_vat_monthly_export' ) ) {
+    add_shortcode( 'dinoco_vat_monthly_export', 'dinoco_vat_export_render_admin_ui' );
+}
+
+if ( ! function_exists( 'dinoco_vat_export_render_admin_ui' ) ) {
+    function dinoco_vat_export_render_admin_ui() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<p style="padding:24px;text-align:center;color:#dc2626;">⛔ ต้องเป็นแอดมินเท่านั้น</p>';
+        }
+
+        // Default to previous month (so admin can run "last month's report" first of new month)
+        $now = current_time( 'timestamp' );
+        $default_ts = strtotime( '-1 month', $now );
+        $default_year = (int) date( 'Y', $default_ts );
+        $default_month = (int) date( 'n', $default_ts );
+
+        // VAT readiness check
+        $vat_ready = function_exists( 'dinoco_vat_is_ready' ) ? dinoco_vat_is_ready() : false;
+        $nonce = wp_create_nonce( 'wp_rest' );
+
+        ob_start();
+        ?>
+        <div class="dnc-vat-export-wrap" style="max-width:960px;margin:24px auto;padding:24px;font-family:sans-serif;">
+            <h2 style="margin:0 0 6px;font-size:22px;">📊 รายงานภาษีขายรายเดือน</h2>
+            <p style="color:#6b7280;margin:0 0 20px;">สำหรับนักบัญชี — ใช้ยื่น ภ.พ.30 (PP30) Thai Revenue Department</p>
+
+            <?php if ( ! $vat_ready ) : ?>
+            <div style="padding:14px;background:#fef3c7;border-left:4px solid #b45309;border-radius:4px;margin-bottom:20px;">
+                <strong>⚠️ VAT settings ยังไม่ครบ</strong> — กรอก tax_id + company_name + address ก่อนใช้รายงานนี้
+                (ที่ <a href="<?php echo esc_url( site_url( '/marketplace-tools/' ) ); ?>" target="_blank">Marketplace Tools</a>)
+            </div>
+            <?php endif; ?>
+
+            <div style="display:flex;gap:12px;align-items:flex-end;margin-bottom:20px;padding:16px;background:#f9fafb;border-radius:8px;">
+                <div>
+                    <label style="display:block;font-size:12px;color:#6b7280;margin-bottom:4px;">ปี</label>
+                    <select id="dnc-vat-year" style="padding:8px;border:1px solid #d1d5db;border-radius:4px;">
+                        <?php for ( $y = (int) date( 'Y' ); $y >= 2024; $y-- ) : ?>
+                            <option value="<?php echo esc_attr( $y ); ?>" <?php selected( $y, $default_year ); ?>>
+                                <?php echo esc_html( $y ); ?>
+                            </option>
+                        <?php endfor; ?>
+                    </select>
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#6b7280;margin-bottom:4px;">เดือน</label>
+                    <select id="dnc-vat-month" style="padding:8px;border:1px solid #d1d5db;border-radius:4px;">
+                        <?php
+                        $month_names_th = array(
+                            1=>'มกราคม',2=>'กุมภาพันธ์',3=>'มีนาคม',4=>'เมษายน',5=>'พฤษภาคม',6=>'มิถุนายน',
+                            7=>'กรกฎาคม',8=>'สิงหาคม',9=>'กันยายน',10=>'ตุลาคม',11=>'พฤศจิกายน',12=>'ธันวาคม',
+                        );
+                        for ( $m = 1; $m <= 12; $m++ ) : ?>
+                            <option value="<?php echo esc_attr( $m ); ?>" <?php selected( $m, $default_month ); ?>>
+                                <?php echo esc_html( $month_names_th[ $m ] ); ?>
+                            </option>
+                        <?php endfor; ?>
+                    </select>
+                </div>
+                <button id="dnc-vat-preview-btn" type="button"
+                        style="padding:10px 20px;background:#1f2937;color:#fff;border:0;border-radius:4px;cursor:pointer;">
+                    🔍 ดูสรุป
+                </button>
+                <button id="dnc-vat-download-btn" type="button"
+                        style="padding:10px 20px;background:#16a34a;color:#fff;border:0;border-radius:4px;cursor:pointer;">
+                    📥 ดาวน์โหลด CSV
+                </button>
+            </div>
+
+            <div id="dnc-vat-summary-box" style="display:none;margin-bottom:20px;padding:16px;background:#eff6ff;border-radius:8px;">
+                <h3 style="margin:0 0 12px;font-size:16px;">สรุปยอด</h3>
+                <div id="dnc-vat-summary-content"></div>
+            </div>
+
+            <div id="dnc-vat-rows-box" style="display:none;">
+                <h3 style="margin:0 0 12px;font-size:16px;">รายการ (50 แถวแรก)</h3>
+                <div style="overflow-x:auto;">
+                    <table id="dnc-vat-rows-table" style="width:100%;border-collapse:collapse;font-size:12px;">
+                        <thead style="background:#f3f4f6;">
+                            <tr>
+                                <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">เลขที่ใบกำกับ</th>
+                                <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">วันที่</th>
+                                <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">ลูกค้า</th>
+                                <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">รายการ</th>
+                                <th style="padding:8px;border:1px solid #e5e7eb;text-align:right;">ก่อน VAT</th>
+                                <th style="padding:8px;border:1px solid #e5e7eb;text-align:right;">VAT</th>
+                                <th style="padding:8px;border:1px solid #e5e7eb;text-align:right;">รวม</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        (function(){
+            var NONCE = <?php echo wp_json_encode( $nonce ); ?>;
+            var API_ROOT = <?php echo wp_json_encode( esc_url_raw( rest_url( 'dinoco-vat/v1/' ) ) ); ?>;
+
+            function $(id){ return document.getElementById(id); }
+            function getYM(){
+                return { year: parseInt($('dnc-vat-year').value, 10), month: parseInt($('dnc-vat-month').value, 10) };
+            }
+            function fmt(n){ return (n||0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+            function esc(s){
+                return String(s||'').replace(/[&<>"']/g, function(c){
+                    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+                });
+            }
+
+            $('dnc-vat-preview-btn').addEventListener('click', function(){
+                var ym = getYM();
+                var box = $('dnc-vat-summary-box');
+                var content = $('dnc-vat-summary-content');
+                content.innerHTML = 'กำลังโหลด...';
+                box.style.display = 'block';
+
+                fetch(API_ROOT + 'export/summary?year=' + ym.year + '&month=' + ym.month, {
+                    headers: { 'X-WP-Nonce': NONCE }
+                })
+                .then(function(r){ return r.json(); })
+                .then(function(d){
+                    content.innerHTML =
+                        '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">' +
+                            '<div><div style="font-size:11px;color:#6b7280;">จำนวนรายการ</div>' +
+                                '<div style="font-size:20px;font-weight:700;">' + (d.count||0) + '</div></div>' +
+                            '<div><div style="font-size:11px;color:#6b7280;">ยอดก่อน VAT</div>' +
+                                '<div style="font-size:20px;font-weight:700;">฿' + fmt(d.subtotal_excl_vat) + '</div></div>' +
+                            '<div><div style="font-size:11px;color:#6b7280;">VAT 7%</div>' +
+                                '<div style="font-size:20px;font-weight:700;color:#b45309;">฿' + fmt(d.vat_amount) + '</div></div>' +
+                            '<div><div style="font-size:11px;color:#6b7280;">รวมทั้งสิ้น</div>' +
+                                '<div style="font-size:20px;font-weight:700;color:#16a34a;">฿' + fmt(d.grand_total) + '</div></div>' +
+                        '</div>';
+
+                    if ((d.count||0) > 0){
+                        // Also load rows for preview
+                        fetch(API_ROOT + 'export/rows?year=' + ym.year + '&month=' + ym.month + '&limit=50', {
+                            headers: { 'X-WP-Nonce': NONCE }
+                        })
+                        .then(function(r){ return r.json(); })
+                        .then(function(rowData){
+                            var tbody = document.querySelector('#dnc-vat-rows-table tbody');
+                            tbody.innerHTML = '';
+                            (rowData.rows||[]).forEach(function(r){
+                                var tr = document.createElement('tr');
+                                tr.innerHTML =
+                                    '<td style="padding:6px;border:1px solid #e5e7eb;">'+esc(r.receipt_no)+'</td>' +
+                                    '<td style="padding:6px;border:1px solid #e5e7eb;">'+esc(r.paid_at)+'</td>' +
+                                    '<td style="padding:6px;border:1px solid #e5e7eb;">'+esc(r.customer_name)+'</td>' +
+                                    '<td style="padding:6px;border:1px solid #e5e7eb;">'+esc(r.item_desc)+'</td>' +
+                                    '<td style="padding:6px;border:1px solid #e5e7eb;text-align:right;">'+fmt(r.subtotal_excl)+'</td>' +
+                                    '<td style="padding:6px;border:1px solid #e5e7eb;text-align:right;">'+fmt(r.vat_amount)+'</td>' +
+                                    '<td style="padding:6px;border:1px solid #e5e7eb;text-align:right;">'+fmt(r.grand_total)+'</td>';
+                                tbody.appendChild(tr);
+                            });
+                            $('dnc-vat-rows-box').style.display = 'block';
+                        });
+                    } else {
+                        $('dnc-vat-rows-box').style.display = 'none';
+                    }
+                })
+                .catch(function(){ content.innerHTML = '<span style="color:#dc2626;">โหลดสรุปล้มเหลว</span>'; });
+            });
+
+            $('dnc-vat-download-btn').addEventListener('click', function(){
+                var ym = getYM();
+                // CSV endpoint streams directly — open in new tab so browser downloads
+                var url = API_ROOT + 'export/csv?year=' + ym.year + '&month=' + ym.month + '&_wpnonce=' + encodeURIComponent(NONCE);
+                window.location.href = url;
+            });
+        })();
+        </script>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. REST ENDPOINTS — admin only
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+add_action( 'rest_api_init', function() {
+    $perm = function() { return current_user_can( 'manage_options' ); };
+
+    register_rest_route( 'dinoco-vat/v1', '/export/summary', array(
+        'methods'             => 'GET',
+        'callback'            => function( $req ) {
+            $y = (int) ( $req->get_param( 'year' ) ?: date( 'Y' ) );
+            $m = (int) ( $req->get_param( 'month' ) ?: date( 'n' ) );
+            return rest_ensure_response( dinoco_vat_export_summary( $y, $m ) );
+        },
+        'permission_callback' => $perm,
+    ) );
+
+    register_rest_route( 'dinoco-vat/v1', '/export/rows', array(
+        'methods'             => 'GET',
+        'callback'            => function( $req ) {
+            $y = (int) ( $req->get_param( 'year' ) ?: date( 'Y' ) );
+            $m = (int) ( $req->get_param( 'month' ) ?: date( 'n' ) );
+            $limit = max( 1, min( 500, (int) ( $req->get_param( 'limit' ) ?: 50 ) ) );
+            $rows = dinoco_vat_export_query( $y, $m );
+            return rest_ensure_response( array(
+                'year'  => $y,
+                'month' => $m,
+                'total' => count( $rows ),
+                'rows'  => array_slice( $rows, 0, $limit ),
+            ) );
+        },
+        'permission_callback' => $perm,
+    ) );
+
+    register_rest_route( 'dinoco-vat/v1', '/export/csv', array(
+        'methods'             => 'GET',
+        'callback'            => function( $req ) {
+            $y = (int) ( $req->get_param( 'year' ) ?: date( 'Y' ) );
+            $m = (int) ( $req->get_param( 'month' ) ?: date( 'n' ) );
+            $csv = dinoco_vat_export_to_csv( $y, $m );
+
+            // Stream as CSV download (bypass REST envelope)
+            $filename = sprintf( 'dinoco-vat-%04d-%02d.csv', $y, $m );
+            header( 'Content-Type: text/csv; charset=UTF-8' );
+            header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
+            header( 'Cache-Control: no-store' );
+            echo $csv;
+            exit;
+        },
+        'permission_callback' => $perm,
+    ) );
+} );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. MODULE REGISTRY — surface under Admin Dashboard if registry present
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( function_exists( 'dinoco_register_admin_module' ) ) {
+    add_action( 'init', function() {
+        dinoco_register_admin_module( array(
+            'id'      => 'vat_monthly_export',
+            'label'   => 'VAT Monthly Export',
+            'section' => 'finance',
+            'order'   => 50,
+            'desc'    => 'รายงานภาษีขายรายเดือน — สำหรับนักบัญชี ยื่น ภ.พ.30',
+        ) );
+    }, 20 );
+}
