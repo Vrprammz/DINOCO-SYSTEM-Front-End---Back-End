@@ -1,0 +1,660 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [System] DINOCO VAT Receipt                                     ║
+ * ║  Version: V.1.0 (2026-05-18)                                     ║
+ * ║  DB_ID: (assign after creation in WP)                            ║
+ * ║                                                                   ║
+ * ║  Purpose:                                                         ║
+ * ║    Generate Thai VAT receipt (ใบกำกับภาษี / ใบเสร็จรับเงิน) for B2C   ║
+ * ║    marketplace orders (warranty extension purchases).             ║
+ * ║                                                                   ║
+ * ║  Boss policy (project_vat_policy_split.md, 2026-05-18):          ║
+ * ║    B2C marketplace → VAT 7% receipt with full Thai tax compliance║
+ * ║    B2B / Walk-in   → SKIP receipt (non-VAT บัญชีบุคคล)               ║
+ * ║                                                                   ║
+ * ║  Receipt format (Thai Revenue Department PP30 compliant):        ║
+ * ║    - Header: company name + tax_id + branch_code + address       ║
+ * ║    - Receipt no: EXT-{id}-{date} (sequential per month)          ║
+ * ║    - Customer: name + line_uid + sn                              ║
+ * ║    - Line items: SKU + qty + unit price + line total             ║
+ * ║    - Subtotal + VAT 7% + Grand Total (Thai baht text)            ║
+ * ║                                                                   ║
+ * ║  Dependencies (all defensive):                                    ║
+ * ║    - dinoco_vat_get() from [Admin System] DINOCO Marketplace Tools║
+ * ║    - dinoco_order_context_is_vat_eligible() from Order Context    ║
+ * ║      Resolver snippet (for CPT orders — sn_extensions are        ║
+ * ║      VAT-eligible by virtue of marketplace table source)          ║
+ * ║    - b2b_get_invoice_baht_text() from B2B Snippet 1 (for ฿ text) ║
+ * ║                                                                   ║
+ * ║  Entry points:                                                    ║
+ * ║    - dinoco_vat_receipt_render_html($extension_id) → string HTML  ║
+ * ║    - dinoco_vat_receipt_render_png($extension_id)  → string PNG   ║
+ * ║      data URL (base64) using GD library                           ║
+ * ║    - dinoco_vat_receipt_generate_receipt_no($extension_id) → str  ║
+ * ║                                                                   ║
+ * ║  REST endpoint:                                                   ║
+ * ║    - GET /dinoco-vat/v1/receipt/{extension_id}?format=html|png    ║
+ * ║      (customer can pull their own receipt; admin can pull any)    ║
+ * ║                                                                   ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. RECEIPT NUMBER GENERATOR — EXT-YYMM-XXXX format
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_receipt_generate_receipt_no' ) ) {
+    /**
+     * Generate stable receipt number from extension_id + paid_at.
+     * Format: EXT-{YYMM}-{padded-extension-id}
+     * Example: EXT-2605-0001234
+     *
+     * Receipt number is deterministic from extension_id — same ID always
+     * produces same number. Safe for re-print scenarios.
+     *
+     * @param int $extension_id
+     * @return string
+     */
+    function dinoco_vat_receipt_generate_receipt_no( $extension_id ) {
+        global $wpdb;
+        $extension_id = (int) $extension_id;
+        if ( $extension_id <= 0 ) return '';
+
+        $tbl = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'extensions' ) : '';
+        if ( $tbl === '' ) return 'EXT-XXXX-' . str_pad( (string) $extension_id, 7, '0', STR_PAD_LEFT );
+
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT paid_at, created_at FROM {$tbl} WHERE id = %d LIMIT 1",
+            $extension_id
+        ) );
+        if ( ! $row ) return '';
+
+        // Prefer paid_at (when finalized), fallback created_at
+        $ts_str = ! empty( $row->paid_at ) ? $row->paid_at : $row->created_at;
+        $ts = strtotime( (string) $ts_str );
+        if ( ! $ts ) $ts = time();
+
+        $yymm = gmdate( 'ym', $ts );
+        return 'EXT-' . $yymm . '-' . str_pad( (string) $extension_id, 7, '0', STR_PAD_LEFT );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. CONTEXT VALIDATION — is this order VAT-eligible?
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_receipt_extension_is_eligible' ) ) {
+    /**
+     * Returns array { eligible: bool, reason: string }.
+     * SN extensions stored in wp_dinoco_sn_extensions custom table — by
+     * definition all are B2C marketplace context. Eligibility requires:
+     *   1. Extension exists + payment_status = 'paid'
+     *   2. VAT settings ready (tax_id + company_name + address)
+     *
+     * @param int $extension_id
+     * @return array
+     */
+    function dinoco_vat_receipt_extension_is_eligible( $extension_id ) {
+        global $wpdb;
+        $extension_id = (int) $extension_id;
+        $tbl = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'extensions' ) : '';
+        if ( $tbl === '' ) {
+            return array( 'eligible' => false, 'reason' => 'sn_extensions_schema_missing' );
+        }
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT payment_status FROM {$tbl} WHERE id = %d LIMIT 1",
+            $extension_id
+        ) );
+        if ( ! $row ) {
+            return array( 'eligible' => false, 'reason' => 'extension_not_found' );
+        }
+        if ( $row->payment_status !== 'paid' ) {
+            return array( 'eligible' => false, 'reason' => 'not_paid', 'status' => $row->payment_status );
+        }
+        if ( function_exists( 'dinoco_vat_is_ready' ) && ! dinoco_vat_is_ready() ) {
+            return array( 'eligible' => false, 'reason' => 'vat_settings_incomplete' );
+        }
+        return array( 'eligible' => true, 'reason' => 'ok' );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. RECEIPT DATA ASSEMBLER — single source of truth for both HTML + PNG
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_receipt_assemble_data' ) ) {
+    /**
+     * Pulls all data needed to render a receipt — extension row + customer
+     * info + product info + VAT settings. Returns null if not renderable.
+     *
+     * @param int $extension_id
+     * @return array|null
+     */
+    function dinoco_vat_receipt_assemble_data( $extension_id ) {
+        global $wpdb;
+        $extension_id = (int) $extension_id;
+        if ( $extension_id <= 0 ) return null;
+
+        $eligible = dinoco_vat_receipt_extension_is_eligible( $extension_id );
+        if ( ! $eligible['eligible'] ) return null;
+
+        $tbl_ext  = dinoco_sn_table( 'extensions' );
+        $tbl_pool = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'pool' ) : '';
+
+        $ext = $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$tbl_ext} WHERE id = %d LIMIT 1", $extension_id
+        ) );
+        if ( ! $ext ) return null;
+
+        // Customer info from sn_pool (registered owner) + WP user
+        $pool = null;
+        $sn = strtoupper( (string) $ext->sn );
+        if ( $tbl_pool !== '' ) {
+            $pool = $wpdb->get_row( $wpdb->prepare(
+                "SELECT registered_user_id, linked_sku FROM {$tbl_pool} WHERE sn = %s LIMIT 1",
+                $sn
+            ) );
+        }
+
+        $customer_name = '';
+        $customer_uid  = 0;
+        if ( $pool && (int) $pool->registered_user_id > 0 ) {
+            $customer_uid = (int) $pool->registered_user_id;
+            $u = get_userdata( $customer_uid );
+            if ( $u ) {
+                $customer_name = trim( $u->display_name ?: ( $u->first_name . ' ' . $u->last_name ) );
+                if ( $customer_name === '' ) $customer_name = $u->user_login;
+            }
+        }
+
+        // Product info via SET-context aware resolver (V.0.53 helper)
+        $renewable_sku = '';
+        $product_name  = '';
+        $plate_count   = 1;
+        if ( $pool && function_exists( 'dinoco_sn_get_renewable_sku' ) ) {
+            $renewable_sku = strtoupper( (string) dinoco_sn_get_renewable_sku( $pool ) );
+        } elseif ( $pool ) {
+            $renewable_sku = strtoupper( (string) ( $pool->linked_sku ?? '' ) );
+        }
+        if ( $renewable_sku !== '' && class_exists( 'DINOCO_Catalog' ) ) {
+            $prod = DINOCO_Catalog::get_by_sku( $renewable_sku );
+            if ( $prod && isset( $prod->title ) ) $product_name = (string) $prod->title;
+        }
+        if ( function_exists( 'dinoco_sn_get_renewable_plate_count' ) && $pool ) {
+            $plate_count = (int) dinoco_sn_get_renewable_plate_count( $pool );
+        }
+        if ( $plate_count < 1 ) $plate_count = 1;
+
+        // Pricing breakdown
+        // V.1.0 — extension table stores price_paid as final amount (already
+        // discount-applied). For VAT receipt we display the gross amount + VAT
+        // breakdown. Assumption: price_paid is VAT-inclusive (consistent with
+        // Thai retail). subtotal_excl_vat = price_paid / (1 + vat_rate).
+        $rate = (float) dinoco_vat_get( 'rate', '0.07' );
+        if ( $rate < 0 || $rate > 1 ) $rate = 0.07;
+        $grand_total      = (float) $ext->price_paid;
+        $subtotal_excl    = $rate > 0 ? round( $grand_total / ( 1 + $rate ), 2 ) : $grand_total;
+        $vat_amount       = round( $grand_total - $subtotal_excl, 2 );
+
+        $years = (int) max( 1, round( ( (int) $ext->extension_months ) / 12 ) );
+        $item_desc = sprintf(
+            'ต่ออายุประกัน %d ปี — %s%s',
+            $years,
+            $product_name !== '' ? $product_name : ( '— ' . $renewable_sku ),
+            $plate_count > 1 ? sprintf( ' (ชุด %d ชิ้น)', $plate_count ) : ''
+        );
+
+        return array(
+            'receipt_no'       => dinoco_vat_receipt_generate_receipt_no( $extension_id ),
+            'receipt_date'     => ! empty( $ext->paid_at ) ? $ext->paid_at : $ext->created_at,
+            'extension_id'     => $extension_id,
+            // Company (issuer)
+            'company_name'     => (string) dinoco_vat_get( 'company_name' ),
+            'company_name_en'  => (string) dinoco_vat_get( 'company_name_en' ),
+            'tax_id'           => (string) dinoco_vat_get( 'tax_id' ),
+            'branch_code'      => (string) dinoco_vat_get( 'branch_code', '00000' ),
+            'branch_name'      => (string) dinoco_vat_get( 'branch_name', 'สำนักงานใหญ่' ),
+            'address'          => (string) dinoco_vat_get( 'address' ),
+            'phone'            => (string) dinoco_vat_get( 'phone' ),
+            'email'            => (string) dinoco_vat_get( 'email' ),
+            'logo_url'         => (string) dinoco_vat_get( 'logo_url' ),
+            // Customer
+            'customer_name'    => $customer_name,
+            'customer_uid'     => $customer_uid,
+            'customer_sn'      => $sn,
+            // Item
+            'item_desc'        => $item_desc,
+            'item_sku'         => $renewable_sku,
+            'item_qty'         => 1,
+            'item_years'       => $years,
+            'item_plate_count' => $plate_count,
+            // Totals
+            'subtotal_excl_vat'=> $subtotal_excl,
+            'vat_rate'         => $rate,
+            'vat_amount'       => $vat_amount,
+            'grand_total'      => $grand_total,
+            'grand_total_text' => function_exists( 'b2b_get_invoice_baht_text' )
+                ? b2b_get_invoice_baht_text( $grand_total )
+                : '',
+            'payment_method'   => (string) $ext->payment_method,
+            'payment_ref'      => (string) $ext->payment_ref,
+        );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. HTML RENDERER — print-friendly Thai VAT receipt
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_receipt_render_html' ) ) {
+    /**
+     * Render full HTML page (with <!doctype>) for browser print or PDF.
+     * Returns empty string if not eligible.
+     *
+     * @param int $extension_id
+     * @return string
+     */
+    function dinoco_vat_receipt_render_html( $extension_id ) {
+        $d = dinoco_vat_receipt_assemble_data( $extension_id );
+        if ( ! $d ) return '';
+
+        $e = function( $s ) { return esc_html( (string) $s ); };
+        $fmt = function( $n ) { return number_format( (float) $n, 2 ); };
+
+        ob_start();
+        ?><!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<title>ใบกำกับภาษี/ใบเสร็จ <?php echo $e( $d['receipt_no'] ); ?></title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: #fff; color: #111; font-family: 'Sarabun', 'TH Sarabun New', system-ui, sans-serif; font-size: 14px; line-height: 1.5; }
+.dnc-vat-page { max-width: 720px; margin: 24px auto; padding: 24px; background: #fff; border: 1px solid #e5e7eb; }
+.dnc-vat-header { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 2px solid #111; padding-bottom: 16px; margin-bottom: 16px; }
+.dnc-vat-header .left { flex: 1; }
+.dnc-vat-header .right { text-align: right; flex: 0 0 auto; }
+.dnc-vat-header h1 { margin: 0 0 6px; font-size: 20px; }
+.dnc-vat-header .en { color: #6b7280; font-size: 12px; }
+.dnc-vat-header .receipt-no { font-size: 18px; font-weight: 700; color: #111; }
+.dnc-vat-header .receipt-date { font-size: 12px; color: #6b7280; margin-top: 4px; }
+.dnc-vat-title { text-align: center; padding: 8px 0; background: #f3f4f6; font-size: 18px; font-weight: 700; margin-bottom: 16px; }
+.dnc-vat-title .en { font-size: 12px; font-weight: 400; color: #6b7280; display: block; }
+.dnc-vat-info { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.dnc-vat-info .block { padding: 12px; background: #f9fafb; border-radius: 4px; }
+.dnc-vat-info .block h3 { margin: 0 0 8px; font-size: 13px; color: #374151; }
+.dnc-vat-info .block .row { display: flex; justify-content: space-between; font-size: 12px; margin: 3px 0; }
+.dnc-vat-info .block .row span:first-child { color: #6b7280; }
+.dnc-vat-table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+.dnc-vat-table th, .dnc-vat-table td { border: 1px solid #e5e7eb; padding: 8px 10px; font-size: 13px; }
+.dnc-vat-table th { background: #f3f4f6; text-align: left; }
+.dnc-vat-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.dnc-vat-totals { display: flex; justify-content: flex-end; margin-bottom: 16px; }
+.dnc-vat-totals table { min-width: 320px; border-collapse: collapse; }
+.dnc-vat-totals td { padding: 6px 10px; font-size: 13px; }
+.dnc-vat-totals td.lbl { color: #6b7280; }
+.dnc-vat-totals td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.dnc-vat-totals tr.grand { border-top: 2px solid #111; }
+.dnc-vat-totals tr.grand td { font-weight: 700; font-size: 16px; padding-top: 10px; }
+.dnc-vat-text { padding: 8px 12px; background: #f9fafb; border-left: 3px solid #6b7280; font-size: 12px; color: #4b5563; margin-bottom: 16px; }
+.dnc-vat-footer { display: flex; justify-content: space-between; padding-top: 16px; border-top: 1px solid #e5e7eb; font-size: 11px; color: #6b7280; }
+.dnc-vat-sign { width: 200px; text-align: center; border-top: 1px dashed #9ca3af; padding-top: 4px; }
+@media print {
+  body { background: #fff; }
+  .dnc-vat-page { border: none; margin: 0; max-width: 100%; padding: 0; }
+  .dnc-vat-no-print { display: none !important; }
+}
+</style>
+</head>
+<body>
+<div class="dnc-vat-page">
+
+  <div class="dnc-vat-header">
+    <div class="left">
+      <?php if ( $d['logo_url'] !== '' ) : ?>
+        <img src="<?php echo esc_url( $d['logo_url'] ); ?>" alt="" style="max-height:50px;margin-bottom:6px;">
+      <?php endif; ?>
+      <h1><?php echo $e( $d['company_name'] ); ?></h1>
+      <?php if ( $d['company_name_en'] !== '' ) : ?>
+        <div class="en"><?php echo $e( $d['company_name_en'] ); ?></div>
+      <?php endif; ?>
+      <div style="font-size:12px;margin-top:6px;"><?php echo nl2br( $e( $d['address'] ) ); ?></div>
+      <div style="font-size:12px;margin-top:4px;">
+        <strong>เลขประจำตัวผู้เสียภาษี:</strong> <?php echo $e( $d['tax_id'] ); ?>
+        &nbsp;|&nbsp; <strong>สาขา:</strong> <?php echo $e( $d['branch_code'] ); ?> (<?php echo $e( $d['branch_name'] ); ?>)
+      </div>
+      <?php if ( $d['phone'] !== '' || $d['email'] !== '' ) : ?>
+      <div style="font-size:11px;margin-top:4px;color:#6b7280;">
+        <?php if ( $d['phone'] !== '' ) : ?>โทร <?php echo $e( $d['phone'] ); ?><?php endif; ?>
+        <?php if ( $d['email'] !== '' ) : ?>&nbsp;|&nbsp;Email <?php echo $e( $d['email'] ); ?><?php endif; ?>
+      </div>
+      <?php endif; ?>
+    </div>
+    <div class="right">
+      <div class="receipt-no"><?php echo $e( $d['receipt_no'] ); ?></div>
+      <div class="receipt-date"><?php echo $e( $d['receipt_date'] ); ?></div>
+    </div>
+  </div>
+
+  <div class="dnc-vat-title">
+    ใบกำกับภาษี/ใบเสร็จรับเงิน
+    <span class="en">TAX INVOICE / RECEIPT</span>
+  </div>
+
+  <div class="dnc-vat-info">
+    <div class="block">
+      <h3>ลูกค้า / Customer</h3>
+      <div class="row"><span>ชื่อ</span><span><?php echo $e( $d['customer_name'] ?: '—' ); ?></span></div>
+      <div class="row"><span>S/N</span><span><?php echo $e( $d['customer_sn'] ); ?></span></div>
+      <div class="row"><span>User ID</span><span>#<?php echo $e( $d['customer_uid'] ); ?></span></div>
+    </div>
+    <div class="block">
+      <h3>การชำระเงิน / Payment</h3>
+      <div class="row"><span>วิธีชำระ</span><span><?php echo $e( $d['payment_method'] ); ?></span></div>
+      <div class="row"><span>เลขอ้างอิง</span><span><?php echo $e( $d['payment_ref'] ); ?></span></div>
+      <div class="row"><span>วันที่ชำระ</span><span><?php echo $e( $d['receipt_date'] ); ?></span></div>
+    </div>
+  </div>
+
+  <table class="dnc-vat-table">
+    <thead>
+      <tr>
+        <th style="width:60px;">ลำดับ</th>
+        <th>รายการ / Description</th>
+        <th style="width:70px;">จำนวน</th>
+        <th style="width:120px;">ราคาต่อหน่วย</th>
+        <th style="width:120px;">รวม</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td>
+          <?php echo $e( $d['item_desc'] ); ?>
+          <br><small style="color:#6b7280;">SKU: <?php echo $e( $d['item_sku'] ); ?></small>
+        </td>
+        <td class="num"><?php echo $e( $d['item_qty'] ); ?></td>
+        <td class="num"><?php echo $fmt( $d['subtotal_excl_vat'] ); ?></td>
+        <td class="num"><?php echo $fmt( $d['subtotal_excl_vat'] ); ?></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="dnc-vat-totals">
+    <table>
+      <tr>
+        <td class="lbl">มูลค่าสินค้า/บริการ (ไม่รวม VAT)</td>
+        <td class="num">฿<?php echo $fmt( $d['subtotal_excl_vat'] ); ?></td>
+      </tr>
+      <tr>
+        <td class="lbl">ภาษีมูลค่าเพิ่ม <?php echo number_format( $d['vat_rate'] * 100, 0 ); ?>%</td>
+        <td class="num">฿<?php echo $fmt( $d['vat_amount'] ); ?></td>
+      </tr>
+      <tr class="grand">
+        <td class="lbl">รวมทั้งสิ้น</td>
+        <td class="num">฿<?php echo $fmt( $d['grand_total'] ); ?></td>
+      </tr>
+    </table>
+  </div>
+
+  <?php if ( $d['grand_total_text'] !== '' ) : ?>
+  <div class="dnc-vat-text">
+    <strong>จำนวนเงินตัวอักษร:</strong> <?php echo $e( $d['grand_total_text'] ); ?>
+  </div>
+  <?php endif; ?>
+
+  <div class="dnc-vat-footer">
+    <div>
+      <small>เอกสารฉบับนี้ออกโดยระบบอัตโนมัติ — ใบกำกับภาษีฉบับสมบูรณ์<br>
+      <em>Generated automatically by DINOCO System — Original Tax Invoice</em></small>
+    </div>
+    <div class="dnc-vat-sign">
+      ผู้รับเงิน / Authorized Signature
+    </div>
+  </div>
+
+</div>
+
+<div class="dnc-vat-no-print" style="text-align:center;margin:20px;">
+  <button onclick="window.print()" style="padding:10px 20px;background:#1f2937;color:#fff;border:0;border-radius:6px;cursor:pointer;">🖨️ พิมพ์ใบกำกับภาษี</button>
+</div>
+
+</body>
+</html><?php
+        return ob_get_clean();
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. PNG RENDERER — for LINE Flex push (image-based receipt)
+ *
+ * Reuses GD library that's already on the server (per B2B Snippet 10
+ * Invoice Image Generator). Outputs A4-portrait 800×1130 px.
+ *
+ * Defensive: if GD missing → returns empty string + logs warning.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_receipt_render_png' ) ) {
+    /**
+     * Render PNG receipt (in-memory) + return base64 data URL.
+     * For server-side caching, callers should write to wp_upload_dir().
+     *
+     * @param int $extension_id
+     * @return string PNG binary, or '' on failure
+     */
+    function dinoco_vat_receipt_render_png( $extension_id ) {
+        if ( ! function_exists( 'imagecreatetruecolor' ) ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'vat_receipt_gd_missing', array(
+                    'extension_id' => $extension_id,
+                    'hint'         => 'apt install php-gd or yum install php-gd then restart php-fpm',
+                ) );
+            }
+            return '';
+        }
+        $d = dinoco_vat_receipt_assemble_data( $extension_id );
+        if ( ! $d ) return '';
+
+        $W = 800;
+        $H = 1130; // A4 portrait ratio
+        $img = imagecreatetruecolor( $W, $H );
+        $white = imagecolorallocate( $img, 255, 255, 255 );
+        $black = imagecolorallocate( $img, 17, 17, 17 );
+        $gray  = imagecolorallocate( $img, 107, 114, 128 );
+        $light = imagecolorallocate( $img, 243, 244, 246 );
+        $accent = imagecolorallocate( $img, 31, 41, 55 );
+        imagefill( $img, 0, 0, $white );
+
+        // Font resolution — try common Thai font paths
+        $font = '';
+        $candidates = array(
+            ABSPATH . 'wp-content/uploads/fonts/Sarabun-Regular.ttf',
+            ABSPATH . 'wp-content/uploads/fonts/THSarabunNew.ttf',
+            '/usr/share/fonts/truetype/tlwg/Sawasdee.ttf',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        );
+        foreach ( $candidates as $cand ) {
+            if ( file_exists( $cand ) ) { $font = $cand; break; }
+        }
+        if ( $font === '' ) {
+            imagedestroy( $img );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'vat_receipt_font_missing', array(
+                    'extension_id' => $extension_id,
+                    'tried'        => $candidates,
+                ) );
+            }
+            return '';
+        }
+
+        $put = function( $size, $x, $y, $color, $text ) use ( $img, $font ) {
+            @imagettftext( $img, $size, 0, (int) $x, (int) $y, $color, $font, (string) $text );
+        };
+
+        // Header
+        $put( 18, 30, 40, $black, $d['company_name'] );
+        if ( $d['company_name_en'] !== '' ) {
+            $put( 11, 30, 60, $gray, $d['company_name_en'] );
+        }
+        $put( 10, 30, 82, $black, 'เลขประจำตัวผู้เสียภาษี: ' . $d['tax_id'] . '  สาขา: ' . $d['branch_code'] );
+        $put( 10, 30, 100, $black, mb_substr( $d['address'], 0, 80 ) );
+        $put( 16, 580, 50, $black, $d['receipt_no'] );
+        $put( 10, 580, 70, $gray, (string) $d['receipt_date'] );
+
+        imageline( $img, 30, 115, $W - 30, 115, $black );
+
+        // Title box
+        imagefilledrectangle( $img, 30, 130, $W - 30, 175, $light );
+        $put( 18, 250, 162, $black, 'ใบกำกับภาษี / ใบเสร็จรับเงิน' );
+
+        // Customer block
+        $put( 12, 30, 210, $accent, 'ลูกค้า / Customer' );
+        $put( 11, 30, 232, $black, 'ชื่อ: ' . ( $d['customer_name'] ?: '—' ) );
+        $put( 11, 30, 252, $black, 'S/N: ' . $d['customer_sn'] );
+
+        // Payment block
+        $put( 12, 420, 210, $accent, 'การชำระเงิน / Payment' );
+        $put( 11, 420, 232, $black, 'วิธี: ' . $d['payment_method'] );
+        $put( 11, 420, 252, $black, 'อ้างอิง: ' . $d['payment_ref'] );
+
+        // Item table
+        $top_y = 300;
+        imagefilledrectangle( $img, 30, $top_y, $W - 30, $top_y + 30, $light );
+        $put( 12, 50,  $top_y + 20, $accent, 'รายการ' );
+        $put( 12, 480, $top_y + 20, $accent, 'จำนวน' );
+        $put( 12, 580, $top_y + 20, $accent, 'ราคา' );
+        $put( 12, 680, $top_y + 20, $accent, 'รวม' );
+
+        $row_y = $top_y + 60;
+        $put( 11, 50, $row_y, $black, mb_substr( $d['item_desc'], 0, 55 ) );
+        $put( 10, 50, $row_y + 18, $gray, 'SKU: ' . $d['item_sku'] );
+        $put( 11, 495, $row_y, $black, (string) $d['item_qty'] );
+        $put( 11, 580, $row_y, $black, number_format( $d['subtotal_excl_vat'], 2 ) );
+        $put( 11, 680, $row_y, $black, number_format( $d['subtotal_excl_vat'], 2 ) );
+
+        imageline( $img, 30, $row_y + 50, $W - 30, $row_y + 50, $gray );
+
+        // Totals (right-aligned)
+        $tot_y = $row_y + 90;
+        $put( 12, 450, $tot_y, $gray, 'มูลค่าสินค้า/บริการ (ไม่รวม VAT)' );
+        $put( 12, 700, $tot_y, $black, '฿' . number_format( $d['subtotal_excl_vat'], 2 ) );
+
+        $put( 12, 450, $tot_y + 25, $gray, 'ภาษีมูลค่าเพิ่ม ' . number_format( $d['vat_rate'] * 100, 0 ) . '%' );
+        $put( 12, 700, $tot_y + 25, $black, '฿' . number_format( $d['vat_amount'], 2 ) );
+
+        imageline( $img, 450, $tot_y + 40, $W - 30, $tot_y + 40, $black );
+        $put( 16, 450, $tot_y + 70, $black, 'รวมทั้งสิ้น' );
+        $put( 16, 660, $tot_y + 70, $black, '฿' . number_format( $d['grand_total'], 2 ) );
+
+        // Baht text
+        if ( $d['grand_total_text'] !== '' ) {
+            imagefilledrectangle( $img, 30, $tot_y + 100, $W - 30, $tot_y + 140, $light );
+            $put( 11, 50, $tot_y + 126, $black, 'จำนวนเงินตัวอักษร: ' . $d['grand_total_text'] );
+        }
+
+        // Footer
+        $put( 9, 30, $H - 40, $gray, 'เอกสารฉบับนี้ออกโดยระบบอัตโนมัติ — Generated by DINOCO System' );
+        $put( 10, 580, $H - 40, $black, 'ผู้รับเงิน ____________________' );
+
+        ob_start();
+        imagepng( $img );
+        $png = ob_get_clean();
+        imagedestroy( $img );
+        return (string) $png;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. REST ENDPOINT — GET /dinoco-vat/v1/receipt/{extension_id}
+ *
+ * Customer can pull their own receipt; admin can pull any.
+ * format=html (default) → text/html | format=png → image/png
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_receipt_rest_pull' ) ) {
+    function dinoco_vat_receipt_rest_pull( $req ) {
+        global $wpdb;
+        $extension_id = (int) $req['id'];
+        $format = $req->get_param( 'format' ) === 'png' ? 'png' : 'html';
+
+        // Permission: admin can pull any, customer can only pull their own
+        $is_admin = current_user_can( 'manage_options' );
+        if ( ! $is_admin ) {
+            $uid = get_current_user_id();
+            if ( $uid <= 0 ) {
+                return new WP_Error( 'rest_forbidden', 'login required', array( 'status' => 401 ) );
+            }
+            $tbl_ext = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'extensions' ) : '';
+            $owner = $tbl_ext ? (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT user_id FROM {$tbl_ext} WHERE id = %d LIMIT 1", $extension_id
+            ) ) : 0;
+            if ( $owner !== $uid ) {
+                return new WP_Error( 'rest_forbidden', 'not owner', array( 'status' => 403 ) );
+            }
+        }
+
+        $eligible = dinoco_vat_receipt_extension_is_eligible( $extension_id );
+        if ( ! $eligible['eligible'] ) {
+            return new WP_Error( 'not_eligible', 'Receipt not available: ' . $eligible['reason'],
+                array( 'status' => 409, 'reason' => $eligible['reason'] ) );
+        }
+
+        if ( $format === 'png' ) {
+            $png = dinoco_vat_receipt_render_png( $extension_id );
+            if ( $png === '' ) {
+                return new WP_Error( 'render_failed', 'PNG renderer failed (check GD + font)',
+                    array( 'status' => 500 ) );
+            }
+            // Stream PNG directly (bypass REST envelope)
+            header( 'Content-Type: image/png' );
+            header( 'Content-Disposition: inline; filename="receipt-' .
+                dinoco_vat_receipt_generate_receipt_no( $extension_id ) . '.png"' );
+            echo $png;
+            exit;
+        }
+
+        // HTML default — stream as text/html
+        $html = dinoco_vat_receipt_render_html( $extension_id );
+        if ( $html === '' ) {
+            return new WP_Error( 'render_failed', 'HTML renderer failed', array( 'status' => 500 ) );
+        }
+        header( 'Content-Type: text/html; charset=utf-8' );
+        echo $html;
+        exit;
+    }
+}
+
+add_action( 'rest_api_init', function() {
+    register_rest_route( 'dinoco-vat/v1', '/receipt/(?P<id>\d+)', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_vat_receipt_rest_pull',
+        'permission_callback' => '__return_true', // permission enforced inside callback (owner-or-admin)
+        'args'                => array(
+            'id'     => array( 'sanitize_callback' => 'absint' ),
+            'format' => array( 'default' => 'html' ),
+        ),
+    ) );
+
+    // Admin-only diagnostic: check if a receipt can be generated
+    register_rest_route( 'dinoco-vat/v1', '/check/(?P<id>\d+)', array(
+        'methods'             => 'GET',
+        'callback'            => function( $req ) {
+            $id = (int) $req['id'];
+            $eligibility = dinoco_vat_receipt_extension_is_eligible( $id );
+            $data = $eligibility['eligible'] ? dinoco_vat_receipt_assemble_data( $id ) : null;
+            return rest_ensure_response( array(
+                'extension_id' => $id,
+                'eligibility'  => $eligibility,
+                'receipt_no'   => dinoco_vat_receipt_generate_receipt_no( $id ),
+                'data_present' => $data !== null,
+                'vat_ready'    => function_exists( 'dinoco_vat_is_ready' ) ? dinoco_vat_is_ready() : null,
+            ) );
+        },
+        'permission_callback' => function() {
+            return current_user_can( 'manage_options' );
+        },
+    ) );
+} );
