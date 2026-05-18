@@ -2,6 +2,23 @@
  * ╔═══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Marketplace Tools                          ║
  * ║                                                                   ║
+ * ║  Version: V.1.3 (2026-05-18) — code-reviewer remediation pack:    ║
+ * ║    • C2: dinoco_vat_set_master_enabled() now reads ACTUAL prior   ║
+ * ║      state from DB (not inverse-of-new) + skips audit log row if  ║
+ * ║      no actual state change (dedup).                              ║
+ * ║    • H1: refuses set when WP_DINOCO_VAT_ENABLED constant defined  ║
+ * ║      (prevents silent option/runtime divergence).                 ║
+ * ║    • H2: JS banner shows constant-lock warning in !ready branch.  ║
+ * ║    • M1: self-registration FIXED to canonical Module Registry     ║
+ * ║      schema (was: dinoco_register_module() wrong fn + slug/title  ║
+ * ║      + section='snid'; now: dinoco_register_admin_module() with   ║
+ * ║      key/label/section='system'/icon/cache_ttl).                  ║
+ * ║    • M2: vat-master-toggle uses window.dinocoModal.confirm() with ║
+ * ║      native confirm() fallback (Phase 6 bulk migration pattern).  ║
+ * ║    • L2: REST /vat-toggle `enabled` arg gets type=string.         ║
+ * ║    • L3: dinoco_obs_capture('info','vat_master_toggled',...).     ║
+ * ║    • L4: b2b_rate_limit 5/10min on /vat-toggle endpoint.          ║
+ * ║                                                                   ║
  * ║  Version: V.1.2 (2026-05-18) — Boss feedback "ไม่มีปุ่มเปิด VAT":  ║
  * ║    • NEW master flag `dinoco_vat_master_enabled` (default '0' OFF)║
  * ║      + helpers dinoco_vat_is_master_enabled() / dinoco_vat_is_    ║
@@ -168,6 +185,16 @@ if ( ! function_exists( 'dinoco_vat_set_master_enabled' ) ) {
      */
     function dinoco_vat_set_master_enabled( $enabled ) {
         $enabled = (bool) $enabled;
+        // V.1.3 H1 fix: Refuse to write when constant overrides (state would
+        // diverge silently — option changes but runtime ignores it).
+        if ( defined( 'WP_DINOCO_VAT_ENABLED' ) ) {
+            return array(
+                'ok'      => false,
+                'enabled' => (bool) WP_DINOCO_VAT_ENABLED,
+                'error'   => 'constant_locked',
+                'message' => 'WP_DINOCO_VAT_ENABLED constant ล็อคไว้ใน wp-config.php — แก้ที่ constant',
+            );
+        }
         if ( $enabled && ! dinoco_vat_is_ready() ) {
             return array(
                 'ok'      => false,
@@ -176,13 +203,42 @@ if ( ! function_exists( 'dinoco_vat_set_master_enabled' ) ) {
                 'message' => 'กรอก tax_id + company_name + address ให้ครบก่อนเปิด VAT',
             );
         }
-        update_option( 'dinoco_vat_master_enabled', $enabled ? '1' : '0' );
-        // Log via flag audit (function_exists guard — snippet may not be synced)
+        // V.1.3 C2 fix: read actual prior state from DB BEFORE update
+        // (previous V.1.2 fabricated $old = inverse of $new which produced
+        // phantom audit log rows when admin toggled to same state twice).
+        // Also: dedup — skip audit log row if no actual state change.
+        $old_raw = (string) get_option( 'dinoco_vat_master_enabled', '0' );
+        $new_raw = $enabled ? '1' : '0';
+        if ( $old_raw === $new_raw ) {
+            // No-op — return success but don't write/log
+            return array(
+                'ok'      => true,
+                'enabled' => $enabled,
+                'no_change' => true,
+            );
+        }
+        update_option( 'dinoco_vat_master_enabled', $new_raw );
+
+        // V.1.3 L3: obs_capture for sensitive op telemetry (Round 11 pattern)
+        if ( function_exists( 'dinoco_obs_capture' ) ) {
+            dinoco_obs_capture( 'info', 'vat_master_toggled', array(
+                'old'     => $old_raw,
+                'new'     => $new_raw,
+                'user_id' => get_current_user_id(),
+                'source'  => 'marketplace_tools_set_helper',
+            ) );
+        }
+        // Log via flag audit (function_exists guard — snippet may not be synced).
+        // V.1.3 C2: $old is now ACTUAL prior state from get_option, not inverse-of-new.
+        // Note: also fires via passive listener on `updated_option` if flag in
+        // Flag Audit whitelist — this explicit call may produce duplicate row
+        // (acceptable: both will record same delta, OR boss can remove this
+        // explicit call once whitelist confirmed includes dinoco_vat_master_enabled).
         if ( function_exists( 'dinoco_flag_audit_log' ) ) {
             dinoco_flag_audit_log(
                 'dinoco_vat_master_enabled',
-                $enabled ? '0' : '1',
-                $enabled ? '1' : '0',
+                $old_raw,
+                $new_raw,
                 'admin_ui_toggle',
                 'marketplace_tools'
             );
@@ -241,12 +297,17 @@ add_action( 'rest_api_init', function() {
     ) );
 
     // V.1.2 — POST /vat-toggle — master enable flag
+    // V.1.3 L2: type=string declared (callback handles bool/int/string normalization)
     register_rest_route( 'dinoco-marketplace-tools/v1', '/vat-toggle', array(
         'methods'             => 'POST',
         'callback'            => 'dinoco_mp_tools_rest_vat_toggle',
         'permission_callback' => $perm,
         'args'                => array(
-            'enabled' => array( 'required' => true ),
+            'enabled' => array(
+                'required' => true,
+                'type'     => 'string',
+                'description' => 'Accepts truthy strings ("1","true","on","yes") or falsey. Normalized in callback.',
+            ),
         ),
     ) );
 
@@ -501,8 +562,17 @@ if ( ! function_exists( 'dinoco_mp_tools_rest_vat_toggle' ) ) {
     /**
      * V.1.2 — POST /vat-toggle — flip master VAT enable flag.
      * Accepts `enabled` as bool/int/string ('1','0','true','false').
+     *
+     * V.1.3 L4: rate-limited 5 toggles per 10 min per user (defense-in-depth
+     * against flapping; admin-only endpoint so low risk, but matches R5 GAP
+     * fix pattern for 7 mutation endpoints).
      */
     function dinoco_mp_tools_rest_vat_toggle( $req ) {
+        $uid = get_current_user_id();
+        if ( $uid > 0 && function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( "vat_master_toggle_{$uid}", 5, 10 * MINUTE_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
         $raw = $req->get_param( 'enabled' );
         // Normalize various truthy/falsey shapes
         if ( is_bool( $raw ) ) {
@@ -923,6 +993,11 @@ if ( ! function_exists( 'dinoco_mp_tools_render_shortcode' ) ) {
                 } else if (!ready) {
                     bg = '#fef3c7'; border = '#b45309'; badge = '⚠️ NOT READY'; badgeColor = '#78350f';
                     msg = '<strong>กรอกข้อมูล VAT ให้ครบก่อนเปิด</strong> — จำเป็นต้องมี <code>tax_id</code> + <code>company_name</code> + <code>address</code> (ดูใน Section 2 ด้านล่าง)';
+                    // V.1.3 H2: warn if constant forces master ON — completing data
+                    // will activate VAT instantly without admin clicking Enable
+                    if (lock && enabled) {
+                        msg += '<br><strong style="color:#dc2626;">🔒 WP_DINOCO_VAT_ENABLED constant = true</strong> — กรอกข้อมูลครบ → VAT เปิดทันทีโดยไม่ต้องกด Enable';
+                    }
                     btnHtml = '<button class="dnc-mp-btn" disabled title="ข้อมูล VAT ยังไม่ครบ">▶️ เปิด VAT (รอกรอกข้อมูล)</button>';
                 } else if (enabled && !active) {
                     bg = '#fef3c7'; border = '#b45309'; badge = '⚠️ ENABLED แต่ NOT READY'; badgeColor = '#78350f';
@@ -1003,17 +1078,32 @@ if ( ! function_exists( 'dinoco_mp_tools_render_shortcode' ) ) {
                     var promptMsg = target
                         ? 'เปิด VAT 7% สำหรับ B2C Marketplace?\n\nลูกค้าใหม่ที่จ่ายค่าต่อประกัน → ระบบจะออกใบกำกับภาษี + ส่ง LINE Flex อัตโนมัติ'
                         : 'ปิด VAT?\n\nลูกค้าใหม่ที่จ่ายเงินระหว่าง flag OFF → ไม่ได้รับใบกำกับภาษี (admin ใช้ /resend/{id} ได้ภายหลัง)';
-                    if (!confirm(promptMsg)) return;
-                    t.disabled = true;
-                    api('POST', '/vat-toggle', { enabled: target ? '1' : '0' }).then(function(res){
-                        if (res.status === 200 && res.data.ok) {
-                            toast('✅ ' + (res.data.message || 'VAT toggled'), 'success');
-                            loadDiagnose();
-                        } else {
-                            toast('❌ ' + (res.data.message || res.data.error || 'Toggle failed'), 'error');
+                    // V.1.3 M2: prefer Modal Helpers with native fallback (Phase 6 bulk migration pattern)
+                    var doToggle = function(){
+                        t.disabled = true;
+                        api('POST', '/vat-toggle', { enabled: target ? '1' : '0' }).then(function(res){
+                            if (res.status === 200 && res.data.ok) {
+                                toast('✅ ' + (res.data.message || 'VAT toggled'), 'success');
+                                loadDiagnose();
+                            } else {
+                                toast('❌ ' + (res.data.message || res.data.error || 'Toggle failed'), 'error');
+                            }
+                            t.disabled = false;
+                        });
+                    };
+                    try {
+                        if (window.dinocoModal && typeof window.dinocoModal.confirm === 'function') {
+                            Promise.resolve(window.dinocoModal.confirm({
+                                message: promptMsg,
+                                confirmLabel: target ? 'เปิด VAT' : 'ปิด VAT',
+                                cancelLabel: 'ยกเลิก',
+                            })).then(function(ok){ if (ok) doToggle(); });
+                        } else if (confirm(promptMsg)) {
+                            doToggle();
                         }
-                        t.disabled = false;
-                    });
+                    } catch (e) {
+                        if (confirm(promptMsg)) doToggle();
+                    }
                     return;
                 }
                 if (action === 'vat-save') {
@@ -1086,16 +1176,26 @@ if ( ! function_exists( 'dinoco_mp_tools_render_shortcode' ) ) {
 
 add_shortcode( 'dinoco_marketplace_tools', 'dinoco_mp_tools_render_shortcode' );
 
-// Module Registry self-registration (if available)
-if ( function_exists( 'dinoco_register_module' ) ) {
+// V.1.3 M1 fix: V.1.0/V.1.1/V.1.2 called non-existent function
+// `dinoco_register_module` (wrong name — actual is dinoco_register_admin_module)
+// with non-canonical args (`slug`+`title`+section='snid' not in whitelist).
+// Today it's silent no-op because function_exists returns false. But this
+// is dead code that would break if a typo collision ever defines that
+// function name. Fixed to canonical schema + correct function name +
+// added to system section so admin can access via Admin Dashboard sidebar
+// (currently only accessible via direct URL /marketplace-tools/).
+if ( function_exists( 'dinoco_register_admin_module' ) ) {
     add_action( 'init', function() {
-        dinoco_register_module( array(
-            'slug'      => 'mp_tools',
-            'title'     => 'Marketplace Tools',
+        dinoco_register_admin_module( array(
+            'key'       => 'mp_tools',
             'shortcode' => 'dinoco_marketplace_tools',
-            'section'   => 'snid',
+            'label'     => 'Marketplace Tools',
+            'section'   => 'system',
+            'icon'      => 'fa-toolbox',
+            'color'     => '#6b7280',
             'order'     => 90,
-            'icon'      => '🛒',
+            'cache_ttl' => 0,
+            'source'    => '[Admin System] DINOCO Marketplace Tools V.1.3',
         ) );
     }, 30 );
 }

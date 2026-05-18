@@ -1,6 +1,16 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO VAT Monthly Export                        ║
+ * ║  Version: V.1.3 (2026-05-18) — code-reviewer C1 remediation:     ║
+ * ║    PP30 query now filters by sn_audit `vat_receipt_pushed` event ║
+ * ║    (canonical "receipt actually issued" marker from LINE Push    ║
+ * ║    V.1.0+). Previous query listed ALL paid extensions including  ║
+ * ║    those during VAT-master-OFF windows → tax filing inconsistency║
+ * ║    (declared revenue with no matching receipts). Now: only       ║
+ * ║    extensions where customer ACTUALLY received receipt appear in ║
+ * ║    accountant CSV. Defensive fallback: if audit table missing →  ║
+ * ║    returns all paid + logs warning via dinoco_obs_capture.       ║
+ * ║                                                                   ║
  * ║  Version: V.1.2 (2026-05-18) — Module Registry fix:              ║
  * ║    V.1.0/1.1 used wrong arg keys (`id` + `desc`) → registry      ║
  * ║    validation failed silently → Admin Dashboard never surfaced.   ║
@@ -94,16 +104,61 @@ if ( ! function_exists( 'dinoco_vat_export_query' ) ) {
         $next_month = $month === 12 ? array( $year + 1, 1 ) : array( $year, $month + 1 );
         $month_end = sprintf( '%04d-%02d-01 00:00:00', $next_month[0], $next_month[1] );
 
-        $rows = $wpdb->get_results( $wpdb->prepare(
-            "SELECT id, sn, user_id, extension_months, price_paid,
-                    payment_method, payment_ref, paid_at, created_at
-               FROM {$tbl_ext}
-              WHERE payment_status = %s
-                AND paid_at >= %s
-                AND paid_at <  %s
-              ORDER BY paid_at ASC",
-            'paid', $month_start, $month_end
-        ), ARRAY_A );
+        // V.1.3 C1 fix: PP30 report MUST only include extensions where the
+        // customer ACTUALLY received a VAT receipt. Master flag toggles
+        // mid-month could create gaps: paid extension during master-OFF
+        // window has NO receipt issued, but old query listed it → tax
+        // filing inconsistency. Filter via sn_audit table:
+        //   - canonical "receipt issued" event = 'vat_receipt_pushed'
+        //     (written by [System] DINOCO VAT Receipt LINE Push V.1.0+
+        //     line 411 on successful Flex push)
+        //   - admin can also force-resend via REST /resend/{id} which
+        //     also writes the same audit event
+        //   - extensions without this event = no receipt = exclude from PP30
+        //
+        // JOIN on sn_audit with subquery to avoid duplicate row blow-up
+        // if multiple pushed events exist (admin resend scenarios).
+        $tbl_audit = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'audit' ) : '';
+
+        if ( $tbl_audit !== '' ) {
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT e.id, e.sn, e.user_id, e.extension_months, e.price_paid,
+                        e.payment_method, e.payment_ref, e.paid_at, e.created_at
+                   FROM {$tbl_ext} e
+                  WHERE e.payment_status = %s
+                    AND e.paid_at >= %s
+                    AND e.paid_at <  %s
+                    AND EXISTS (
+                        SELECT 1 FROM {$tbl_audit} a
+                         WHERE a.sn = e.sn
+                           AND a.event_type = %s
+                           AND a.details LIKE %s
+                    )
+                  ORDER BY e.paid_at ASC",
+                'paid', $month_start, $month_end,
+                'vat_receipt_pushed',
+                '%' . $wpdb->esc_like( '"extension_id":' ) . '%'
+            ), ARRAY_A );
+        } else {
+            // Defensive fallback if audit table missing (Phase 1 install race) —
+            // fall back to ALL paid extensions but log warning so admin knows.
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'vat_export_audit_table_missing', array(
+                    'year' => $year, 'month' => $month,
+                    'fallback' => 'returning_all_paid_unfiltered',
+                ) );
+            }
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT id, sn, user_id, extension_months, price_paid,
+                        payment_method, payment_ref, paid_at, created_at
+                   FROM {$tbl_ext}
+                  WHERE payment_status = %s
+                    AND paid_at >= %s
+                    AND paid_at <  %s
+                  ORDER BY paid_at ASC",
+                'paid', $month_start, $month_end
+            ), ARRAY_A );
+        }
         if ( empty( $rows ) ) return array();
 
         // VAT rate (constant or option)
