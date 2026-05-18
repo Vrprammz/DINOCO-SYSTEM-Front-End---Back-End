@@ -1,12 +1,72 @@
-# Phase 6 LT-3 · DINOCO Home V2 + E-Commerce Widget — Mega Spec
+# Phase 6 LT-3 · DINOCO Home V2 + Lead-Gen Site — Mega Spec
 
 [← Specs index](./README.md) · [← Phase 6 backlog tracker](../sn-system/34-phase6-backlog-tracker.md)
 
-> **Status**: DESIGN SPEC · Boss-binding inputs locked (2026-05-15 + 2026-05-16) · Awaiting final approval for phasing kickoff
+> **Status**: DESIGN SPEC · Boss-binding inputs locked (2026-05-15 + 2026-05-16 + 2026-05-18) · Awaiting final approval for phasing kickoff
 > **Boss vision (2026-05-16)**: "ทำ web home dinoco.in.th ใหม่ และใช้ [Admin System] DINOCO Global Inventory Database ใช้ login ด้วย line ร่างสเปคเทพๆ มาหน่อยให้ link กับระบบทั้งหมดของ dinoco"
-> **Effort estimate**: ~12 weeks (5 phases LT-3.1 → LT-3.5) · ~520-580 dev hours
+> **Boss pivot (2026-05-18)**: "เว็บ DINOCO.in.th จะไม่มีช่องทางให้ชำระเงิน แต่จะมีปุ่มประสานตัวแทนจำหน่าย และก็ไปใช้ระบบประสานตัวแทนจำหน่าย openclawminicrm แทน ไปส่ง flex ผ่านไลน์ติดต่อลูกค้าฯ"
+> **Effort estimate (revised post-pivot)**: ~8 weeks (was 12) · ~340-400 dev hours (was 520-580) · checkout stack ตัดออกแล้ว
 > **Replaces / supersedes**: `33-phase6-strategic-foundations.md` §LT-3 stub (LT-1 done, LT-2 cut, LT-3 = this doc, LT-4 TBD)
-> **Cuts (boss decision 2026-05-16)**: Dealer mobile dashboard cut — "ไม่จำเป็นมันมี b2b อยู่แล้ว"
+> **Cuts**: Dealer mobile dashboard (2026-05-16), all checkout/payment stack (2026-05-18 — see pivot notice below)
+
+---
+
+## 🔴 Pivot Notice — 2026-05-18 (READ FIRST)
+
+หลัง boss review draft แรก → ตัดสินใจเปลี่ยน **product model** จาก "e-commerce + checkout" → "**lead-gen + dealer handoff via openclawminicrm**". การเปลี่ยนแปลงสำคัญ:
+
+### ของเดิม (CUT — superseded)
+
+- ❌ Cart + checkout flow
+- ❌ Slip2GO payment integration
+- ❌ Order creation บน dinoco.in.th
+- ❌ Dealer commission ledger (full implementation)
+- ❌ LINE Login เป็น hard requirement (เปลี่ยนเป็น optional สำหรับ personalization)
+- ❌ widget redirect → checkout page
+
+### ของใหม่ (NEW direction)
+
+- ✅ ลูกค้า browse catalog บน home/product pages
+- ✅ คลิก **"ติดต่อตัวแทนใกล้คุณ"** button
+- ✅ Form เก็บ: เบอร์โทร / LINE ID / สนใจสินค้า / ภูมิภาค
+- ✅ Submit → POST openclawminicrm `/api/leads/dealer-coord`
+- ✅ openclawminicrm จับคู่ dealer (by region + product match)
+- ✅ openclawminicrm ส่ง LINE Flex หา dealer + ลูกค้า (3-way coord card)
+- ✅ Dealer ติดตามใน openclawminicrm dashboard
+- ✅ Widget redirect → ปุ่ม "ติดต่อตัวแทน" → flow เดียวกัน
+
+### Sections ใน spec นี้ที่ยัง valid (KEEP, อ่านได้)
+
+- ✅ §1 Executive summary (ปรับ ROI ใหม่ — ดู revised est. ด้านบน)
+- ✅ §2 User personas (ปรับ "buy flow" → "contact dealer flow")
+- ✅ §3 Information architecture / sitemap (ลบ `/cart` + `/checkout` + `/order/{id}`)
+- ✅ §4 Tech stack decision (Next.js ยัง valid)
+- ✅ §5 LINE Login SSO architecture (downgrade เป็น optional)
+- ✅ §6 Home page sections (most sections เก็บ — ตัด "Quick checkout")
+- ✅ §7 E-commerce widget (rename → "Catalog widget" — ทำงานเหมือนเดิม แต่ click → contact dealer)
+- ✅ §10 DB schema (ลบ dealer_orders + commission tables; เก็บ home_featured + widget_dealers + widget_analytics)
+- ✅ §11 Security model
+- ✅ §12 Performance + SEO targets
+- ✅ §13 Subsystem integration map (เน้น openclawminicrm มากกว่า payment)
+
+### Sections ที่ต้องอ่าน NEW (added bottom)
+
+- ✅ **§19 NEW — Dealer Handoff Flow** (Part D) — flow detail + openclawminicrm contract + Flex templates
+
+### Sections ที่ DEPRECATED (ข้าม)
+
+- ❌ §8 Order Flow + Dealer Attribution (entirely cut — no checkout)
+- ❌ §9.5 dinoco-order/v1/* endpoints (cut)
+- ❌ §10 wp_dinoco_dealer_orders table (cut)
+- ❌ §14 Phasing LT-3.4 commission system (cut — saves ~120h)
+
+### Tracking widget integration (boss bonus 2026-05-18)
+
+บอสไม่เลือก LT-4 ideas แต่ระบุ "ระบบต้องทำงานร่วมกับ system ใน repo ได้ทั้งหมดอย่างฉลาด ยกเว้นส่งของด้วย Flash Express" (จากข้อความรอบแรก). หมายถึง home V2 ควรมี:
+
+- ✅ **Order tracking widget** บน home — ลูกค้ากรอกเลข ticket → ดู Flash status realtime (reuse existing webhook)
+- → เพิ่มเป็น Section 6 home page sub-section ใหม่: "🚚 ติดตามพัสดุ" — connect ผ่าน `b2b_flash_tracking_cron` data ที่มีอยู่แล้ว
+- → ไม่ต้อง develop tracking infra ใหม่ — แค่ frontend widget เรียก existing REST `GET /wp-json/b2b/v1/flash-tracking?ticket={id}`
 
 ---
 
@@ -1698,3 +1758,272 @@ graph LR
 **Sign-off**:
 - Boss approval: __________________ Date: __________
 - Tech lead review: __________________ Date: __________
+
+---
+
+## 19. NEW — Dealer Handoff Flow (Part D — boss pivot 2026-05-18)
+
+Section นี้แทน §8 (Order Flow) ของ original spec. flow ใหม่ = lead-gen + dealer handoff ผ่าน openclawminicrm (ไม่มี checkout/payment)
+
+### 19.1 Flow overview
+
+```mermaid
+sequenceDiagram
+    actor Customer as ลูกค้า
+    participant Home as dinoco.in.th (Home V2)
+    participant WP as WordPress (REST proxy)
+    participant OC as openclawminicrm Agent
+    participant Dealer as Dealer LINE OA
+    participant CustLine as Customer LINE
+
+    Customer->>Home: Browse product → click "ติดต่อตัวแทน"
+    Home->>Customer: Modal: เบอร์โทร / LINE ID / สนใจสินค้า / ภูมิภาค
+    Customer->>Home: Submit form
+    Home->>WP: POST /dinoco-leads/v1/dealer-coord
+    WP->>OC: POST /api/leads/dealer-coord (HMAC signed)
+    OC->>OC: Match dealer (region + product compatibility)
+    OC->>Dealer: LINE Flex Push — "🆕 ลูกค้าใหม่สนใจ {product}"
+    OC->>CustLine: LINE Flex Push — "✅ ส่งคำขอแล้ว — ตัวแทน {name} จะติดต่อภายใน {sla}"
+    OC->>WP: callback — lead_id + dealer_id created
+    WP->>Home: Response — success + dealer name + ETA
+    Home->>Customer: Show success page — "ตัวแทน {name} จะติดต่อภายใน {sla}"
+    
+    Note over Customer,Dealer: Continued offline / via LINE
+    Dealer->>CustLine: ทักลูกค้าใน LINE personal chat
+    Dealer->>OC: Update lead status (ตามได้ใน dashboard)
+```
+
+### 19.2 Contact form spec (modal บน dinoco.in.th)
+
+**Triggers**: ปุ่ม "ติดต่อตัวแทน" บน home + product detail + widget catalog cards
+
+**Form fields**:
+
+| Field | Type | Required | Validation |
+|---|---|---|---|
+| `customer_name` | text | ✅ | 2-100 chars Thai/Eng |
+| `phone` | tel | ✅ | Thai mobile pattern `^0[0-9]{9}$` |
+| `line_id` | text | optional | 1-50 chars (no @) |
+| `region` | select | ✅ | dropdown 77 จังหวัด + "ไม่ระบุ" |
+| `interested_sku` | hidden | auto-filled | จาก product page context (or null = general inquiry) |
+| `interested_category` | hidden | auto-filled | จาก browsing context |
+| `motorcycle_model` | select | optional | dropdown from moto catalog |
+| `notes` | textarea | optional | 0-500 chars |
+| `consent_pdpa` | checkbox | ✅ | "ยอมรับให้ DINOCO + ตัวแทนติดต่อกลับ" |
+
+**No login required** — open contact (lead-gen friendly)
+
+**LINE Login optional benefit**: ถ้า logged in → auto-fill name + phone + skip CAPTCHA (trust signal)
+
+### 19.3 New REST endpoint — `POST /wp-json/dinoco-leads/v1/dealer-coord`
+
+**Auth**: Public (rate-limited 5/hour/IP + 20/day/IP)
+
+**Body**:
+```json
+{
+  "customer_name": "สมชาย",
+  "phone": "0812345678",
+  "line_id": "somchai_line",
+  "region": "bangkok",
+  "interested_sku": "DNCSETXL7500X001H",
+  "motorcycle_model": "XL750",
+  "notes": "อยากดูของจริงก่อน",
+  "consent_pdpa": true,
+  "source": "home_button" | "product_page" | "widget" | "tracking_page"
+}
+```
+
+**Response (202 Accepted)**:
+```json
+{
+  "success": true,
+  "lead_id": "LEAD-2026-05-18-XXXX",
+  "dealer": {
+    "name": "ร้าน ABC",
+    "region_match_quality": "exact",
+    "estimated_response_time_hours": 2,
+    "line_oa_url": "https://lin.ee/dinoco_abc"
+  },
+  "message": "ส่งคำขอเรียบร้อย ตัวแทน ABC จะติดต่อภายใน 2 ชม."
+}
+```
+
+**Errors**:
+- `400 invalid_phone` — phone format ผิด
+- `400 missing_consent` — consent_pdpa ไม่ใช่ true
+- `429 rate_limited` — เกิน 5/hr หรือ 20/day
+- `503 no_dealer_match` — ไม่มี dealer ใน region → fallback "ทีม DINOCO จะติดต่อโดยตรง"
+- `502 openclaw_unreachable` — agent down → queue retry + admin alert
+
+### 19.4 openclawminicrm contract — `POST /api/leads/dealer-coord`
+
+**Auth**: HMAC signature (shared secret `LIFF_AI_AGENT_KEY` reused)
+
+**Body** (from WP):
+```json
+{
+  "source_app": "dinoco_home_v2",
+  "lead_payload": { ...same as customer form... },
+  "wp_user_id": null,
+  "timestamp": "2026-05-18T14:30:00+07:00"
+}
+```
+
+**Response** (synchronous, but actual LINE push fires async):
+```json
+{
+  "lead_id": "LEAD-...",
+  "dealer_matched": {
+    "dealer_id": "D001",
+    "name": "...",
+    "region": "...",
+    "products_carried": ["DNCSETXL...", ...],
+    "response_sla_hours": 2
+  },
+  "line_pushes_scheduled": [
+    { "target": "dealer_oa", "status": "queued" },
+    { "target": "customer_line", "status": "skipped_no_line_id" }
+  ]
+}
+```
+
+**Dealer matching algorithm** (in openclawminicrm):
+1. Filter dealers by region (exact match → fallback nearby provinces)
+2. Filter by `products_carried` overlap with `interested_sku`/`interested_category`
+3. Sort by: (a) recent activity, (b) response SLA history, (c) load balance (least leads this week)
+4. Tie-breaker: random
+5. ถ้าไม่มี match → return `no_dealer_match` → WP falls back to DINOCO direct contact
+
+### 19.5 LINE Flex templates
+
+**Dealer Flex (received by dealer LINE OA)**:
+
+```
+┌─────────────────────────────┐
+│ 🆕 ลูกค้าใหม่สนใจสินค้า     │ (header dark navy)
+├─────────────────────────────┤
+│ 👤 สมชาย                    │
+│ 📱 081-234-5678             │
+│ 💬 LINE: somchai_line       │
+│ 📍 กรุงเทพ                  │
+│ 🏍️ XL750                    │
+│                             │
+│ สนใจ: Crash Bar Pro Rally   │
+│ "อยากดูของจริงก่อน"           │
+│                             │
+│ ⏰ ส่งเมื่อ 14:30            │
+├─────────────────────────────┤
+│ [📞 โทร] [💬 ทัก LINE]      │
+│ [✅ รับเคส] [⏭️ ส่งต่อ]      │
+└─────────────────────────────┘
+```
+
+**Customer Flex (received by customer LINE — only ถ้ามี line_id หรือ logged in)**:
+
+```
+┌─────────────────────────────┐
+│ ✅ ส่งคำขอเรียบร้อย          │ (header green)
+├─────────────────────────────┤
+│ ขอบคุณ สมชาย!               │
+│                             │
+│ ตัวแทน ABC ในกรุงเทพ        │
+│ จะติดต่อกลับภายใน 2 ชม.     │
+│                             │
+│ 📦 Crash Bar Pro Rally      │
+│                             │
+│ ถ้าไม่ได้รับการติดต่อ        │
+│ ทักทาง LINE DINOCO          │
+├─────────────────────────────┤
+│ [💬 ทัก LINE DINOCO]        │
+└─────────────────────────────┘
+```
+
+### 19.6 Lead status flow (in openclawminicrm)
+
+States:
+- `new` — เพิ่งสร้าง, dealer ยังไม่ accept
+- `accepted` — dealer กดรับเคส
+- `contacted` — dealer ทักลูกค้าแล้ว
+- `negotiating` — กำลังคุย/ส่งราคา
+- `closed_won` — ลูกค้าสั่งซื้อ
+- `closed_lost` — ไม่สั่ง / ติดต่อไม่ได้
+- `reassigned` — dealer ส่งต่อให้อีก dealer
+- `escalated` — ลูกค้า complaint → ทีม DINOCO รับช่วง
+
+Dealer dashboard ใน openclawminicrm มีอยู่แล้ว — เพิ่ม source filter `dinoco_home_v2` เพื่อแยก stats
+
+### 19.7 Tracking widget integration (boss bonus 2026-05-18)
+
+NEW home section "🚚 ติดตามพัสดุของฉัน":
+
+```
+┌────────────────────────────────────────────┐
+│ 🚚 ติดตามพัสดุ                              │
+│                                            │
+│ กรอกเลขที่คำสั่งซื้อหรือ Tracking PNO       │
+│                                            │
+│ [_____________________] [ติดตาม]            │
+│                                            │
+│ ตัวอย่าง: ORD-12345 หรือ TH-FLE-PNO-XXX    │
+└────────────────────────────────────────────┘
+```
+
+**Backend**: ใช้ existing REST `GET /wp-json/b2b/v1/flash-tracking?ticket={id}` หรือ `GET /wp-json/b2b/v1/flash-tracking?pno={pno}` (B2B Snippet 5 V.32+) — ไม่ต้องสร้าง infra ใหม่
+
+**Response**:
+- Status timeline (created → picked_up → in_transit → out_for_delivery → delivered)
+- Last update timestamp + location
+- Estimated delivery
+
+**Permission**: Public (tracking info ไม่ sensitive — Flash standard) — แต่ rate limit 30/min/IP
+
+### 19.8 Effort revised
+
+| Phase | Original (with checkout) | Revised (lead-gen) | Savings |
+|---|---|---|---|
+| LT-3.1 Foundation + Home | 160h | 160h | 0 |
+| LT-3.2 Catalog + Checkout | 120h | 60h (catalog only, no checkout) | -60h |
+| LT-3.3 Widget v1 | 80h | 80h | 0 |
+| LT-3.4 Widget v2 + Commission | 120h | 40h (widget v2, no commission) | -80h |
+| LT-3.5 Polish | 40h | 40h | 0 |
+| **NEW LT-3.6 Dealer Handoff** | — | 60h | +60h |
+| **Total** | 520h | **440h** | **-80h** |
+
+**Net**: ~80h less than original (no payment stack to build/maintain)
+
+### 19.9 What openclawminicrm needs (already exists vs new)
+
+Existing in openclawminicrm:
+- ✅ Lead/dealer database (Dealer Management V.2.0)
+- ✅ LINE Flex push helpers
+- ✅ Lead pipeline FSM (V.2.0 — 17 statuses)
+- ✅ Dealer dashboard
+- ✅ Telegram notifications (น้องกุ้ง)
+
+NEW for LT-3 handoff:
+- 🆕 `POST /api/leads/dealer-coord` endpoint (REST contract above)
+- 🆕 Dealer matching algorithm (region + product carry)
+- 🆕 Lead source = `dinoco_home_v2` (extends existing source enum)
+- 🆕 2 Flex templates (dealer + customer)
+
+Effort openclaw-side: ~20-30h (vs WP-side ~30-40h for handoff REST + form UI + analytics)
+
+### 19.10 PDPA + privacy
+
+- Form ต้องมี `consent_pdpa` checkbox + link to privacy policy
+- Lead data จะถูกเก็บใน openclawminicrm DB + เป็น subject to PDPA Phase 7 export/delete flow
+- Dealer ที่ได้รับ Flex ต้องไม่ forward customer info → enforce via dealer T&C (admin บังคับ sign on dealer onboarding)
+- Lead data retention: 1 ปี หลัง closed_won/lost → auto-archive (boss decide ก่อน implement)
+
+---
+
+## End of Spec (Updated 2026-05-18)
+
+**Action items**:
+
+1. Boss approve pivot direction (lead-gen vs e-commerce) → ✅ confirmed 2026-05-18
+2. Update `docs/sn-system/34-phase6-backlog-tracker.md` — LT-3 status = SPEC v2 (pivoted)
+3. Coordinate with openclawminicrm dev to add `/api/leads/dealer-coord` endpoint + dealer matching algorithm
+4. Boss decides timing: เริ่ม LT-3.1 เมื่อไหร่ + budget allocation
+5. ตัดสินใจ Q-LT-3-1..Q-LT-3-10 (open questions §16) — หรือ boss บอก "ใช้ default" จะ proceed ทันที
