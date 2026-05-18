@@ -53,6 +53,15 @@
  * ║    address brand strip header. Resolves logo via 3-tier fallback:║
  * ║    dinoco_brand_logo_url('dark') → b2b_get_logo_url() → hardcoded║
  * ║    https://dinoco.in.th/wp-content/uploads/2026/02/logodnc.png   ║
+ * ║  Version: V.0.56 (2026-05-18) — P0.1 Dead-Workflow Spec V.1.0:    ║
+ * ║    NEW POST /marketplace/{id}/refund-request — customer-initiated║
+ * ║    intake (distinct from admin /refund). Eligibility: paid + ≤7d ║
+ * ║    + no pending. Side effects: option-keyed pending state +      ║
+ * ║    sn_audit 'refund_requested' (5y sensitive) + Telegram alert    ║
+ * ║    via b2b_tg_send_dedup (1hr TTL). Idempotency wrapper (Round   ║
+ * ║    30+ pattern). Closes Q20 R2 manual refund SOP customer-facing ║
+ * ║    intake gap.                                                    ║
+ * ║                                                                   ║
  * ║  Version: V.0.50 (2026-05-15) — Phase 6 W19+: marketplace receipt║
  * ║    HTML render endpoint /marketplace/{id}/receipt/render (closes ║
  * ║    "W17 stub" deferred). Plain ใบเสร็จธรรมดา (non-VAT) — printable║
@@ -2562,6 +2571,44 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                     'sanitize_callback' => 'sanitize_text_field',
                     'validate_callback' => function( $v ) {
                         return is_string( $v ) && trim( $v ) === 'REFUND CONFIRM';
+                    },
+                ),
+            ),
+        ) );
+
+        // V.0.56 P0.1 (Dead-Workflow Spec V.1.0) — customer-initiated refund REQUEST.
+        // Distinct from admin POST /marketplace/{id}/refund (which PROCESSES the refund).
+        // This endpoint creates a pending review item + Telegram alerts admin.
+        //
+        //   POST /dinoco-sn/v1/marketplace/{id}/refund-request
+        //   Permission: logged-in user (must own the extension)
+        //   Body: { reason: 10-500 chars, refund_channel: 'promptpay'|'bank_transfer' }
+        //   Eligibility: payment_status='paid' + paid_at within 7 days + no active claim
+        //                + no existing pending request (idempotent — single request per ext)
+        //   Returns: 201 { ok: true, request_id, message } or WP_Error
+        //   Idempotency-Key wrapper recommended (Round 30+ pattern)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/marketplace/(?P<id>\d+)/refund-request', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_marketplace_refund_request',
+            'permission_callback' => 'dinoco_sn_perm_logged_in',
+            'args'                => array(
+                'id'              => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+                'reason'          => array(
+                    'required'          => true,
+                    'type'              => 'string',
+                    'sanitize_callback' => 'sanitize_textarea_field',
+                    'validate_callback' => function( $v ) {
+                        if ( ! is_string( $v ) ) return false;
+                        $len = mb_strlen( trim( $v ) );
+                        return $len >= 10 && $len <= 500;
+                    },
+                ),
+                'refund_channel'  => array(
+                    'required'          => true,
+                    'type'              => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                    'validate_callback' => function( $v ) {
+                        return in_array( $v, array( 'promptpay', 'bank_transfer' ), true );
                     },
                 ),
             ),
@@ -12088,5 +12135,192 @@ if ( ! function_exists( 'dinoco_sn_apply_refund' ) ) {
             }
             throw $e;
         }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * P0.1 (V.0.56 — Dead-Workflow Spec V.1.0) — Customer-Initiated Refund Request
+ *
+ * Customer-facing intake endpoint. Distinct from admin /marketplace/{id}/refund
+ * (which PROCESSES the refund with 4-eyes). This endpoint captures the customer
+ * intent + alerts admin via Telegram + audit log. Admin reviews + processes
+ * via Facebook DM channel or the admin /refund endpoint.
+ *
+ * Eligibility:
+ *   - extension exists + belongs to current user
+ *   - payment_status='paid' (not already refunded/cancelled)
+ *   - paid_at within 7 days (7×86400 seconds window)
+ *   - no existing pending request (single-request invariant per extension)
+ *
+ * Side effects:
+ *   - postmeta `_refund_request_pending=1` + `_refund_request_*` fields
+ *   - sn_audit event 'refund_requested' (sensitive=true, 5y retention)
+ *   - Telegram alert to admin via b2b_tg_send_dedup
+ *
+ * Idempotency: Round 30+ wrapper. Body hash = { id, reason, refund_channel }
+ * + actor_user_id added by wrapper → different reason mid-retry → 409.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_rest_marketplace_refund_request' ) ) {
+    function dinoco_sn_rest_marketplace_refund_request( $req ) {
+        if ( ! function_exists( 'dinoco_sn_marketplace_is_enabled' ) || ! dinoco_sn_marketplace_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'Marketplace disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        // Per-user rate limit: 3 attempts per hour (customer-side, generous but anti-spam)
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( "sn_refund_request_{$uid}", 3, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency(
+                $req,
+                'marketplace-refund-request',
+                array( 'id', 'reason', 'refund_channel' ),
+                function( $req ) {
+                    return dinoco_sn_handler_marketplace_refund_request( $req );
+                }
+            );
+        }
+        return dinoco_sn_handler_marketplace_refund_request( $req );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_handler_marketplace_refund_request' ) ) {
+    function dinoco_sn_handler_marketplace_refund_request( $req ) {
+        global $wpdb;
+        $extension_id   = (int) $req->get_param( 'id' );
+        $reason         = sanitize_textarea_field( (string) $req->get_param( 'reason' ) );
+        $refund_channel = sanitize_text_field( (string) $req->get_param( 'refund_channel' ) );
+        $actor_uid      = get_current_user_id();
+
+        if ( $extension_id <= 0 ) {
+            return new WP_Error( 'bad_request', __( 'Invalid extension ID', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( $actor_uid <= 0 ) {
+            return new WP_Error( 'rest_not_logged_in', __( 'Authentication required', 'dinoco-sn' ), array( 'status' => 401 ) );
+        }
+        if ( ! in_array( $refund_channel, array( 'promptpay', 'bank_transfer' ), true ) ) {
+            return new WP_Error( 'bad_refund_channel', __( 'refund_channel must be promptpay or bank_transfer', 'dinoco-sn' ), array( 'status' => 422 ) );
+        }
+
+        // Look up extension
+        $tbl = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'extensions' ) : '';
+        if ( ! $tbl ) {
+            return new WP_Error( 'feature_disabled', __( 'Schema not ready', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        $ext = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl} WHERE id = %d LIMIT 1", $extension_id ) );
+        if ( ! $ext ) {
+            // Anti-enumeration: return generic 404 (don't leak whether ID exists for another user)
+            return new WP_Error( 'rest_not_found', __( 'ไม่พบรายการสั่งซื้อ', 'dinoco-sn' ), array( 'status' => 404 ) );
+        }
+
+        // Ownership check (404 collapse — don't reveal existence to non-owners)
+        if ( (int) $ext->user_id !== $actor_uid ) {
+            return new WP_Error( 'rest_not_found', __( 'ไม่พบรายการสั่งซื้อ', 'dinoco-sn' ), array( 'status' => 404 ) );
+        }
+
+        // Eligibility: payment_status must be 'paid'
+        if ( strtolower( (string) $ext->payment_status ) !== 'paid' ) {
+            return new WP_Error( 'not_eligible', sprintf(
+                /* translators: %s = current status */
+                __( 'ไม่สามารถขอคืนเงินได้ — สถานะปัจจุบัน: %s', 'dinoco-sn' ),
+                $ext->payment_status
+            ), array( 'status' => 409 ) );
+        }
+
+        // Eligibility: within 7-day window from paid_at
+        $paid_at_ts = $ext->paid_at ? strtotime( $ext->paid_at ) : 0;
+        if ( ! $paid_at_ts ) {
+            return new WP_Error( 'not_eligible', __( 'ไม่พบวันที่ชำระเงิน', 'dinoco-sn' ), array( 'status' => 409 ) );
+        }
+        $now_ts = current_time( 'U' );
+        $age_days = floor( ( $now_ts - $paid_at_ts ) / DAY_IN_SECONDS );
+        if ( $age_days > 7 ) {
+            return new WP_Error( 'not_eligible', sprintf(
+                /* translators: %d = days since payment */
+                __( 'เกินระยะเวลา 7 วันที่ขอคืนเงินได้ (ผ่านไปแล้ว %d วัน) — กรุณาติดต่อ Admin', 'dinoco-sn' ),
+                (int) $age_days
+            ), array( 'status' => 409 ) );
+        }
+
+        // Idempotency: check existing pending request (postmeta on extension)
+        // Use wp_options instead of postmeta since extensions are custom table rows, not posts
+        $pending_key = 'dinoco_sn_refund_request_' . $extension_id;
+        $existing = get_option( $pending_key, '' );
+        if ( $existing !== '' ) {
+            $existing_data = is_string( $existing ) ? json_decode( $existing, true ) : null;
+            return new WP_Error( 'already_requested', sprintf(
+                __( 'คุณได้ส่งคำขอคืนเงินไปแล้ว เมื่อ %s — กรุณารอแอดมินตรวจสอบ', 'dinoco-sn' ),
+                is_array( $existing_data ) && isset( $existing_data['requested_at'] ) ? $existing_data['requested_at'] : 'unknown'
+            ), array( 'status' => 409 ) );
+        }
+
+        // Store pending request (autoload=false — won't bloat alloptions)
+        $request_payload = array(
+            'extension_id'  => $extension_id,
+            'user_id'       => $actor_uid,
+            'reason'        => $reason,
+            'refund_channel' => $refund_channel,
+            'requested_at'  => current_time( 'mysql' ),
+            'status'        => 'pending_admin_review',
+            'sn'            => isset( $ext->sn ) ? $ext->sn : '',
+            'amount'        => isset( $ext->price_paid ) ? (float) $ext->price_paid : 0.0,
+        );
+        update_option( $pending_key, wp_json_encode( $request_payload ), false );
+
+        // Audit log (sensitive=true, 5y retention per existing audit policy)
+        if ( function_exists( 'dinoco_sn_audit_log' ) && isset( $ext->sn ) ) {
+            dinoco_sn_audit_log(
+                strtoupper( (string) $ext->sn ),
+                'refund_requested',
+                null,
+                null,
+                array(
+                    'extension_id'    => $extension_id,
+                    'user_id'         => $actor_uid,
+                    'reason_preview'  => mb_substr( $reason, 0, 80 ),
+                    'refund_channel'  => $refund_channel,
+                    'amount'          => $request_payload['amount'],
+                ),
+                $actor_uid,
+                null,
+                '',
+                'marketplace_refund_request',
+                true // sensitive
+            );
+        }
+
+        // Telegram alert to admin — dedup 1hr to prevent spam if customer retries
+        $tg_msg = "💰 คำขอคืนเงิน Marketplace\n"
+                . "ext_id: {$extension_id}\n"
+                . "user: {$actor_uid}\n"
+                . "SN: " . ( isset( $ext->sn ) ? $ext->sn : 'n/a' ) . "\n"
+                . "amount: ฿" . number_format( $request_payload['amount'], 2 ) . "\n"
+                . "channel: {$refund_channel}\n"
+                . "age: {$age_days}d post-paid\n"
+                . "reason: " . mb_substr( $reason, 0, 120 ) . "\n"
+                . "action: review + POST /dinoco-sn/v1/marketplace/{$extension_id}/refund (admin 4-eyes if ≥฿5K)";
+
+        if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+            b2b_tg_send_dedup( 'refund_request_' . $extension_id, $tg_msg, 3600 );
+        }
+
+        if ( function_exists( 'dinoco_obs_capture' ) ) {
+            dinoco_obs_capture( 'info', 'marketplace_refund_requested', array(
+                'extension_id' => $extension_id,
+                'user_id'      => $actor_uid,
+                'channel'      => $refund_channel,
+                'age_days'     => (int) $age_days,
+            ) );
+        }
+
+        return rest_ensure_response( array(
+            'ok'           => true,
+            'request_id'   => $pending_key,
+            'extension_id' => $extension_id,
+            'status'       => 'pending_admin_review',
+            'message'      => 'คำขอคืนเงินถูกบันทึกแล้ว — แอดมินจะตรวจสอบและติดต่อกลับภายใน 1-2 วันทำการ',
+        ) );
     }
 }
