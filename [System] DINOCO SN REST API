@@ -2,6 +2,24 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.55 (2026-05-18) — R3 audit BLOCKER + HIGH fixes:   ║
+ * ║    • BLOCKER-2: dinoco_sn_get_renewable_plate_count() SQL rewrite ║
+ * ║      (V.0.53 referenced nonexistent cols m.sn_id/p.warranty_end/  ║
+ * ║      'extended' status → silent return 1 → defeats SET banner).   ║
+ * ║      Now joins on m.sn = p.sn + counts siblings + adds self.      ║
+ * ║    • BLOCKER-1 (5 sites): DINOCO_Catalog returns ARRAY_A with     ║
+ * ║      `name` col — code accessed $prod->title (wrong col + access  ║
+ * ║      type). Affected: get_renewable_product_name + /quote x2 +    ║
+ * ║      receipt-html + get_extension_price ($product->{$col} → arr). ║
+ * ║    • HIGH-1 (fan-out semantics): siblings re-base to $new_end     ║
+ * ║      (Option A — boss "renew as bundle"). Skip-if-longer guard    ║
+ * ║      protects legacy per-leaf renewals from being shortened.      ║
+ * ║    • code-review BLOCKER: postmeta SELECT FOR UPDATE + direct     ║
+ * ║      wpdb->update (bypass cache) + wp_cache_delete = atomic       ║
+ * ║      sibling extend (no stale-read race).                         ║
+ * ║    • MED-4: removed non-SARGable BINARY UPPER on JOIN (utf8mb4_bin║
+ * ║      collation already case-sensitive + SNs stored uppercase).    ║
+ * ║                                                                   ║
  * ║  Version: V.0.54 (2026-05-18) — Renewal-as-bundle ENFORCEMENT:   ║
  * ║    /marketplace/quote + /marketplace/checkout now resolve         ║
  * ║    renewable_sku via V.0.53 helper (top_set_sku else linked_sku). ║
@@ -9840,9 +9858,16 @@ if ( ! function_exists( 'dinoco_sn_get_extension_price' ) ) {
         if ( ! class_exists( 'DINOCO_Catalog' ) ) return null;
         $product = DINOCO_Catalog::get_by_sku( strtoupper( $sku ) );
         if ( ! $product ) return null;
+        // V.0.55 BLOCKER-1 fix: DINOCO_Catalog returns ARRAY_A (not object).
         // Defensive: column may not exist yet (Phase 1-3 — pre-ALTER)
-        if ( ! isset( $product->{$col} ) ) return null;
-        $price = $product->{$col};
+        if ( is_array( $product ) ) {
+            if ( ! array_key_exists( $col, $product ) ) return null;
+            $price = $product[ $col ];
+        } elseif ( is_object( $product ) && isset( $product->{$col} ) ) {
+            $price = $product->{$col};
+        } else {
+            return null;
+        }
         if ( $price === null || $price === '' ) return null;
         $price = (float) $price;
         return $price >= 0 ? $price : null;
@@ -9927,7 +9952,16 @@ if ( ! function_exists( 'dinoco_sn_get_renewable_product_name' ) ) {
         if ( ! class_exists( 'DINOCO_Catalog' ) ) return $sku;
         $product = DINOCO_Catalog::get_by_sku( $sku );
         if ( ! $product ) return $sku;
-        return isset( $product->name ) ? (string) $product->name : $sku;
+        // V.0.55 BLOCKER-1 fix: DINOCO_Catalog::get_by_sku returns ARRAY_A (not object).
+        // Column name is `name` (Snippet 15 schema line 249).
+        if ( is_array( $product ) && ! empty( $product['name'] ) ) {
+            return (string) $product['name'];
+        }
+        // Defensive fallback for object-shape (future schema changes)
+        if ( is_object( $product ) && ! empty( $product->name ) ) {
+            return (string) $product->name;
+        }
+        return $sku;
     }
 }
 
@@ -9944,45 +9978,59 @@ if ( ! function_exists( 'dinoco_sn_get_renewable_plate_count' ) ) {
      */
     function dinoco_sn_get_renewable_plate_count( $sn_or_row, $window_days = 7 ) {
         global $wpdb;
+        // V.0.55 (2026-05-18) — REWRITE: V.0.53 SQL referenced nonexistent
+        // columns (m.sn_id, p.warranty_end) + 'extended' status (not in FSM)
+        // → silent return 1 always → SET-context banner never appeared.
+        // sn_pool/sn_pool_meta FK is `sn` (varchar PK), not `sn_id`.
+        // warranty_until lives in postmeta on registered_warranty_id CPT,
+        // not on pool. window_days param retained for API compat but no
+        // longer used (boss policy: all SET-context siblings renew as bundle
+        // regardless of staggered expiry).
         $row = null;
-        if ( is_object( $sn_or_row ) || is_array( $sn_or_row ) ) {
+        $sn  = '';
+        if ( is_object( $sn_or_row ) ) {
             $row = $sn_or_row;
-        } elseif ( is_string( $sn_or_row ) && $sn_or_row !== '' && function_exists( 'dinoco_sn_get_pool_row' ) ) {
-            $row = dinoco_sn_get_pool_row( $sn_or_row );
+            $sn  = strtoupper( (string) ( $sn_or_row->sn ?? '' ) );
+        } elseif ( is_array( $sn_or_row ) ) {
+            $row = (object) $sn_or_row;
+            $sn  = strtoupper( (string) ( $sn_or_row['sn'] ?? '' ) );
+        } elseif ( is_string( $sn_or_row ) && $sn_or_row !== '' ) {
+            $sn = strtoupper( $sn_or_row );
+            if ( function_exists( 'dinoco_sn_get_pool_row' ) ) {
+                $row = dinoco_sn_get_pool_row( $sn );
+            } elseif ( function_exists( 'dinoco_sn_get_plate_data' ) ) {
+                $row = dinoco_sn_get_plate_data( $sn );
+            }
         }
-        if ( empty( $row ) ) return 1;
+        if ( empty( $row ) || $sn === '' ) return 1;
 
-        $get = function( $row, $key ) {
-            if ( is_object( $row ) ) return isset( $row->$key ) ? $row->$key : null;
-            if ( is_array( $row ) )  return isset( $row[ $key ] ) ? $row[ $key ] : null;
-            return null;
-        };
+        $user_id = (int) ( is_object( $row ) ? ( $row->registered_user_id ?? 0 ) : ( $row['registered_user_id'] ?? 0 ) );
+        if ( $user_id <= 0 ) return 1;
 
-        $top_set = (string) $get( $row, 'top_set_sku' );
-        $user_id = (int) $get( $row, 'registered_user_id' );
-        $warranty_end = (string) $get( $row, 'warranty_end' );
+        // Resolve top_set_sku via pool_meta (separate table — pool row may
+        // not have it pre-joined).
+        $tbl_pool = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'pool' ) : ( $wpdb->prefix . 'dinoco_sn_pool' );
+        $tbl_meta = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'pool_meta' ) : ( $wpdb->prefix . 'dinoco_sn_pool_meta' );
+        if ( $tbl_pool === '' || $tbl_meta === '' ) return 1;
 
-        // Single purchase (no SET context) → always 1
-        if ( $top_set === '' || $user_id <= 0 || $warranty_end === '' ) {
-            return 1;
-        }
+        $top_set = (string) $wpdb->get_var( $wpdb->prepare(
+            "SELECT top_set_sku FROM {$tbl_meta} WHERE sn = %s LIMIT 1", $sn
+        ) );
+        if ( $top_set === '' ) return 1; // Single purchase — no SET context
 
-        // Count SNs in same SET-context for same user expiring within window
-        $tbl_pool = $wpdb->prefix . 'dinoco_sn_pool';
-        $tbl_meta = $wpdb->prefix . 'dinoco_sn_pool_meta';
-
-        $sql = $wpdb->prepare(
+        // Count SET-context siblings (same user, registered status, NOT this SN).
+        // Then add 1 for this SN itself = total plates in bundle.
+        $siblings = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*)
-             FROM {$tbl_pool} p
-             INNER JOIN {$tbl_meta} m ON m.sn_id = p.id
-             WHERE m.top_set_sku = %s
-               AND p.registered_user_id = %d
-               AND p.status IN ('registered', 'extended')
-               AND p.warranty_end BETWEEN DATE_SUB(%s, INTERVAL %d DAY) AND DATE_ADD(%s, INTERVAL %d DAY)",
-            $top_set, $user_id, $warranty_end, $window_days, $warranty_end, $window_days
-        );
-        $count = (int) $wpdb->get_var( $sql );
-        return max( 1, $count );
+               FROM {$tbl_pool} p
+               INNER JOIN {$tbl_meta} m ON m.sn = p.sn
+              WHERE m.top_set_sku = %s
+                AND p.registered_user_id = %d
+                AND p.status = 'registered'
+                AND p.sn != %s",
+            $top_set, $user_id, $sn
+        ) );
+        return max( 1, 1 + $siblings );
     }
 }
 
@@ -10242,15 +10290,16 @@ if ( ! function_exists( 'dinoco_sn_rest_marketplace_quote' ) ) {
             ? dinoco_sn_extension_available( $renewable_sku )
             : array();
 
+        // V.0.55 BLOCKER-1 fix: DINOCO_Catalog returns ARRAY_A with `name` column
         $product_name = '';
         if ( $renewable_sku !== '' && class_exists( 'DINOCO_Catalog' ) ) {
             $prod = DINOCO_Catalog::get_by_sku( $renewable_sku );
-            if ( $prod && isset( $prod->title ) ) $product_name = (string) $prod->title;
+            if ( is_array( $prod ) && ! empty( $prod['name'] ) ) $product_name = (string) $prod['name'];
         }
-        // Fallback to leaf name if SET SKU has no catalog title (shouldn't happen but defensive)
+        // Fallback to leaf name if SET SKU has no catalog name (shouldn't happen but defensive)
         if ( $product_name === '' && $linked_sku !== '' && class_exists( 'DINOCO_Catalog' ) ) {
             $prod = DINOCO_Catalog::get_by_sku( $linked_sku );
-            if ( $prod && isset( $prod->title ) ) $product_name = (string) $prod->title;
+            if ( is_array( $prod ) && ! empty( $prod['name'] ) ) $product_name = (string) $prod['name'];
         }
 
         $options = array();
@@ -10846,8 +10895,9 @@ if ( ! function_exists( 'dinoco_sn_rest_marketplace_receipt_render' ) ) {
             $plate = dinoco_sn_pool_get( $ext->sn );
             if ( $plate && ! empty( $plate->top_set_sku ) && class_exists( 'DINOCO_Catalog' ) ) {
                 $prod = DINOCO_Catalog::get_by_sku( $plate->top_set_sku );
-                if ( $prod && ! empty( $prod->title ) ) {
-                    $product_name = $prod->title;
+                // V.0.55 BLOCKER-1 fix: DINOCO_Catalog returns ARRAY_A with `name` column
+                if ( is_array( $prod ) && ! empty( $prod['name'] ) ) {
+                    $product_name = (string) $prod['name'];
                 }
             }
         }
@@ -11466,12 +11516,24 @@ if ( ! function_exists( 'dinoco_sn_apply_warranty_extension' ) ) {
                 update_post_meta( $warranty_id, 'warranty_until', $new_end );
             }
 
-            // V.0.54 — Boss decision 2026-05-18 (project_extension_renewal_policy.md):
+            // V.0.55 — Boss decision 2026-05-18 (project_extension_renewal_policy.md):
             //   "ถ้าเป็นชุดก็ต่ออายุเป็นชุด"
-            //   Fan-out: if this SN belongs to a SET context (top_set_sku populated),
-            //   extend ALL sibling plates owned by the same user that share the same
-            //   top_set_sku context. Within the same transaction so all-or-nothing.
-            //   Uses sn_pool_meta join (V.0.53 helper pattern).
+            //
+            //   Fan-out semantics (Option A — re-base to $new_end):
+            //   All SET-context siblings align to $new_end (the renewed SN's
+            //   new end), NOT $sib_current + years. This prevents double-
+            //   extension when a sibling was already renewed separately
+            //   pre-V.0.54 — that sibling stays at its longer end (we never
+            //   shorten a warranty).
+            //
+            //   V.0.55 fixes from R3 review:
+            //   - HIGH-1 (fullstack): re-base to $new_end (not sib_current + years)
+            //   - MED-4: removed redundant BINARY UPPER wrap on JOIN (non-SARGable);
+            //     SNs are stored uppercase by convention + utf8mb4_bin collation
+            //     is already case-sensitive
+            //   - code-review BLOCKER: postmeta SELECT FOR UPDATE + atomic
+            //     wpdb->update (bypasses cache) prevents stale-read race
+            //   - LOW-1: pre-prime postmeta cache for warranty_ids batch
             $set_siblings_extended = 0;
             $tbl_meta = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'pool_meta' ) : '';
             if ( $tbl_meta && function_exists( 'dinoco_sn_get_renewable_sku' ) ) {
@@ -11484,34 +11546,79 @@ if ( ! function_exists( 'dinoco_sn_apply_warranty_extension' ) ) {
                 }
                 if ( $top_set_sku !== '' ) {
                     // Find SET-context siblings: same top_set_sku, same owner, registered, not this SN.
-                    // Lock for UPDATE to serialize against concurrent renewals on sibling plates.
+                    // FOR UPDATE locks pool + pool_meta rows (NOT postmeta — that's per-sibling below).
                     $siblings = $wpdb->get_results( $wpdb->prepare(
                         "SELECT p.sn, p.registered_warranty_id
                            FROM {$tbl_pool} p
-                           INNER JOIN {$tbl_meta} m ON BINARY UPPER(m.sn) = BINARY UPPER(p.sn)
-                          WHERE BINARY UPPER(m.top_set_sku) = %s
+                           INNER JOIN {$tbl_meta} m ON m.sn = p.sn
+                          WHERE m.top_set_sku = %s
                             AND p.registered_user_id = %d
                             AND p.status = 'registered'
-                            AND BINARY UPPER(p.sn) != %s
+                            AND p.sn != %s
                           FOR UPDATE",
                         $top_set_sku, (int) $pool->registered_user_id, $sn
                     ) );
-                    if ( is_array( $siblings ) ) {
+                    if ( is_array( $siblings ) && ! empty( $siblings ) ) {
+                        // LOW-1: pre-prime postmeta cache (eliminates N+1 read pattern)
+                        $warranty_ids = array_filter( array_map( function( $s ) {
+                            return (int) $s->registered_warranty_id;
+                        }, $siblings ) );
+                        if ( ! empty( $warranty_ids ) && function_exists( 'update_meta_cache' ) ) {
+                            update_meta_cache( 'post', $warranty_ids );
+                        }
                         foreach ( $siblings as $sib ) {
                             $sib_wid = (int) $sib->registered_warranty_id;
-                            if ( $sib_wid > 0 ) {
-                                // Read sibling current warranty_until + extend by same years
-                                $sib_current = (string) get_post_meta( $sib_wid, 'warranty_until', true );
-                                if ( $sib_current === '' ) $sib_current = $current_end;
-                                $sib_new = dinoco_sn_marketplace_compute_new_warranty_end( $sib_current, $years );
-                                if ( $sib_new ) {
-                                    update_post_meta( $sib_wid, 'warranty_until', $sib_new );
-                                    $set_siblings_extended++;
-                                    if ( function_exists( 'dinoco_sn_audit_log' ) ) {
-                                        dinoco_sn_audit_log( (string) $sib->sn, 'warranty_extended_set_sibling', null, null, array(
-                                            'extension_id'        => $extension_id,
-                                            'parent_sn'           => $sn,
-                                            'top_set_sku'         => $top_set_sku,
+                            if ( $sib_wid <= 0 ) continue;
+                            // Atomic read with FOR UPDATE on postmeta row
+                            // (bypasses object cache + locks against parallel renewal)
+                            $sib_meta_row = $wpdb->get_row( $wpdb->prepare(
+                                "SELECT meta_id, meta_value FROM {$wpdb->postmeta}
+                                  WHERE post_id = %d AND meta_key = 'warranty_until'
+                                  LIMIT 1 FOR UPDATE",
+                                $sib_wid
+                            ) );
+                            $sib_current = $sib_meta_row ? (string) $sib_meta_row->meta_value : '';
+                            if ( $sib_current === '' ) $sib_current = $current_end;
+
+                            // Boss policy: align to $new_end (re-base to renewed SN).
+                            // Skip if sibling already has LONGER warranty
+                            // (never shorten — protects legacy per-leaf renewals).
+                            $sib_current_ts = strtotime( $sib_current ) ?: 0;
+                            $new_end_ts     = strtotime( $new_end ) ?: 0;
+                            if ( $sib_current_ts >= $new_end_ts ) {
+                                // Sibling already further out — skip
+                                continue;
+                            }
+                            $sib_new = $new_end;
+
+                            // Direct UPDATE bypasses ACF cache + uses postmeta row lock
+                            if ( $sib_meta_row ) {
+                                $upd = $wpdb->update(
+                                    $wpdb->postmeta,
+                                    array( 'meta_value' => $sib_new ),
+                                    array( 'meta_id' => (int) $sib_meta_row->meta_id ),
+                                    array( '%s' ), array( '%d' )
+                                );
+                            } else {
+                                // Sibling has no warranty_until row yet — insert
+                                $upd = $wpdb->insert(
+                                    $wpdb->postmeta,
+                                    array(
+                                        'post_id'    => $sib_wid,
+                                        'meta_key'   => 'warranty_until',
+                                        'meta_value' => $sib_new,
+                                    ),
+                                    array( '%d', '%s', '%s' )
+                                );
+                            }
+                            if ( $upd !== false ) {
+                                wp_cache_delete( $sib_wid, 'post_meta' );
+                                $set_siblings_extended++;
+                                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                                    dinoco_sn_audit_log( (string) $sib->sn, 'warranty_extended_set_sibling', null, null, array(
+                                        'extension_id'        => $extension_id,
+                                        'parent_sn'           => $sn,
+                                        'top_set_sku'         => $top_set_sku,
                                             'warranty_until_old'  => $sib_current,
                                             'warranty_until_new'  => $sib_new,
                                             'years_added'         => $years,
@@ -11522,9 +11629,9 @@ if ( ! function_exists( 'dinoco_sn_apply_warranty_extension' ) ) {
                         }
                     }
                 }
-            }
 
             // UPDATE extensions row — ensure warranty_until_old/new accurate + paid_at if not set
+            // (V.0.55 brace audit: 6 closes balance 6 opens in fan-out block)
             $now = current_time( 'mysql' );
             $upd_data = array(
                 'warranty_until_old' => $current_end,

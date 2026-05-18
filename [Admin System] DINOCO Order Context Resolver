@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Order Context Resolver                    ║
+ * ║  Version: V.1.1 (2026-05-18) — R3 audit HIGH-1 + MED-1:          ║
+ * ║    • HIGH-1 (security): auto-tag race fix. save_post_b2b_order   ║
+ * ║      fires BEFORE _b2b_is_walkin marker lands → walk-in orders   ║
+ * ║      mis-tagged as b2b_distributor + sticky guard prevents       ║
+ * ║      correction. Now defers via wp_schedule_single_event +5s so  ║
+ * ║      ACF + walk-in markers settle first. NEW handler             ║
+ * ║      dinoco_order_context_deferred_tag_handler bound to cron.    ║
+ * ║    • HIGH-1 (review): register_post_meta(show_in_rest=false +    ║
+ * ║      auth_callback=manage_options) on _dinoco_order_context so   ║
+ * ║      VAT-routing tag cannot leak via WP REST or be modified by   ║
+ * ║      non-admin. Mirrors BO Snippet 16 V.1.6 C3 hardening.        ║
+ * ║    • MED-1: removed dead `=== 1` (int) branch — value is already ║
+ * ║      cast to string above.                                       ║
  * ║  Version: V.1.0 (2026-05-18)                                     ║
  * ║  DB_ID: 1222                                                     ║
  * ║                                                                   ║
@@ -109,8 +122,10 @@ if ( ! function_exists( 'dinoco_order_context' ) ) {
             return DINOCO_ORDER_CTX_B2B_MANUAL_INVOICE;
         }
 
+        // V.1.1: cast to string above makes `=== 1` (int) branch dead — removed.
+        // _b2b_is_walkin is written as string '1' by Snippet 3 line 1118.
         $is_walkin = (string) get_post_meta( $order_id, '_b2b_is_walkin', true );
-        if ( $is_walkin === '1' || $is_walkin === 1 ) {
+        if ( $is_walkin === '1' ) {
             return DINOCO_ORDER_CTX_B2B_WALKIN;
         }
 
@@ -184,27 +199,66 @@ if ( ! function_exists( 'dinoco_order_context_set' ) ) {
 
 if ( ! function_exists( 'dinoco_order_context_auto_tag' ) ) {
     /**
-     * Auto-tag fires on save_post_b2b_order — idempotent.
-     * Only sets meta if currently empty (preserves manual admin overrides).
+     * V.1.1 HIGH-1 fix: DEFER auto-tag to next tick via wp_schedule_single_event.
+     *
+     * Original bug: save_post_b2b_order fires inside wp_insert_post() — at that
+     * instant, _b2b_is_walkin meta is NOT yet set (the place-order handler
+     * writes it AFTER wp_insert_post returns). With priority 99 we still ran
+     * BEFORE the walk-in marker landed → walk-in orders mis-tagged as
+     * b2b_distributor + the "skip if already tagged" guard then prevented
+     * correction → silent permanent mis-classification.
+     *
+     * Fix: defer 5 seconds so all ACF + meta writes in the request settle
+     * before we infer the context. wp_schedule_single_event() dedupes
+     * same-args same-timestamp so rapid re-saves don't fan out.
      */
     function dinoco_order_context_auto_tag( $post_id, $post = null, $update = false ) {
         $post_id = (int) $post_id;
         if ( $post_id <= 0 ) return;
-        // Skip auto-saves + revisions
         if ( wp_is_post_autosave( $post_id ) || wp_is_post_revision( $post_id ) ) return;
-        // Skip if already tagged (avoid clobbering admin override)
+        // Skip if already tagged (avoid clobbering admin override / deferred-fire chains)
         $existing = (string) get_post_meta( $post_id, DINOCO_ORDER_CTX_META_KEY, true );
         if ( $existing !== '' ) return;
-        // Resolve via inference + persist
+        // Defer 5s so walk-in marker + ACF writes settle first
+        if ( ! wp_next_scheduled( 'dinoco_order_context_deferred_tag', array( $post_id ) ) ) {
+            wp_schedule_single_event( time() + 5, 'dinoco_order_context_deferred_tag', array( $post_id ) );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_order_context_deferred_tag_handler' ) ) {
+    function dinoco_order_context_deferred_tag_handler( $post_id ) {
+        $post_id = (int) $post_id;
+        if ( $post_id <= 0 ) return;
+        // Re-check existing tag (admin may have set during defer window)
+        $existing = (string) get_post_meta( $post_id, DINOCO_ORDER_CTX_META_KEY, true );
+        if ( $existing !== '' ) return;
         $ctx = dinoco_order_context( $post_id );
         if ( $ctx !== DINOCO_ORDER_CTX_UNKNOWN ) {
             update_post_meta( $post_id, DINOCO_ORDER_CTX_META_KEY, $ctx );
         }
     }
 }
+add_action( 'dinoco_order_context_deferred_tag', 'dinoco_order_context_deferred_tag_handler', 10, 1 );
 
 // Wire to b2b_order CPT save (priority 99 = AFTER Manual Invoice + walk-in markers).
 add_action( 'save_post_b2b_order', 'dinoco_order_context_auto_tag', 99, 3 );
+
+/* V.1.1 HIGH-1 (review) — register_post_meta with show_in_rest=false +
+ * auth_callback=manage_options so the order-context tag (which classifies
+ * orders for VAT routing) cannot leak via WP REST API or be modified by
+ * non-admin callers. Mirrors BO Snippet 16 V.1.6 C3 hardening pattern. */
+if ( ! function_exists( 'dinoco_order_context_register_meta' ) ) {
+    function dinoco_order_context_register_meta() {
+        register_post_meta( 'b2b_order', DINOCO_ORDER_CTX_META_KEY, array(
+            'show_in_rest'  => false,
+            'single'        => true,
+            'type'          => 'string',
+            'auth_callback' => function() { return current_user_can( 'manage_options' ); },
+        ) );
+    }
+}
+add_action( 'init', 'dinoco_order_context_register_meta', 20 );
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 4. ADMIN BACKFILL HELPER (manual trigger via WP-CLI or admin button)

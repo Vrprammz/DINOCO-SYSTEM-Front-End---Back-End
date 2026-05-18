@@ -1,6 +1,14 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO VAT Monthly Export                        ║
+ * ║  Version: V.1.1 (2026-05-18) — R3 audit CRIT-3 + HIGH-2 + BLK-1: ║
+ * ║    • CRIT-3 (OWASP CSV Injection): dinoco_vat_export_csv_escape  ║
+ * ║      now neutralizes =/+/-/@/tab/CR formula triggers (prefix     ║
+ * ║      single-quote) + strips embedded CR/LF. Closes Excel/Sheets  ║
+ * ║      RCE class via customer-controlled display_name.             ║
+ * ║    • HIGH-2: CSV download via POST form submit (was GET +        ║
+ * ║      _wpnonce in URL → server log leak). Endpoint accepts both.  ║
+ * ║    • BLOCKER-1: DINOCO_Catalog ARRAY_A column `name` (was title).║
  * ║  Version: V.1.0 (2026-05-18)                                     ║
  * ║  DB_ID: 1225                                                     ║
  * ║                                                                   ║
@@ -154,7 +162,8 @@ if ( ! function_exists( 'dinoco_vat_export_query' ) ) {
             $product_name = '';
             if ( $renewable_sku !== '' && class_exists( 'DINOCO_Catalog' ) ) {
                 $prod = DINOCO_Catalog::get_by_sku( $renewable_sku );
-                if ( $prod && isset( $prod->title ) ) $product_name = (string) $prod->title;
+                // V.1.1 BLOCKER-1 fix: DINOCO_Catalog returns ARRAY_A with `name` column
+                if ( is_array( $prod ) && ! empty( $prod['name'] ) ) $product_name = (string) $prod['name'];
             }
             $years = (int) max( 1, round( ( (int) $r['extension_months'] ) / 12 ) );
             $item_desc = sprintf( 'ต่ออายุประกัน %d ปี — %s', $years, $product_name ?: $renewable_sku );
@@ -217,6 +226,17 @@ if ( ! function_exists( 'dinoco_vat_export_summary' ) ) {
 if ( ! function_exists( 'dinoco_vat_export_csv_escape' ) ) {
     function dinoco_vat_export_csv_escape( $v ) {
         $v = (string) $v;
+        // V.1.1 CRIT-3: CSV formula injection defense per OWASP CSV Injection
+        // Prevention Cheat Sheet. If cell starts with =/+/-/@/tab/CR, Excel +
+        // Google Sheets + LibreOffice interpret as formula (CVE-class:
+        // arbitrary URL exfil via WEBSERVICE/HYPERLINK, DDE command exec).
+        // Mitigation: prefix with single quote — Excel hides it on display
+        // but neutralizes formula execution.
+        // Also: strip embedded CR/LF that some parsers treat as new record.
+        if ( $v !== '' && strpbrk( $v[0], "=+-@\t\r" ) !== false ) {
+            $v = "'" . $v;
+        }
+        $v = str_replace( array( "\r\n", "\r", "\n" ), ' ', $v );
         // Always quote — safest for Thai content + commas/newlines
         return '"' . str_replace( '"', '""', $v ) . '"';
     }
@@ -453,9 +473,25 @@ if ( ! function_exists( 'dinoco_vat_export_render_admin_ui' ) ) {
 
             $('dnc-vat-download-btn').addEventListener('click', function(){
                 var ym = getYM();
-                // CSV endpoint streams directly — open in new tab so browser downloads
-                var url = API_ROOT + 'export/csv?year=' + ym.year + '&month=' + ym.month + '&_wpnonce=' + encodeURIComponent(NONCE);
-                window.location.href = url;
+                // V.1.1 HIGH-2 (security): POST form submit instead of GET — keeps
+                // nonce out of URL (server logs / browser history / referer / proxy
+                // caches). Endpoint already manage_options-gated; nonce is CSRF
+                // defense-in-depth.
+                var f = document.createElement('form');
+                f.method = 'POST';
+                f.action = API_ROOT + 'export/csv';
+                f.style.display = 'none';
+                ['year','month','_wpnonce'].forEach(function(k, i){
+                    var v = [ym.year, ym.month, NONCE][i];
+                    var inp = document.createElement('input');
+                    inp.type  = 'hidden';
+                    inp.name  = k;
+                    inp.value = v;
+                    f.appendChild(inp);
+                });
+                document.body.appendChild(f);
+                f.submit();
+                setTimeout(function(){ document.body.removeChild(f); }, 1000);
             });
         })();
         </script>
@@ -499,7 +535,9 @@ add_action( 'rest_api_init', function() {
     ) );
 
     register_rest_route( 'dinoco-vat/v1', '/export/csv', array(
-        'methods'             => 'GET',
+        // V.1.1 HIGH-2: accept POST (preferred — no nonce-in-URL leak) + GET
+        // (back-compat for direct curl). Endpoint manage_options-gated.
+        'methods'             => array( 'GET', 'POST' ),
         'callback'            => function( $req ) {
             $y = (int) ( $req->get_param( 'year' ) ?: date( 'Y' ) );
             $m = (int) ( $req->get_param( 'month' ) ?: date( 'n' ) );
@@ -507,8 +545,10 @@ add_action( 'rest_api_init', function() {
 
             // Stream as CSV download (bypass REST envelope)
             $filename = sprintf( 'dinoco-vat-%04d-%02d.csv', $y, $m );
-            header( 'Content-Type: text/csv; charset=UTF-8' );
-            header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
+            if ( ! headers_sent() ) {
+                header( 'Content-Type: text/csv; charset=UTF-8' );
+                header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
+            }
             header( 'Cache-Control: no-store' );
             echo $csv;
             exit;

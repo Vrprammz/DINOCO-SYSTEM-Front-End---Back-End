@@ -1,6 +1,15 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO VAT Receipt                                     ║
+ * ║  Version: V.1.1 (2026-05-18) — R3 audit CRIT-2 + BLOCKER-1 + H-2:║
+ * ║    • CRIT-2: REST /receipt/{id} now (a) requires login (closes   ║
+ * ║      anon enumeration), (b) rate-limited 30/hr per user, (c)     ║
+ * ║      collapses 403/404/409 → single 404 (no oracle), (d) sends   ║
+ * ║      Cache-Control: no-store, (e) defensive headers_sent check.  ║
+ * ║    • BLOCKER-1: DINOCO_Catalog returns ARRAY_A (column `name`).  ║
+ * ║      Fixed 1 site in assemble_data (was $prod->title).           ║
+ * ║    • HIGH-2: removed inline onclick=window.print() → data-action ║
+ * ║      + event delegation (UX-H3 baseline compliance).             ║
  * ║  Version: V.1.0 (2026-05-18)                                     ║
  * ║  DB_ID: 1223                                                     ║
  * ║                                                                   ║
@@ -180,7 +189,8 @@ if ( ! function_exists( 'dinoco_vat_receipt_assemble_data' ) ) {
         }
         if ( $renewable_sku !== '' && class_exists( 'DINOCO_Catalog' ) ) {
             $prod = DINOCO_Catalog::get_by_sku( $renewable_sku );
-            if ( $prod && isset( $prod->title ) ) $product_name = (string) $prod->title;
+            // V.1.1 BLOCKER-1 fix: DINOCO_Catalog returns ARRAY_A with `name` column
+            if ( is_array( $prod ) && ! empty( $prod['name'] ) ) $product_name = (string) $prod['name'];
         }
         if ( function_exists( 'dinoco_sn_get_renewable_plate_count' ) && $pool ) {
             $plate_count = (int) dinoco_sn_get_renewable_plate_count( $pool );
@@ -419,8 +429,17 @@ html, body { margin: 0; padding: 0; background: #fff; color: #111; font-family: 
 </div>
 
 <div class="dnc-vat-no-print" style="text-align:center;margin:20px;">
-  <button onclick="window.print()" style="padding:10px 20px;background:#1f2937;color:#fff;border:0;border-radius:6px;cursor:pointer;">🖨️ พิมพ์ใบกำกับภาษี</button>
+  <button data-dnc-vat-action="print" style="padding:10px 20px;background:#1f2937;color:#fff;border:0;border-radius:6px;cursor:pointer;">🖨️ พิมพ์ใบกำกับภาษี</button>
 </div>
+<script>
+// V.1.1 HIGH-2 UX-H3 compliance: event delegation instead of inline onclick.
+(function(){
+    document.addEventListener('click', function(e){
+        var t = e.target && e.target.closest && e.target.closest('[data-dnc-vat-action="print"]');
+        if (t) { window.print(); }
+    });
+})();
+</script>
 
 </body>
 </html><?php
@@ -580,26 +599,55 @@ if ( ! function_exists( 'dinoco_vat_receipt_rest_pull' ) ) {
         $extension_id = (int) $req['id'];
         $format = $req->get_param( 'format' ) === 'png' ? 'png' : 'html';
 
-        // Permission: admin can pull any, customer can only pull their own
+        // V.1.1 CRIT-2: per-user rate limit (defense against mass enumeration).
+        // Admin bypasses the limit (legit admin diagnostic workflows).
         $is_admin = current_user_can( 'manage_options' );
-        if ( ! $is_admin ) {
-            $uid = get_current_user_id();
-            if ( $uid <= 0 ) {
-                return new WP_Error( 'rest_forbidden', 'login required', array( 'status' => 401 ) );
+        $uid_for_rl = get_current_user_id();
+        if ( ! $is_admin && $uid_for_rl > 0 && function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( "vat_receipt_pull_{$uid_for_rl}", 30, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+
+        // V.1.1 CRIT-2: require login BEFORE any other check (prevents
+        // anonymous enumeration mapping ext_id space via 401 vs 404 ratio).
+        if ( ! is_user_logged_in() ) {
+            return new WP_Error( 'rest_not_logged_in', __( 'ไม่พบเอกสาร', 'dinoco-vat' ),
+                array( 'status' => 404 ) );
+        }
+
+        // V.1.1 CRIT-2: collapse all "no receipt for you" responses to a
+        // single 404 so attackers can't differentiate:
+        //   - extension exists but isn't yours (used to be 403)
+        //   - extension exists but not paid yet (used to be 409)
+        //   - extension doesn't exist (404)
+        // Log the actual reason server-side for admin investigation only.
+        $log_reason = function( $reason ) use ( $extension_id, $uid_for_rl ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'info', 'vat_receipt_access_denied', array(
+                    'extension_id' => $extension_id,
+                    'caller_uid'   => $uid_for_rl,
+                    'reason'       => $reason,
+                ) );
             }
+        };
+
+        if ( ! $is_admin ) {
             $tbl_ext = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'extensions' ) : '';
             $owner = $tbl_ext ? (int) $wpdb->get_var( $wpdb->prepare(
                 "SELECT user_id FROM {$tbl_ext} WHERE id = %d LIMIT 1", $extension_id
             ) ) : 0;
-            if ( $owner !== $uid ) {
-                return new WP_Error( 'rest_forbidden', 'not owner', array( 'status' => 403 ) );
+            if ( $owner !== $uid_for_rl ) {
+                $log_reason( $owner === 0 ? 'not_found' : 'not_owner' );
+                return new WP_Error( 'not_found', __( 'ไม่พบเอกสาร', 'dinoco-vat' ),
+                    array( 'status' => 404 ) );
             }
         }
 
         $eligible = dinoco_vat_receipt_extension_is_eligible( $extension_id );
         if ( ! $eligible['eligible'] ) {
-            return new WP_Error( 'not_eligible', 'Receipt not available: ' . $eligible['reason'],
-                array( 'status' => 409, 'reason' => $eligible['reason'] ) );
+            $log_reason( $eligible['reason'] );
+            return new WP_Error( 'not_found', __( 'ไม่พบเอกสาร', 'dinoco-vat' ),
+                array( 'status' => 404 ) );
         }
 
         if ( $format === 'png' ) {
@@ -609,9 +657,13 @@ if ( ! function_exists( 'dinoco_vat_receipt_rest_pull' ) ) {
                     array( 'status' => 500 ) );
             }
             // Stream PNG directly (bypass REST envelope)
-            header( 'Content-Type: image/png' );
-            header( 'Content-Disposition: inline; filename="receipt-' .
-                dinoco_vat_receipt_generate_receipt_no( $extension_id ) . '.png"' );
+            // V.1.1: defensive headers_sent check (prevents "headers already sent" warning)
+            if ( ! headers_sent() ) {
+                header( 'Content-Type: image/png' );
+                header( 'Content-Disposition: inline; filename="receipt-' .
+                    dinoco_vat_receipt_generate_receipt_no( $extension_id ) . '.png"' );
+                header( 'Cache-Control: private, no-store' );
+            }
             echo $png;
             exit;
         }
@@ -621,7 +673,10 @@ if ( ! function_exists( 'dinoco_vat_receipt_rest_pull' ) ) {
         if ( $html === '' ) {
             return new WP_Error( 'render_failed', 'HTML renderer failed', array( 'status' => 500 ) );
         }
-        header( 'Content-Type: text/html; charset=utf-8' );
+        if ( ! headers_sent() ) {
+            header( 'Content-Type: text/html; charset=utf-8' );
+            header( 'Cache-Control: private, no-store' );
+        }
         echo $html;
         exit;
     }

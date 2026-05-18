@@ -1,6 +1,16 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO VAT Receipt LINE Push                           ║
+ * ║  Version: V.1.1 (2026-05-18) — R3 audit CRIT-1 + HIGH-3 + MED-2: ║
+ * ║    • CRIT-1: PDPA breach defense — PNG filename now includes     ║
+ * ║      24-char HMAC token (120 bits entropy) derived from ext_id + ║
+ * ║      receipt_no + wp_salt('auth'). Brute force infeasible.       ║
+ * ║      + .htaccess + index.php in upload dir (Apache defense).     ║
+ * ║    • HIGH-3: atomic write via tmp + rename (no partial-file race ║
+ * ║      visible to LINE downloader). LOCK_EX on write.              ║
+ * ║      + 5 MB size cap (storage bomb defense).                     ║
+ * ║      + PNG magic byte check (input validation).                  ║
+ * ║    • MED-2: LINE UID masked in transient (was full UID 30d).     ║
  * ║  Version: V.1.0 (2026-05-18)                                     ║
  * ║  DB_ID: 1224                                                     ║
  * ║                                                                   ║
@@ -62,6 +72,16 @@ if ( ! function_exists( 'dinoco_vat_push_upload_dir' ) ) {
         $dir = trailingslashit( $u['basedir'] ) . 'dinoco-vat-receipts';
         if ( ! file_exists( $dir ) ) {
             wp_mkdir_p( $dir );
+            // V.1.1 CRIT-1: Defense layer 1 — .htaccess deny-all for Apache.
+            // (Nginx ignores .htaccess so we ALSO use HMAC filename — see persist_png)
+            @file_put_contents(
+                trailingslashit( $dir ) . '.htaccess',
+                "# DINOCO VAT Receipts — direct access denied.\n" .
+                "# Access via REST endpoint /dinoco-vat/v1/receipt/{id}?format=png only.\n" .
+                "Order deny,allow\nDeny from all\n" .
+                "<IfModule mod_authz_core.c>\n  Require all denied\n</IfModule>\n"
+            );
+            @file_put_contents( trailingslashit( $dir ) . 'index.php', "<?php // Silence is golden.\n" );
         }
         $url_base = trailingslashit( $u['baseurl'] ) . 'dinoco-vat-receipts';
         return array(
@@ -74,29 +94,79 @@ if ( ! function_exists( 'dinoco_vat_push_upload_dir' ) ) {
 if ( ! function_exists( 'dinoco_vat_push_persist_png' ) ) {
     /**
      * Write PNG bytes to upload dir → return public URL.
-     * Filename deterministic: {ext_id}-{receipt_no}.png so re-renders
-     * overwrite (no orphan accumulation).
+     *
+     * V.1.1 CRIT-1 + HIGH-3 hardening:
+     *   - Filename now includes 24-char HMAC token derived from extension_id +
+     *     receipt_no + wp_salt('auth'). Brute force = 120 bits of entropy.
+     *     This protects PII even on nginx stacks where .htaccess is ignored.
+     *   - 5 MB size cap prevents storage bombs (e.g. font fallback bug
+     *     producing oversized PNG).
+     *   - PNG magic-byte check confirms input is actually PNG.
+     *   - Atomic write via tmp + rename so concurrent readers never see
+     *     a partial file (LINE pulling URL during write race).
      *
      * @param int    $extension_id
      * @param string $png_binary
      * @return string public URL (https), or '' on failure
      */
     function dinoco_vat_push_persist_png( $extension_id, $png_binary ) {
-        if ( $png_binary === '' ) return '';
         $extension_id = (int) $extension_id;
+        if ( $extension_id <= 0 ) return '';
+        if ( $png_binary === '' ) return '';
+
+        // V.1.1 HIGH-3: size cap (5 MB ceiling — receipts should be <500 KB)
+        if ( strlen( $png_binary ) > 5 * 1024 * 1024 ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'vat_receipt_oversize', array(
+                    'extension_id' => $extension_id,
+                    'bytes'        => strlen( $png_binary ),
+                ) );
+            }
+            return '';
+        }
+        // V.1.1 HIGH-3: PNG magic byte check
+        if ( substr( $png_binary, 0, 8 ) !== "\x89PNG\r\n\x1a\n" ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'vat_receipt_not_png', array(
+                    'extension_id' => $extension_id,
+                ) );
+            }
+            return '';
+        }
+
         if ( ! function_exists( 'dinoco_vat_receipt_generate_receipt_no' ) ) return '';
         $receipt_no = dinoco_vat_receipt_generate_receipt_no( $extension_id );
         if ( $receipt_no === '' ) return '';
 
+        // V.1.1 CRIT-1: HMAC-derived filename token (24 chars = 120 bits entropy)
+        // Brute force requires guessing 2^120 → infeasible. Even with leaked URL
+        // structure attacker cannot forge a filename for another extension_id.
+        $token = substr( hash_hmac( 'sha256', $extension_id . '|' . $receipt_no, wp_salt( 'auth' ) ), 0, 24 );
+
         $paths = dinoco_vat_push_upload_dir();
-        $fname = $extension_id . '-' . $receipt_no . '.png';
+        $fname = $extension_id . '-' . $receipt_no . '-' . $token . '.png';
         $fpath = trailingslashit( $paths['dir'] ) . $fname;
-        $written = file_put_contents( $fpath, $png_binary );
+
+        // V.1.1 HIGH-3: atomic write via tmp + rename
+        $tmp = $fpath . '.tmp.' . wp_generate_password( 8, false );
+        $written = file_put_contents( $tmp, $png_binary, LOCK_EX );
         if ( $written === false ) {
+            @unlink( $tmp );
             if ( function_exists( 'dinoco_obs_capture' ) ) {
                 dinoco_obs_capture( 'warning', 'vat_receipt_write_failed', array(
                     'extension_id' => $extension_id,
                     'path'         => $fpath,
+                ) );
+            }
+            return '';
+        }
+        if ( ! @rename( $tmp, $fpath ) ) {
+            @unlink( $tmp );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'vat_receipt_rename_failed', array(
+                    'extension_id' => $extension_id,
+                    'tmp_path'     => $tmp,
+                    'final_path'   => $fpath,
                 ) );
             }
             return '';
@@ -122,9 +192,12 @@ if ( ! function_exists( 'dinoco_vat_push_is_already_sent' ) ) {
 if ( ! function_exists( 'dinoco_vat_push_mark_sent' ) ) {
     function dinoco_vat_push_mark_sent( $extension_id, $line_uid = '' ) {
         $key = 'dinoco_vat_pushed_' . (int) $extension_id;
+        // V.1.1 MED-2: store masked LINE UID only — full UID in wp_options
+        // is readable by any plugin with options access (PDPA leak risk).
+        $masked = $line_uid !== '' ? substr( (string) $line_uid, 0, 4 ) . '****' : '';
         $payload = array(
             'sent_at'  => current_time( 'mysql' ),
-            'line_uid' => (string) $line_uid,
+            'line_uid' => $masked,
         );
         // 30 day TTL — long enough that idempotency holds for retry burst
         set_transient( $key, $payload, 30 * DAY_IN_SECONDS );
