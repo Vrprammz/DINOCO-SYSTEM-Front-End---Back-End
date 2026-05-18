@@ -76,12 +76,49 @@ if ($flag_verbose) {
 }
 
 /* ──────────────────────────────────────────────────────────────────
+ * 2a. GLOBAL PRE-PASS — build cross-file symbol table for CONSTANT
+ *     namespace literals (e.g. DINOCO_SN_REST_NAMESPACE defined in SN
+ *     Manager but referenced in SN REST API + Reconciliation + Approval).
+ *
+ *     V.1.1 MED-6 fix: previous per-file pre-pass missed 48 routes that
+ *     reference constants defined in a different file. Now: 2-pass —
+ *     scan all files for `define()` first, then parse each file's
+ *     register_rest_route() with full global symbol table available.
+ *
+ *     Variables ($ns) remain per-file (PHP runtime scope).
+ * ────────────────────────────────────────────────────────────────── */
+
+$global_const_sym = []; // CONSTANT_NAME => literal string
+foreach ($snippet_files as $fp) {
+    $src = @file_get_contents($fp);
+    if ($src === false) continue;
+    // Match: define( 'X', 'value' ) OR define('X','value') OR
+    //        define( "X", "value" ). Inside if (!defined(...)) guards still matches.
+    if (preg_match_all('/define\s*\(\s*[\'"]([A-Z_][A-Z0-9_]*)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $src, $cm)) {
+        foreach ($cm[1] as $idx => $cname) {
+            $cval = $cm[2][$idx];
+            // Heuristic: looks like REST namespace
+            if (preg_match('#^[a-z0-9-]+/v\d+#i', $cval)) {
+                // First definition wins (later files don't redefine identically — PHP runtime)
+                if (!isset($global_const_sym[$cname])) {
+                    $global_const_sym[$cname] = $cval;
+                }
+            }
+        }
+    }
+}
+if ($flag_verbose) {
+    fprintf(STDERR, "[autogen] Global constant pre-pass: %d namespace constants resolved\n", count($global_const_sym));
+}
+
+/* ──────────────────────────────────────────────────────────────────
  * 2. Parse register_rest_route() — extract namespace + route + methods
  * ────────────────────────────────────────────────────────────────── */
 
 $paths_by_ns = []; // [ namespace => [ path => [methods => [meta]] ] ]
 $parse_errors = [];
 $total_routes = 0;
+$skipped_unresolved = []; // namespace_token => [file:line, ...]
 
 foreach ($snippet_files as $fp) {
     $src = file_get_contents($fp);
@@ -91,9 +128,10 @@ foreach ($snippet_files as $fp) {
     }
     $base = basename($fp);
 
-    // ─ Pre-pass: build symbol table for $variable + CONSTANT namespace literals
-    $sym = []; // name => literal string
-    // Variable assignments: $ns = 'b2f/v1';   OR   $namespace = "ns";
+    // ─ Pre-pass: build per-file symbol table for $variable namespace literals.
+    // Constants resolved via $global_const_sym (cross-file).
+    $sym = $global_const_sym; // start with global constants
+    // Form 1: Variable assignments to LITERAL — `$ns = 'b2f/v1';`
     if (preg_match_all('/\$([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*[\'"]([^\'"]+)[\'"]/', $src, $vm)) {
         foreach ($vm[1] as $idx => $vname) {
             $vval = $vm[2][$idx];
@@ -103,13 +141,25 @@ foreach ($snippet_files as $fp) {
             }
         }
     }
-    // define( 'CONST', 'value' );
-    if (preg_match_all('/define\s*\(\s*[\'"]([A-Z_][A-Z0-9_]*)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]/', $src, $cm)) {
-        foreach ($cm[1] as $idx => $cname) {
-            $sym[$cname] = $cm[2][$idx];
+    // V.1.1 MED-6 followup: Form 2: Variable assignments to CONSTANT —
+    // `$ns = DINOCO_SN_REST_NAMESPACE;`. Resolve via global const symbol table.
+    // SN Approval Workflow + Reconciliation use this pattern (13+ routes).
+    if (preg_match_all('/\$([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([A-Z_][A-Z0-9_]*)\s*;/', $src, $vcm)) {
+        foreach ($vcm[1] as $idx => $vname) {
+            $cname = $vcm[2][$idx];
+            if (isset($global_const_sym[$cname])) {
+                $sym['$' . $vname] = $global_const_sym[$cname];
+            }
         }
     }
-    // Also handle define( 'X', 'val' ) within if-not-defined guards (same regex catches this)
+    // V.1.1 MED-6: constants now resolved cross-file via $global_const_sym
+    // (initialized into $sym above). Per-file define() scan removed —
+    // duplicate work, and a constant only defined in another file would
+    // miss here (per-file pre-pass only saw same-file defines).
+    //
+    // Also: per-file define() in non-namespace contexts (e.g. WP options,
+    // table prefixes) were getting indexed into $sym unnecessarily. Global
+    // pre-pass filters by namespace-shape heuristic — cleaner.
 
     // ─ Find register_rest_route calls with balanced-paren extraction
     // (Naive (.*?) breaks on nested arrays — walk char-by-char tracking depth.)
@@ -151,6 +201,7 @@ foreach ($snippet_files as $fp) {
 
         // Extract namespace (1st arg = literal string OR $variable OR CONSTANT)
         $namespace = null;
+        $unresolved_token = null;
         // a) Literal string
         if (preg_match('/^[\s\n]*([\'"])([^\'"]+)\\1/', $args_blob, $ns_match)) {
             $namespace = $ns_match[2];
@@ -162,6 +213,8 @@ foreach ($snippet_files as $fp) {
             if (isset($sym[$sym_key])) {
                 $namespace = $sym[$sym_key];
                 $rest = substr($args_blob, strlen($ns_match[0]));
+            } else {
+                $unresolved_token = $sym_key;
             }
         }
         // c) CONSTANT
@@ -170,9 +223,20 @@ foreach ($snippet_files as $fp) {
             if (isset($sym[$sym_key])) {
                 $namespace = $sym[$sym_key];
                 $rest = substr($args_blob, strlen($ns_match[0]));
+            } else {
+                $unresolved_token = $sym_key;
             }
         }
-        if ($namespace === null) continue;
+        if ($namespace === null) {
+            // V.1.1 MED-6: track unresolved tokens for --verbose reporting
+            if ($unresolved_token !== null) {
+                if (!isset($skipped_unresolved[$unresolved_token])) {
+                    $skipped_unresolved[$unresolved_token] = [];
+                }
+                $skipped_unresolved[$unresolved_token][] = $base . ':' . $line_no;
+            }
+            continue;
+        }
 
         // Strip leading comma
         $rest = ltrim($rest, " \t\n,");
@@ -414,6 +478,23 @@ foreach ($paths_by_ns as $ns => $routes) {
     $verb_count = 0;
     foreach ($routes as $verbs) $verb_count += count($verbs);
     fprintf(STDERR, "  %-40s %3d paths %3d operations\n", $ns, count($routes), $verb_count);
+}
+
+// V.1.1 MED-6: report unresolved tokens (constants/vars never defined)
+if (!empty($skipped_unresolved)) {
+    fprintf(STDERR, "\n[autogen] Skipped routes (unresolved namespace tokens):\n");
+    foreach ($skipped_unresolved as $token => $sites) {
+        fprintf(STDERR, "  %-40s %d route(s)\n", $token, count($sites));
+        if ($flag_verbose) {
+            foreach (array_slice($sites, 0, 5) as $site) {
+                fprintf(STDERR, "      %s\n", $site);
+            }
+            if (count($sites) > 5) {
+                fprintf(STDERR, "      ... and %d more\n", count($sites) - 5);
+            }
+        }
+    }
+    fprintf(STDERR, "  HINT: ensure define('TOKEN', 'ns/v1') exists in some snippet, or pass via \$variable assignment with namespace-shaped value.\n");
 }
 
 exit(0);
