@@ -1,6 +1,16 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO VAT Receipt LINE Push                           ║
+ * ║  Version: V.1.5 (2026-05-18) — Section 4 post-launch hardening:  ║
+ * ║    NEW dinoco_vat_push_admin_alert() helper wired into 4 failure ║
+ * ║    paths (png_renderer_missing / png_render_failed /              ║
+ * ║    png_persist_failed / flex_build_failed / line_push_failed) →  ║
+ * ║    Telegram via b2b_tg_send_dedup ('vat_event' channel), 5-min   ║
+ * ║    dedup per (ext_id, reason) tuple so different failure modes   ║
+ * ║    for same ext alert separately. Customer never knows we failed ║
+ * ║    (Flex not sent) — admin gets actionable alert with /resend    ║
+ * ║    endpoint URL + diagnostic hint inline.                         ║
+ * ║                                                                   ║
  * ║  Version: V.1.4 (2026-05-18) — C-2 proactive fix (no smoke-test  ║
  * ║    needed): bubble restructured to canonical 3-section pattern   ║
  * ║    (header + body + footer) used by ALL other DINOCO Flex        ║
@@ -500,6 +510,49 @@ if ( ! function_exists( 'dinoco_vat_push_build_flex' ) ) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * 4.5 ADMIN ALERT — Telegram for failure paths (dedup via b2b_tg_send_dedup)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Receipt failures are silent to customer (Flex not sent) → MUST surface to
+ * admin so they can investigate + manually resend via /resend endpoint.
+ *
+ * Dedup TTL = 5 min per (ext_id|reason) — prevents flood if same ext_id
+ * re-fires via cron retry. Different reasons for same ext_id deliver separately
+ * (e.g. png_render_failed then later line_push_failed = 2 alerts).
+ */
+if ( ! function_exists( 'dinoco_vat_push_admin_alert' ) ) {
+    function dinoco_vat_push_admin_alert( $extension_id, $reason, array $context = array() ) {
+        $extension_id = (int) $extension_id;
+        if ( $extension_id <= 0 || $reason === '' ) return false;
+
+        $tid = 'vat_push_' . $extension_id . '_' . $reason;
+        $extra_pairs = array();
+        foreach ( $context as $k => $v ) {
+            if ( is_scalar( $v ) ) {
+                $extra_pairs[] = '- ' . $k . ': ' . (string) $v;
+            }
+        }
+        $extra = $extra_pairs ? "\n" . implode( "\n", $extra_pairs ) : '';
+
+        $msg = "🧾 VAT Receipt Push Failed\n"
+             . "ext_id: {$extension_id}\n"
+             . "reason: {$reason}\n"
+             . "action: ตรวจสอบ + /dinoco-vat/v1/resend/{$extension_id} (admin only)"
+             . $extra;
+
+        // Dedup 5 min per (ext_id, reason) — different reasons still alert separately
+        if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+            return b2b_tg_send_dedup( $tid, $msg, 300 );
+        }
+        // Fallback: direct send if helper not loaded
+        if ( function_exists( 'sendTelegramAlert' ) ) {
+            return sendTelegramAlert( 'vat_event', $msg );
+        }
+        return false;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * 5. CORE HANDLER — bound to cron hook
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -551,20 +604,32 @@ if ( ! function_exists( 'dinoco_vat_push_send_receipt' ) ) {
 
         // Render + persist PNG
         if ( ! function_exists( 'dinoco_vat_receipt_render_png' ) ) {
+            dinoco_vat_push_admin_alert( $extension_id, 'png_renderer_missing', array(
+                'hint' => 'VAT Receipt snippet (DB_ID 1223) not synced',
+            ) );
             return array( 'sent' => false, 'reason' => 'png_renderer_missing' );
         }
         $png = dinoco_vat_receipt_render_png( $extension_id );
         if ( $png === '' ) {
+            dinoco_vat_push_admin_alert( $extension_id, 'png_render_failed', array(
+                'hint' => 'GD/FreeType missing? — php -m | grep -i gd',
+            ) );
             return array( 'sent' => false, 'reason' => 'png_render_failed' );
         }
         $image_url = dinoco_vat_push_persist_png( $extension_id, $png );
         if ( $image_url === '' ) {
+            dinoco_vat_push_admin_alert( $extension_id, 'png_persist_failed', array(
+                'hint' => 'upload dir writable? disk full? PNG > 5MB cap?',
+            ) );
             return array( 'sent' => false, 'reason' => 'png_persist_failed' );
         }
 
         // Build Flex + push
         $messages = dinoco_vat_push_build_flex( $extension_id, $image_url );
         if ( empty( $messages ) ) {
+            dinoco_vat_push_admin_alert( $extension_id, 'flex_build_failed', array(
+                'image_url' => $image_url,
+            ) );
             return array( 'sent' => false, 'reason' => 'flex_build_failed' );
         }
 
@@ -604,6 +669,11 @@ if ( ! function_exists( 'dinoco_vat_push_send_receipt' ) ) {
                 'line_uid'     => substr( $line_uid, 0, 4 ) . '****',
             ) );
         }
+        dinoco_vat_push_admin_alert( $extension_id, 'line_push_failed', array(
+            'line_uid'  => substr( $line_uid, 0, 4 ) . '****',
+            'image_url' => $image_url,
+            'hint'      => 'LINE blocked? token expired? — admin can resend manually or share image_url',
+        ) );
         return array( 'sent' => false, 'reason' => 'line_push_failed', 'image_url' => $image_url );
     }
 }

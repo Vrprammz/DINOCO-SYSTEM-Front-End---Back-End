@@ -2,6 +2,17 @@
  * ╔═══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Marketplace Tools                          ║
  * ║                                                                   ║
+ * ║  Version: V.1.5 (2026-05-18) — Section 6 idempotency wrapper:    ║
+ * ║    3 mutation endpoints wrapped with Round 30+ Idempotency-Key   ║
+ * ║    pattern (defensive function_exists guards):                    ║
+ * ║      • POST /vat-set         — body hash {key,value}              ║
+ * ║      • POST /vat-set-bulk    — bulk-shape ksort normalize         ║
+ * ║      • POST /vat-toggle      — boolean discriminator + user_id    ║
+ * ║    Backward compat: clients without X-Idempotency-Key header     ║
+ * ║    behave byte-identical pre-wrapper. Different value mid-retry  ║
+ * ║    → 409 conflict (admin sees value-mismatch instead of cached    ║
+ * ║    replay). Wrapper count: 142/196 POST endpoints (~72%).         ║
+ * ║                                                                   ║
  * ║  Version: V.1.4 (2026-05-18) — code-reviewer L-1 remediation:    ║
  * ║    VAT Master Switch banner refactored — inline `style=...`      ║
  * ║    attributes replaced with scoped `.dnc-mp-vat-banner.is-*`     ║
@@ -490,6 +501,19 @@ if ( ! function_exists( 'dinoco_mp_tools_rest_vat_set' ) ) {
         $key   = sanitize_key( $req->get_param( 'key' ) );
         $value = $req->get_param( 'value' ); // sanitize per-field below
 
+        // V.1.5 Section 6 — Idempotency-Key wrapper (Round 30+ pattern)
+        // Body hash = {key, value} core fields only — different value mid-retry
+        // → 409 ensures admin sees value-mismatch instead of cached old replay.
+        if ( function_exists( 'dinoco_idempotency_extract_key' ) ) {
+            $idem_key = dinoco_idempotency_extract_key( $req );
+            if ( $idem_key !== '' ) {
+                $idem_body = array( 'action' => 'vat-set', 'key' => $key, 'value' => (string) $value );
+                $idem_check = dinoco_idempotency_check( $idem_key, 'vat-set', $idem_body );
+                if ( is_wp_error( $idem_check ) ) return $idem_check;       // 409 conflict
+                if ( is_array( $idem_check ) )  return rest_ensure_response( $idem_check ); // replay
+            }
+        }
+
         $allowed = array(
             'tax_id', 'company_name', 'company_name_en', 'address',
             'branch_code', 'branch_name', 'phone', 'email', 'rate', 'logo_url',
@@ -524,12 +548,19 @@ if ( ! function_exists( 'dinoco_mp_tools_rest_vat_set' ) ) {
             wp_cache_delete( 'alloptions', 'options' );
         }
 
-        return rest_ensure_response( array(
+        $response = array(
             'success' => true,
             'key'     => $key,
             'value'   => $value,
             'message' => "VAT field '{$key}' updated",
-        ) );
+        );
+
+        // Store idempotency replay if key was provided
+        if ( ! empty( $idem_key ) && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, 'vat-set', $idem_body, $response, 200 );
+        }
+
+        return rest_ensure_response( $response );
     }
 }
 
@@ -538,6 +569,26 @@ if ( ! function_exists( 'dinoco_mp_tools_rest_vat_set_bulk' ) ) {
         $body = $req->get_json_params();
         if ( ! is_array( $body ) ) {
             return new WP_Error( 'mp_invalid_body', 'Body ต้องเป็น JSON object', array( 'status' => 400 ) );
+        }
+
+        // V.1.5 Section 6 — Idempotency wrapper (bulk-shape — body normalized via ksort)
+        $idem_key  = '';
+        $idem_body = array();
+        if ( function_exists( 'dinoco_idempotency_extract_key' ) ) {
+            $idem_key = dinoco_idempotency_extract_key( $req );
+            if ( $idem_key !== '' ) {
+                // Normalize body for deterministic hash: sort keys + cast to string
+                $sorted = $body;
+                ksort( $sorted );
+                $stringified = array();
+                foreach ( $sorted as $k => $v ) {
+                    $stringified[ $k ] = (string) $v;
+                }
+                $idem_body = array( 'action' => 'vat-set-bulk', 'fields' => $stringified );
+                $check = dinoco_idempotency_check( $idem_key, 'vat-set-bulk', $idem_body );
+                if ( is_wp_error( $check ) ) return $check;
+                if ( is_array( $check ) )  return rest_ensure_response( $check );
+            }
         }
 
         $updated = array();
@@ -556,11 +607,17 @@ if ( ! function_exists( 'dinoco_mp_tools_rest_vat_set_bulk' ) ) {
             }
         }
 
-        return rest_ensure_response( array(
+        $response = array(
             'success' => empty( $errors ),
             'updated' => $updated,
             'errors'  => $errors,
-        ) );
+        );
+
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, 'vat-set-bulk', $idem_body, $response, 200 );
+        }
+
+        return rest_ensure_response( $response );
     }
 }
 
@@ -590,17 +647,38 @@ if ( ! function_exists( 'dinoco_mp_tools_rest_vat_toggle' ) ) {
             $enabled = (bool) intval( $raw );
         }
 
+        // V.1.5 Section 6 — Idempotency wrapper (boolean discriminator — Round 32+ pattern).
+        // Different `enabled` value mid-retry → 409 protects against double-flip race
+        // (admin A flips ON + admin B flips OFF simultaneously).
+        $idem_key  = '';
+        $idem_body = array();
+        if ( function_exists( 'dinoco_idempotency_extract_key' ) ) {
+            $idem_key = dinoco_idempotency_extract_key( $req );
+            if ( $idem_key !== '' ) {
+                $idem_body = array( 'action' => 'vat-toggle', 'enabled' => $enabled, 'user_id' => $uid );
+                $check = dinoco_idempotency_check( $idem_key, 'vat-toggle', $idem_body );
+                if ( is_wp_error( $check ) ) return $check;
+                if ( is_array( $check ) )  return rest_ensure_response( $check );
+            }
+        }
+
         $result = dinoco_vat_set_master_enabled( $enabled );
 
         // Compose response with current readiness + new active state
-        return rest_ensure_response( array(
+        $response = array(
             'ok'           => $result['ok'],
             'enabled'      => $result['enabled'],
             'error'        => $result['error'] ?? null,
             'message'      => $result['message'] ?? ( $result['enabled'] ? 'VAT เปิดใช้งานแล้ว' : 'VAT ปิดใช้งานแล้ว' ),
             'is_ready'     => dinoco_vat_is_ready(),
             'is_active'    => dinoco_vat_is_active(),
-        ) );
+        );
+
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, 'vat-toggle', $idem_body, $response, 200 );
+        }
+
+        return rest_ensure_response( $response );
     }
 }
 

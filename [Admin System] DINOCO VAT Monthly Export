@@ -1,6 +1,14 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO VAT Monthly Export                        ║
+ * ║  Version: V.1.5 (2026-05-18) — Section 4 monthly auto-email cron:║
+ * ║    NEW `dinoco_vat_monthly_csv_email_cron` daily handler self-   ║
+ * ║    gates to 1st of month at 02:00 ICT → exports PRIOR month CSV  ║
+ * ║    → wp_mail attachment to `dinoco_vat_csv_email_to`. Flag       ║
+ * ║    `dinoco_vat_csv_auto_email_enabled` default OFF. Idempotency:  ║
+ * ║    wp_option `dinoco_vat_csv_email_last_sent_{YYYY-MM}`.          ║
+ * ║    Telegram alert on failure via b2b_tg_send_dedup 1hr TTL.       ║
+ * ║                                                                   ║
  * ║  Version: V.1.4 (2026-05-18) — code-reviewer MED-3 remediation:  ║
  * ║    dinoco_vat_export_summary() now uses direct aggregate SQL      ║
  * ║    (single COUNT + SUM with audit-event subquery filter) instead ║
@@ -705,7 +713,135 @@ if ( function_exists( 'dinoco_register_admin_module' ) ) {
             'color'     => '#10b981',
             'order'     => 50,
             'cache_ttl' => 60,
-            'source'    => '[Admin System] DINOCO VAT Monthly Export V.1.2',
+            'source'    => '[Admin System] DINOCO VAT Monthly Export V.1.3',
         ) );
     }, 20 );
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. MONTHLY AUTO-EMAIL CRON — V.1.3 scaffold (flag-gated, default OFF)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * On the 1st of each month at 02:00 ICT, generate prior month's CSV and email
+ * to accountant. Flag-gated: `dinoco_vat_csv_auto_email_enabled` (default 0)
+ * + `dinoco_vat_csv_email_to` (recipient address).
+ *
+ * Boss workflow:
+ *   1. Admin UI manual download (PRIMARY) — always works, used for ad-hoc
+ *   2. Auto-email (this cron, OPTIONAL) — convenience, flag-flip to enable
+ *
+ * Design choices (defensive):
+ *   - CSV attached as `vat-export-YYYY-MM.csv` (no UI dependency, no temp files left)
+ *   - Email subject in Thai: "VAT รายเดือน {YYYY-MM} — DINOCO PPT Group"
+ *   - Idempotency: wp_option `dinoco_vat_csv_email_last_sent_{YYYY-MM}` set after success
+ *     → re-fire same month skipped (admin manual re-trigger via /resend-email REST = TODO)
+ *   - Defensive function_exists() throughout — no fatal on flag toggle
+ */
+
+if ( ! wp_next_scheduled( 'dinoco_vat_monthly_csv_email_cron' ) ) {
+    // Schedule daily — handler self-gates to 1st of month at 02:00 ICT
+    wp_schedule_event( time() + 600, 'daily', 'dinoco_vat_monthly_csv_email_cron' );
+}
+
+if ( ! function_exists( 'dinoco_vat_monthly_csv_email_handler' ) ) {
+    function dinoco_vat_monthly_csv_email_handler() {
+        // Heartbeat (matches R12 cron pattern — outside try)
+        update_option( 'dinoco_cron_vat_csv_email_last_run', current_time( 'mysql' ), false );
+
+        // Day-of-month gate: only fire on 1st
+        if ( (int) current_time( 'j' ) !== 1 ) {
+            return;
+        }
+
+        // Flag gate (default OFF)
+        if ( (string) get_option( 'dinoco_vat_csv_auto_email_enabled', '0' ) !== '1' ) {
+            return;
+        }
+
+        $email_to = (string) get_option( 'dinoco_vat_csv_email_to', '' );
+        if ( ! is_email( $email_to ) ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'vat_csv_auto_email_no_recipient', array(
+                    'flag_on' => true,
+                ) );
+            }
+            return;
+        }
+
+        // Prior month (cron fires 1st → export PREVIOUS month)
+        $month_ts = strtotime( '-1 month', current_time( 'timestamp' ) );
+        $year     = (int) date( 'Y', $month_ts );
+        $month    = (int) date( 'n', $month_ts );
+        $period   = sprintf( '%04d-%02d', $year, $month );
+
+        // Idempotency — already sent for this period?
+        $sent_key = 'dinoco_vat_csv_email_last_sent_' . $period;
+        if ( get_option( $sent_key, '' ) !== '' ) {
+            return;
+        }
+
+        try {
+            if ( ! function_exists( 'dinoco_vat_export_to_csv' ) ) {
+                throw new \Exception( 'CSV exporter missing' );
+            }
+            $csv = dinoco_vat_export_to_csv( $year, $month );
+            if ( $csv === '' ) {
+                throw new \Exception( 'CSV empty (no receipts for ' . $period . ')' );
+            }
+
+            $upload_dir = wp_upload_dir();
+            $tmp_file = trailingslashit( $upload_dir['basedir'] ) . 'dinoco-vat-receipts/_email-tmp-vat-export-' . $period . '.csv';
+            $written = @file_put_contents( $tmp_file, $csv, LOCK_EX );
+            if ( $written === false ) {
+                throw new \Exception( 'CSV temp write failed' );
+            }
+
+            $subject = "VAT รายเดือน {$period} — DINOCO PPT Group Corp";
+            $body = "เรียน คุณบัญชี,\n\n"
+                  . "แนบไฟล์ CSV รายงานภาษีขาย (ภ.พ.30) ประจำเดือน {$period}\n"
+                  . "บริษัท พีพีที กรุ๊ป คอร์ปอเรชั่น จำกัด (Tax ID 0105564033573)\n\n"
+                  . "หากต้องการดูรายละเอียดเพิ่มเติม กรุณาเข้า Admin Dashboard → การเงิน → VAT รายเดือน\n\n"
+                  . "ระบบ DINOCO";
+
+            $headers = array(
+                'From: DINOCO System <noreply@dinoco.in.th>',
+                'Content-Type: text/plain; charset=UTF-8',
+            );
+
+            $ok = wp_mail( $email_to, $subject, $body, $headers, array( $tmp_file ) );
+
+            @unlink( $tmp_file );
+
+            if ( $ok ) {
+                update_option( $sent_key, current_time( 'mysql' ), false );
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( 'info', 'vat_csv_auto_email_sent', array(
+                        'period' => $period,
+                        'to'     => $email_to,
+                    ) );
+                }
+            } else {
+                throw new \Exception( 'wp_mail returned false' );
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array(
+                    'context' => 'vat_csv_auto_email_failed',
+                    'period'  => $period,
+                ) );
+            }
+            // Telegram alert to admin
+            if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+                b2b_tg_send_dedup(
+                    'vat_csv_email_fail_' . $period,
+                    "📧 VAT Monthly CSV Auto-Email FAILED\n"
+                    . "period: {$period}\n"
+                    . "error: " . $e->getMessage() . "\n"
+                    . "action: ตรวจสอบ wp_mail + dinoco_vat_csv_email_to setting + manual download via Admin Dashboard",
+                    3600 // 1hr dedup
+                );
+            }
+        }
+    }
+}
+add_action( 'dinoco_vat_monthly_csv_email_cron', 'dinoco_vat_monthly_csv_email_handler' );

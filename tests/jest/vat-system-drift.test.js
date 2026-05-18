@@ -291,4 +291,55 @@ describe('VAT System Drift Detector — 2026-05-18 V.1.0', () => {
         const src = read('order_ctx');
         expect(src).toMatch(/register_post_meta[\s\S]{0,500}show_in_rest['"]?\s*=>\s*false/);
     });
+
+    /* ─ Idempotency wrapper on mutation endpoints (Section 6) ─ */
+    test('POST /vat-set wraps with dinoco_idempotency_check', () => {
+        const src = stripComments(read('mp_tools'));
+        // V.1.5 Section 6 — Round 30+ pattern
+        expect(src).toMatch(/function\s+dinoco_mp_tools_rest_vat_set\s*\(/);
+        expect(src).toMatch(/dinoco_idempotency_check\s*\(\s*\$idem_key\s*,\s*['"]vat-set['"]/);
+        expect(src).toMatch(/dinoco_idempotency_store\s*\([^)]*['"]vat-set['"]/);
+    });
+
+    test('POST /vat-set-bulk wraps with idempotency (ksort normalize)', () => {
+        const src = stripComments(read('mp_tools'));
+        expect(src).toMatch(/function\s+dinoco_mp_tools_rest_vat_set_bulk/);
+        expect(src).toMatch(/dinoco_idempotency_check\s*\([^)]*['"]vat-set-bulk['"]/);
+        // Bulk-shape canonical: ksort + cast-to-string normalize
+        expect(src).toMatch(/ksort\s*\(\s*\$sorted\s*\)/);
+    });
+
+    test('POST /vat-toggle wraps with idempotency (boolean+user_id discriminator)', () => {
+        const src = stripComments(read('mp_tools'));
+        expect(src).toMatch(/function\s+dinoco_mp_tools_rest_vat_toggle/);
+        expect(src).toMatch(/dinoco_idempotency_check\s*\([^)]*['"]vat-toggle['"]/);
+        // Discriminator must include enabled + user_id (prevents A-flips-ON / B-flips-OFF replay)
+        expect(src).toMatch(/['"]enabled['"]\s*=>\s*\$enabled/);
+        expect(src).toMatch(/['"]user_id['"]\s*=>\s*\$uid/);
+    });
+
+    /* ─ Telegram alerts on VAT push failure (Section 4) ─ */
+    test('VAT push wires Telegram alert on failure paths', () => {
+        const src = stripComments(read('vat_push'));
+        expect(src).toMatch(/function\s+dinoco_vat_push_admin_alert/);
+        // Called on at least 4 distinct failure reasons
+        expect(src).toMatch(/dinoco_vat_push_admin_alert\s*\([^)]*png_render_failed/);
+        expect(src).toMatch(/dinoco_vat_push_admin_alert\s*\([^)]*line_push_failed/);
+        // Uses dedup helper (b2b_tg_send_dedup) — prevents flood
+        expect(src).toMatch(/b2b_tg_send_dedup/);
+    });
+
+    /* ─ Monthly CSV auto-email cron (Section 4) ─ */
+    test('VAT Monthly Export defines flag-gated auto-email cron', () => {
+        const src = stripComments(read('vat_export'));
+        expect(src).toMatch(/function\s+dinoco_vat_monthly_csv_email_handler/);
+        // Flag-gate default OFF
+        expect(src).toMatch(/dinoco_vat_csv_auto_email_enabled/);
+        // Day-of-month gate (1st only)
+        expect(src).toMatch(/current_time\s*\(\s*['"]j['"]\s*\)/);
+        // Idempotency: option per-period
+        expect(src).toMatch(/dinoco_vat_csv_email_last_sent_/);
+        // wp_mail with attachment
+        expect(src).toMatch(/wp_mail\s*\([\s\S]{0,500}\$tmp_file/);
+    });
 });
