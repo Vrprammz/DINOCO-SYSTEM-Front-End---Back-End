@@ -1,0 +1,369 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Order Context Resolver                    ║
+ * ║  Version: V.1.0 (2026-05-18)                                     ║
+ * ║  DB_ID: (assign after creation in WP)                            ║
+ * ║                                                                   ║
+ * ║  Purpose:                                                         ║
+ * ║    Provide canonical `_dinoco_order_context` postmeta value      ║
+ * ║    discriminator for VAT compliance routing — separate axis      ║
+ * ║    from existing `_order_source` (which describes creation path).║
+ * ║                                                                   ║
+ * ║  Boss decision 2026-05-18 (project_vat_policy_split.md):         ║
+ * ║    B2C marketplace orders → VAT 7% receipt required              ║
+ * ║    B2B distributor orders → non-VAT (บัญชีบุคคล)                       ║
+ * ║                                                                   ║
+ * ║  Context taxonomy (5 values):                                    ║
+ * ║    b2c_marketplace      — F#8 warranty extension purchase (VAT)  ║
+ * ║    b2b_distributor      — B2B normal order (non-VAT)             ║
+ * ║    b2b_manual_invoice   — Admin-issued invoice (non-VAT default) ║
+ * ║    b2b_walkin           — Walk-in distributor (non-VAT)          ║
+ * ║    unknown              — legacy/unset orders (treated non-VAT)  ║
+ * ║                                                                   ║
+ * ║  Design:                                                         ║
+ * ║    - 100% additive — never overwrites existing `_order_source`   ║
+ * ║    - Auto-tags via low-priority hooks (priority 99) AFTER        ║
+ * ║      existing systems set their meta.                            ║
+ * ║    - Backfill helper for legacy orders.                          ║
+ * ║    - All callers use `dinoco_order_context($id)` accessor.       ║
+ * ║                                                                   ║
+ * ║  Dependencies: none (defensive — works standalone).              ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. CONSTANTS — canonical context values + meta key
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! defined( 'DINOCO_ORDER_CTX_META_KEY' ) ) {
+    define( 'DINOCO_ORDER_CTX_META_KEY', '_dinoco_order_context' );
+}
+if ( ! defined( 'DINOCO_ORDER_CTX_B2C_MARKETPLACE' ) ) {
+    define( 'DINOCO_ORDER_CTX_B2C_MARKETPLACE', 'b2c_marketplace' );
+}
+if ( ! defined( 'DINOCO_ORDER_CTX_B2B_DISTRIBUTOR' ) ) {
+    define( 'DINOCO_ORDER_CTX_B2B_DISTRIBUTOR', 'b2b_distributor' );
+}
+if ( ! defined( 'DINOCO_ORDER_CTX_B2B_MANUAL_INVOICE' ) ) {
+    define( 'DINOCO_ORDER_CTX_B2B_MANUAL_INVOICE', 'b2b_manual_invoice' );
+}
+if ( ! defined( 'DINOCO_ORDER_CTX_B2B_WALKIN' ) ) {
+    define( 'DINOCO_ORDER_CTX_B2B_WALKIN', 'b2b_walkin' );
+}
+if ( ! defined( 'DINOCO_ORDER_CTX_UNKNOWN' ) ) {
+    define( 'DINOCO_ORDER_CTX_UNKNOWN', 'unknown' );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. RESOLVER — single source of truth lookup
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_order_context_valid_values' ) ) {
+    /**
+     * Whitelist of canonical context values. Anything outside this list is
+     * treated as 'unknown' to prevent typo propagation downstream.
+     */
+    function dinoco_order_context_valid_values() {
+        return array(
+            DINOCO_ORDER_CTX_B2C_MARKETPLACE,
+            DINOCO_ORDER_CTX_B2B_DISTRIBUTOR,
+            DINOCO_ORDER_CTX_B2B_MANUAL_INVOICE,
+            DINOCO_ORDER_CTX_B2B_WALKIN,
+            DINOCO_ORDER_CTX_UNKNOWN,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_order_context' ) ) {
+    /**
+     * Resolve order context for a given order_id (any post_type with
+     * order-like semantics: b2b_order, manual_invoice, sn_extension).
+     *
+     * Resolution chain:
+     *   1. Existing `_dinoco_order_context` meta (if previously tagged)
+     *   2. Inference from `_order_source` (manual_invoice) + `_b2b_is_walkin`
+     *   3. Inference from post_type (b2b_order → distributor)
+     *   4. Default 'unknown'
+     *
+     * Result is NOT cached (caller may have just-mutated meta — callers
+     * who need batch performance should pre-prime via update_meta_cache).
+     *
+     * @param int $order_id
+     * @return string one of canonical 5 values.
+     */
+    function dinoco_order_context( $order_id ) {
+        $order_id = (int) $order_id;
+        if ( $order_id <= 0 ) return DINOCO_ORDER_CTX_UNKNOWN;
+
+        // 1. Explicit tag
+        $explicit = (string) get_post_meta( $order_id, DINOCO_ORDER_CTX_META_KEY, true );
+        if ( $explicit !== '' && in_array( $explicit, dinoco_order_context_valid_values(), true ) ) {
+            return $explicit;
+        }
+
+        // 2. Inference from existing markers
+        $source = (string) get_post_meta( $order_id, '_order_source', true );
+        if ( $source === 'manual_invoice' ) {
+            return DINOCO_ORDER_CTX_B2B_MANUAL_INVOICE;
+        }
+
+        $is_walkin = (string) get_post_meta( $order_id, '_b2b_is_walkin', true );
+        if ( $is_walkin === '1' || $is_walkin === 1 ) {
+            return DINOCO_ORDER_CTX_B2B_WALKIN;
+        }
+
+        // 3. Inference from post_type
+        $post_type = get_post_type( $order_id );
+        if ( $post_type === 'b2b_order' ) {
+            return DINOCO_ORDER_CTX_B2B_DISTRIBUTOR;
+        }
+        // sn_extension CPT (if F#8 marketplace stores via CPT — currently stored
+        // in custom table wp_dinoco_sn_extensions, so this branch is reserve
+        // for future migration).
+        if ( $post_type === 'sn_extension' || $post_type === 'warranty_extension' ) {
+            return DINOCO_ORDER_CTX_B2C_MARKETPLACE;
+        }
+
+        return DINOCO_ORDER_CTX_UNKNOWN;
+    }
+}
+
+if ( ! function_exists( 'dinoco_order_context_is_vat_eligible' ) ) {
+    /**
+     * Returns true iff order requires Thai VAT 7% receipt (PP30 + tax invoice).
+     * Currently: only b2c_marketplace context.
+     *
+     * Boss decision binding (2026-05-18 project_vat_policy_split.md):
+     *   - b2c_marketplace → VAT 7% receipt
+     *   - everything else → non-VAT (บัญชีบุคคล)
+     *
+     * @param int $order_id
+     * @return bool
+     */
+    function dinoco_order_context_is_vat_eligible( $order_id ) {
+        return dinoco_order_context( $order_id ) === DINOCO_ORDER_CTX_B2C_MARKETPLACE;
+    }
+}
+
+if ( ! function_exists( 'dinoco_order_context_set' ) ) {
+    /**
+     * Explicit setter — validates value against whitelist before write.
+     * Returns the value actually set (may differ from input if rejected → 'unknown').
+     *
+     * @param int    $order_id
+     * @param string $context one of canonical 5 values
+     * @return string
+     */
+    function dinoco_order_context_set( $order_id, $context ) {
+        $order_id = (int) $order_id;
+        if ( $order_id <= 0 ) return DINOCO_ORDER_CTX_UNKNOWN;
+        $context = (string) $context;
+        if ( ! in_array( $context, dinoco_order_context_valid_values(), true ) ) {
+            $context = DINOCO_ORDER_CTX_UNKNOWN;
+        }
+        update_post_meta( $order_id, DINOCO_ORDER_CTX_META_KEY, $context );
+        return $context;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. AUTO-TAGGING HOOKS — run AFTER existing systems set their markers
+ *
+ * Priority 99 chosen to fire after:
+ *   - Manual Invoice (priority 10 default) sets `_order_source=manual_invoice`
+ *   - B2B Snippet 2 confirm_order sets `_b2b_is_walkin`
+ *   - SN Marketplace checkout inserts row to wp_dinoco_sn_extensions
+ *
+ * We do NOT auto-tag SN extensions (they're in custom table, no save_post fires).
+ * Callers in SN REST API explicitly set context via dinoco_order_context_set()
+ * if needed — but for now the resolver infers via post_type for CPT-stored
+ * future migration paths.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_order_context_auto_tag' ) ) {
+    /**
+     * Auto-tag fires on save_post_b2b_order — idempotent.
+     * Only sets meta if currently empty (preserves manual admin overrides).
+     */
+    function dinoco_order_context_auto_tag( $post_id, $post = null, $update = false ) {
+        $post_id = (int) $post_id;
+        if ( $post_id <= 0 ) return;
+        // Skip auto-saves + revisions
+        if ( wp_is_post_autosave( $post_id ) || wp_is_post_revision( $post_id ) ) return;
+        // Skip if already tagged (avoid clobbering admin override)
+        $existing = (string) get_post_meta( $post_id, DINOCO_ORDER_CTX_META_KEY, true );
+        if ( $existing !== '' ) return;
+        // Resolve via inference + persist
+        $ctx = dinoco_order_context( $post_id );
+        if ( $ctx !== DINOCO_ORDER_CTX_UNKNOWN ) {
+            update_post_meta( $post_id, DINOCO_ORDER_CTX_META_KEY, $ctx );
+        }
+    }
+}
+
+// Wire to b2b_order CPT save (priority 99 = AFTER Manual Invoice + walk-in markers).
+add_action( 'save_post_b2b_order', 'dinoco_order_context_auto_tag', 99, 3 );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. ADMIN BACKFILL HELPER (manual trigger via WP-CLI or admin button)
+ *
+ * Tags untagged orders with inferred context. Chunked for safety (500/iter).
+ * Idempotent — re-running on already-tagged orders is a no-op.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_order_context_backfill_chunk' ) ) {
+    /**
+     * Run one backfill chunk. Returns { tagged: N, scanned: N, has_more: bool }.
+     *
+     * @param int $batch_size (default 500, max 2000)
+     * @param string $cursor_after_id (resume from last_id+1)
+     * @return array
+     */
+    function dinoco_order_context_backfill_chunk( $batch_size = 500, $cursor_after_id = 0 ) {
+        global $wpdb;
+        $batch_size = max( 1, min( 2000, (int) $batch_size ) );
+        $cursor_after_id = max( 0, (int) $cursor_after_id );
+
+        // Find b2b_order posts without context meta, ordered by ID ASC (stable cursor)
+        $sql = $wpdb->prepare(
+            "SELECT p.ID
+               FROM {$wpdb->posts} p
+               LEFT JOIN {$wpdb->postmeta} pm
+                      ON pm.post_id = p.ID
+                     AND pm.meta_key = %s
+              WHERE p.post_type = 'b2b_order'
+                AND p.ID > %d
+                AND pm.meta_id IS NULL
+              ORDER BY p.ID ASC
+              LIMIT %d",
+            DINOCO_ORDER_CTX_META_KEY,
+            $cursor_after_id,
+            $batch_size
+        );
+        $ids = $wpdb->get_col( $sql );
+        if ( empty( $ids ) ) {
+            return array( 'tagged' => 0, 'scanned' => 0, 'has_more' => false, 'last_id' => $cursor_after_id );
+        }
+
+        // Prime meta cache for batch
+        if ( function_exists( 'update_meta_cache' ) ) {
+            update_meta_cache( 'post', array_map( 'intval', $ids ) );
+        }
+
+        $tagged = 0;
+        foreach ( $ids as $id ) {
+            $id = (int) $id;
+            $ctx = dinoco_order_context( $id );
+            if ( $ctx !== DINOCO_ORDER_CTX_UNKNOWN ) {
+                update_post_meta( $id, DINOCO_ORDER_CTX_META_KEY, $ctx );
+                $tagged++;
+            } else {
+                // Tag unknown explicitly so we don't re-scan it next chunk.
+                update_post_meta( $id, DINOCO_ORDER_CTX_META_KEY, DINOCO_ORDER_CTX_UNKNOWN );
+            }
+        }
+        $last_id = (int) max( array_map( 'intval', $ids ) );
+        return array(
+            'tagged'   => $tagged,
+            'scanned'  => count( $ids ),
+            'has_more' => count( $ids ) === $batch_size,
+            'last_id'  => $last_id,
+        );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. REST ENDPOINTS — admin diagnostic + backfill trigger
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_order_context_register_rest' ) ) {
+    function dinoco_order_context_register_rest() {
+        register_rest_route( 'dinoco/v1', '/order-context/(?P<id>\d+)', array(
+            'methods'             => 'GET',
+            'callback'            => function( $req ) {
+                $id = (int) $req['id'];
+                return rest_ensure_response( array(
+                    'order_id'        => $id,
+                    'context'         => dinoco_order_context( $id ),
+                    'vat_eligible'    => dinoco_order_context_is_vat_eligible( $id ),
+                    'post_type'       => get_post_type( $id ) ?: null,
+                    'order_source'    => get_post_meta( $id, '_order_source', true ) ?: null,
+                    'is_walkin'       => (bool) get_post_meta( $id, '_b2b_is_walkin', true ),
+                    'explicit_tag'    => (string) get_post_meta( $id, DINOCO_ORDER_CTX_META_KEY, true ),
+                ) );
+            },
+            'permission_callback' => function() {
+                return current_user_can( 'manage_options' );
+            },
+            'args' => array(
+                'id' => array( 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        register_rest_route( 'dinoco/v1', '/order-context/backfill', array(
+            'methods'             => 'POST',
+            'callback'            => function( $req ) {
+                $batch = (int) ( $req->get_param( 'batch_size' ) ?: 500 );
+                $cursor = (int) ( $req->get_param( 'cursor' ) ?: 0 );
+                $result = dinoco_order_context_backfill_chunk( $batch, $cursor );
+                $result['ok'] = true;
+                return rest_ensure_response( $result );
+            },
+            'permission_callback' => function() {
+                return current_user_can( 'manage_options' );
+            },
+        ) );
+
+        register_rest_route( 'dinoco/v1', '/order-context/stats', array(
+            'methods'             => 'GET',
+            'callback'            => function() {
+                global $wpdb;
+                $sql = $wpdb->prepare(
+                    "SELECT COALESCE(pm.meta_value, 'untagged') AS context, COUNT(*) AS cnt
+                       FROM {$wpdb->posts} p
+                       LEFT JOIN {$wpdb->postmeta} pm
+                              ON pm.post_id = p.ID
+                             AND pm.meta_key = %s
+                      WHERE p.post_type = 'b2b_order'
+                        AND p.post_status NOT IN ('trash','auto-draft')
+                      GROUP BY context",
+                    DINOCO_ORDER_CTX_META_KEY
+                );
+                $rows = $wpdb->get_results( $sql, ARRAY_A );
+                $out = array();
+                foreach ( (array) $rows as $r ) {
+                    $out[ (string) $r['context'] ] = (int) $r['cnt'];
+                }
+                return rest_ensure_response( array(
+                    'ok'    => true,
+                    'stats' => $out,
+                    'note'  => 'b2b_order CPT only. SN extensions live in wp_dinoco_sn_extensions table (always b2c_marketplace by definition).',
+                ) );
+            },
+            'permission_callback' => function() {
+                return current_user_can( 'manage_options' );
+            },
+        ) );
+    }
+}
+add_action( 'rest_api_init', 'dinoco_order_context_register_rest' );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. MODULE REGISTRY (optional — surfaces in Admin Dashboard sidebar)
+ *
+ * Defensive: only registers if existing module-registry function present.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( function_exists( 'dinoco_register_admin_module' ) ) {
+    add_action( 'init', function() {
+        dinoco_register_admin_module( array(
+            'id'      => 'order_context_resolver',
+            'label'   => 'Order Context (VAT)',
+            'section' => 'utilities',
+            'order'   => 90,
+            'desc'    => 'Order context resolver + VAT eligibility lookup',
+        ) );
+    }, 20 );
+}
