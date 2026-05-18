@@ -2,6 +2,20 @@
  * ╔═══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Marketplace Tools                          ║
  * ║                                                                   ║
+ * ║  Version: V.1.2 (2026-05-18) — Boss feedback "ไม่มีปุ่มเปิด VAT":  ║
+ * ║    • NEW master flag `dinoco_vat_master_enabled` (default '0' OFF)║
+ * ║      + helpers dinoco_vat_is_master_enabled() / dinoco_vat_is_    ║
+ * ║      active() (= master ON AND data ready) /                      ║
+ * ║      dinoco_vat_set_master_enabled() (refuses if data not ready)  ║
+ * ║    • Constant override: WP_DINOCO_VAT_ENABLED locks via wp-config ║
+ * ║    • NEW prominent VAT Master Switch banner above Section 2 with  ║
+ * ║      status badge (ACTIVE/NOT READY/OFF/CONST LOCK) + toggle btn  ║
+ * ║      + clear customer-facing impact messaging                     ║
+ * ║    • NEW POST /vat-toggle REST endpoint (admin only, normalize    ║
+ * ║      bool/int/string truthy/falsey + Flag Audit Log via           ║
+ * ║      dinoco_flag_audit_log())                                     ║
+ * ║    • /diagnose response includes `vat_state` block for banner     ║
+ * ║                                                                   ║
  * ║  Version: V.1.1 (2026-05-18) — Hard defaults for branch_code +    ║
  * ║    branch_name + rate (สำนักงานใหญ่/00000/0.07 — Thai standard).   ║
  * ║    get_option returns '__NOT_SET__' sentinel before $default      ║
@@ -100,6 +114,84 @@ if ( ! function_exists( 'dinoco_vat_is_ready' ) ) {
 }
 
 /* ============================================================
+ * V.1.2 — VAT Master Enable Flag
+ *
+ * Boss feedback 2026-05-18: "ไม่มีปุ่มเปิด VAT" — มี data ready check
+ * แต่ไม่มี explicit master switch. เพิ่ม wp_option flag
+ * `dinoco_vat_master_enabled` (default '0' = OFF) + helper
+ * `dinoco_vat_is_active()` = master ON AND data ready.
+ *
+ * Defense-in-depth: ทุก VAT-emitting module (Receipt, LINE Push,
+ * Monthly Export) ต้อง gate ด้วย dinoco_vat_is_active() ก่อน fire.
+ *
+ * Rollback: instant via flag flip OFF (ลูกค้าใหม่ที่ paid ระหว่าง
+ * flag OFF → ไม่ได้รับ receipt; admin ใช้ /resend/{id} ปลด)
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_vat_is_master_enabled' ) ) {
+    /**
+     * Master VAT switch (separate from data-readiness check).
+     * Defaults OFF — boss must explicitly enable via UI.
+     */
+    function dinoco_vat_is_master_enabled() {
+        // Constant override has highest priority (allow boss to lock via wp-config)
+        if ( defined( 'WP_DINOCO_VAT_ENABLED' ) ) {
+            return (bool) WP_DINOCO_VAT_ENABLED;
+        }
+        return (bool) get_option( 'dinoco_vat_master_enabled', '0' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_vat_is_active' ) ) {
+    /**
+     * Authoritative "should VAT module fire?" check.
+     * MUST be: master flag ON AND all required settings populated.
+     *
+     * Callers: VAT Receipt eligibility, LINE Push handler, Monthly
+     * Export — all gate downstream behavior on this.
+     */
+    function dinoco_vat_is_active() {
+        if ( ! dinoco_vat_is_master_enabled() ) return false;
+        if ( ! dinoco_vat_is_ready() ) return false;
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_vat_set_master_enabled' ) ) {
+    /**
+     * Toggle master flag (admin only). Returns the new state actually set.
+     * Refuses to enable if data not ready (preserves invariant: active
+     * implies ready).
+     *
+     * @param bool $enabled
+     * @return array { ok: bool, enabled: bool, error?: string }
+     */
+    function dinoco_vat_set_master_enabled( $enabled ) {
+        $enabled = (bool) $enabled;
+        if ( $enabled && ! dinoco_vat_is_ready() ) {
+            return array(
+                'ok'      => false,
+                'enabled' => false,
+                'error'   => 'data_not_ready',
+                'message' => 'กรอก tax_id + company_name + address ให้ครบก่อนเปิด VAT',
+            );
+        }
+        update_option( 'dinoco_vat_master_enabled', $enabled ? '1' : '0' );
+        // Log via flag audit (function_exists guard — snippet may not be synced)
+        if ( function_exists( 'dinoco_flag_audit_log' ) ) {
+            dinoco_flag_audit_log(
+                'dinoco_vat_master_enabled',
+                $enabled ? '0' : '1',
+                $enabled ? '1' : '0',
+                'admin_ui_toggle',
+                'marketplace_tools'
+            );
+        }
+        return array( 'ok' => true, 'enabled' => $enabled );
+    }
+}
+
+/* ============================================================
  * 2. REST ENDPOINTS — namespace /dinoco-marketplace-tools/v1/
  * ============================================================ */
 
@@ -146,6 +238,16 @@ add_action( 'rest_api_init', function() {
         'methods'             => 'POST',
         'callback'            => 'dinoco_mp_tools_rest_vat_set_bulk',
         'permission_callback' => $perm,
+    ) );
+
+    // V.1.2 — POST /vat-toggle — master enable flag
+    register_rest_route( 'dinoco-marketplace-tools/v1', '/vat-toggle', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_mp_tools_rest_vat_toggle',
+        'permission_callback' => $perm,
+        'args'                => array(
+            'enabled' => array( 'required' => true ),
+        ),
     ) );
 
     // GET /pricing-stats — count enabled/disabled SKUs by attach_level
@@ -269,6 +371,13 @@ if ( ! function_exists( 'dinoco_mp_tools_rest_diagnose' ) ) {
             'vat'    => $vat,
             'stats'  => $stats,
             'ready'  => $ready,
+            // V.1.2 — VAT master state for UI banner
+            'vat_state' => array(
+                'master_enabled' => dinoco_vat_is_master_enabled(),
+                'is_ready'       => dinoco_vat_is_ready(),
+                'is_active'      => dinoco_vat_is_active(),
+                'constant_lock'  => defined( 'WP_DINOCO_VAT_ENABLED' ),
+            ),
             'now'    => current_time( 'mysql' ),
         ) );
     }
@@ -384,6 +493,37 @@ if ( ! function_exists( 'dinoco_mp_tools_rest_vat_set_bulk' ) ) {
             'success' => empty( $errors ),
             'updated' => $updated,
             'errors'  => $errors,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_mp_tools_rest_vat_toggle' ) ) {
+    /**
+     * V.1.2 — POST /vat-toggle — flip master VAT enable flag.
+     * Accepts `enabled` as bool/int/string ('1','0','true','false').
+     */
+    function dinoco_mp_tools_rest_vat_toggle( $req ) {
+        $raw = $req->get_param( 'enabled' );
+        // Normalize various truthy/falsey shapes
+        if ( is_bool( $raw ) ) {
+            $enabled = $raw;
+        } elseif ( is_string( $raw ) ) {
+            $low = strtolower( trim( $raw ) );
+            $enabled = in_array( $low, array( '1', 'true', 'on', 'yes' ), true );
+        } else {
+            $enabled = (bool) intval( $raw );
+        }
+
+        $result = dinoco_vat_set_master_enabled( $enabled );
+
+        // Compose response with current readiness + new active state
+        return rest_ensure_response( array(
+            'ok'           => $result['ok'],
+            'enabled'      => $result['enabled'],
+            'error'        => $result['error'] ?? null,
+            'message'      => $result['message'] ?? ( $result['enabled'] ? 'VAT เปิดใช้งานแล้ว' : 'VAT ปิดใช้งานแล้ว' ),
+            'is_ready'     => dinoco_vat_is_ready(),
+            'is_active'    => dinoco_vat_is_active(),
         ) );
     }
 }
@@ -591,6 +731,14 @@ if ( ! function_exists( 'dinoco_mp_tools_render_shortcode' ) ) {
                 </div>
             </div>
 
+            <!-- V.1.2 — VAT Master Switch Banner -->
+            <div class="dnc-mp-section" id="dnc-mp-vat-master-section">
+                <div class="dnc-mp-section-h">⚡ VAT Master Switch (B2C Marketplace)</div>
+                <div id="dnc-mp-vat-master-banner" style="padding:14px;border-radius:8px;background:#f3f4f6;">
+                    <p style="margin:0;color:#6b7280;">กำลังโหลดสถานะ...</p>
+                </div>
+            </div>
+
             <!-- Section 2: VAT Constants/Options -->
             <div class="dnc-mp-section">
                 <div class="dnc-mp-section-h">2️⃣ VAT Info (สำหรับใบกำกับภาษี B2C)</div>
@@ -756,6 +904,54 @@ if ( ! function_exists( 'dinoco_mp_tools_render_shortcode' ) ) {
                 document.getElementById('dnc-mp-browse-content').innerHTML = html;
             }
 
+            // V.1.2 — VAT Master Switch banner
+            function renderVatMaster(state) {
+                state = state || {};
+                var box = document.getElementById('dnc-mp-vat-master-banner');
+                if (!box) return;
+                var lock = state.constant_lock;
+                var enabled = !!state.master_enabled;
+                var ready = !!state.is_ready;
+                var active = !!state.is_active;
+                var bg, border, badge, badgeColor, msg, btnHtml = '';
+                if (active) {
+                    bg = '#d1fae5'; border = '#10b981'; badge = '✅ ACTIVE'; badgeColor = '#065f46';
+                    msg = '<strong>VAT 7% เปิดใช้งานอยู่</strong> — ลูกค้าจ่ายเงินจบ → ใบกำกับภาษีถูกส่งทาง LINE Flex อัตโนมัติ';
+                    btnHtml = lock
+                        ? '<button class="dnc-mp-btn dnc-mp-btn-secondary" disabled title="WP_DINOCO_VAT_ENABLED constant locked">🔒 ปิดผ่าน constant</button>'
+                        : '<button class="dnc-mp-btn dnc-mp-btn-secondary" data-action="vat-master-toggle" data-target="0">⏸️ ปิด VAT</button>';
+                } else if (!ready) {
+                    bg = '#fef3c7'; border = '#b45309'; badge = '⚠️ NOT READY'; badgeColor = '#78350f';
+                    msg = '<strong>กรอกข้อมูล VAT ให้ครบก่อนเปิด</strong> — จำเป็นต้องมี <code>tax_id</code> + <code>company_name</code> + <code>address</code> (ดูใน Section 2 ด้านล่าง)';
+                    btnHtml = '<button class="dnc-mp-btn" disabled title="ข้อมูล VAT ยังไม่ครบ">▶️ เปิด VAT (รอกรอกข้อมูล)</button>';
+                } else if (enabled && !active) {
+                    bg = '#fef3c7'; border = '#b45309'; badge = '⚠️ ENABLED แต่ NOT READY'; badgeColor = '#78350f';
+                    msg = 'Master flag เปิดอยู่ แต่ข้อมูล VAT ขาดหาย — ตรวจ Section 2';
+                    btnHtml = '<button class="dnc-mp-btn dnc-mp-btn-secondary" data-action="vat-master-toggle" data-target="0">⏸️ ปิด VAT</button>';
+                } else {
+                    bg = '#f3f4f6'; border = '#6b7280'; badge = '⏸️ OFF'; badgeColor = '#374151';
+                    msg = 'VAT ยังไม่เปิด — ลูกค้า marketplace จะไม่ได้รับใบกำกับภาษีจนกว่าจะกดเปิด';
+                    btnHtml = lock
+                        ? '<button class="dnc-mp-btn" disabled title="WP_DINOCO_VAT_ENABLED constant locked">🔒 ล็อคผ่าน constant</button>'
+                        : '<button class="dnc-mp-btn" data-action="vat-master-toggle" data-target="1">▶️ เปิด VAT</button>';
+                }
+                box.style.background = bg;
+                box.style.borderLeft = '4px solid ' + border;
+                box.innerHTML =
+                    '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">' +
+                        '<div>' +
+                            '<span style="display:inline-block;padding:4px 10px;border-radius:12px;background:#fff;color:' + badgeColor + ';font-size:12px;font-weight:600;margin-bottom:6px;">' + badge + '</span>' +
+                            '<div style="color:#1f2937;font-size:14px;">' + msg + '</div>' +
+                            '<div style="margin-top:6px;font-size:11px;color:#6b7280;">' +
+                                'Master: <code>' + (enabled ? 'ON' : 'OFF') + '</code> · ' +
+                                'Data ready: <code>' + (ready ? 'YES' : 'NO') + '</code>' +
+                                (lock ? ' · <strong>locked via WP_DINOCO_VAT_ENABLED constant</strong>' : '') +
+                            '</div>' +
+                        '</div>' +
+                        '<div>' + btnHtml + '</div>' +
+                    '</div>';
+            }
+
             function loadDiagnose() {
                 api('GET', '/diagnose').then(function(res){
                     if (res.status !== 200) {
@@ -763,6 +959,7 @@ if ( ! function_exists( 'dinoco_mp_tools_render_shortcode' ) ) {
                         return;
                     }
                     renderFlags(res.data.flags);
+                    renderVatMaster(res.data.vat_state);
                     renderVat(res.data.vat, res.data.ready);
                 }).catch(function(e){
                     toast('Network error: ' + e.message, 'error');
@@ -796,6 +993,24 @@ if ( ! function_exists( 'dinoco_mp_tools_render_shortcode' ) ) {
                             loadDiagnose();
                         } else {
                             toast('❌ ' + (res.data.message || 'Toggle failed'), 'error');
+                        }
+                        t.disabled = false;
+                    });
+                    return;
+                }
+                if (action === 'vat-master-toggle') {
+                    var target = t.dataset.target === '1';
+                    var promptMsg = target
+                        ? 'เปิด VAT 7% สำหรับ B2C Marketplace?\n\nลูกค้าใหม่ที่จ่ายค่าต่อประกัน → ระบบจะออกใบกำกับภาษี + ส่ง LINE Flex อัตโนมัติ'
+                        : 'ปิด VAT?\n\nลูกค้าใหม่ที่จ่ายเงินระหว่าง flag OFF → ไม่ได้รับใบกำกับภาษี (admin ใช้ /resend/{id} ได้ภายหลัง)';
+                    if (!confirm(promptMsg)) return;
+                    t.disabled = true;
+                    api('POST', '/vat-toggle', { enabled: target ? '1' : '0' }).then(function(res){
+                        if (res.status === 200 && res.data.ok) {
+                            toast('✅ ' + (res.data.message || 'VAT toggled'), 'success');
+                            loadDiagnose();
+                        } else {
+                            toast('❌ ' + (res.data.message || res.data.error || 'Toggle failed'), 'error');
                         }
                         t.disabled = false;
                     });
