@@ -167,10 +167,13 @@ export async function handleSubmitOrder(opts) {
         const rateEl = (typeof document !== "undefined") ? document.getElementById("b2fExchangeRate") : null;
         exchangeRate = parseFloat((rateEl && /** @type {HTMLInputElement} */ (rateEl).value) || "0");
         if (!exchangeRate || exchangeRate <= 0) {
+            // V.0.7 P0.15 — highlight field + scroll-to + toast (was toast-only).
+            _highlightFieldError(rateEl, "กรุณากรอกอัตราแลกเปลี่ยน");
             showToast("กรุณากรอกอัตราแลกเปลี่ยน", "error");
             return;
         }
         if (!shipMethod) {
+            _highlightFieldError(shipMethodEl, "กรุณาเลือกวิธีส่ง");
             showToast("กรุณาเลือกวิธีส่ง", "error");
             return;
         }
@@ -278,6 +281,76 @@ function _renderCartErrorState(opts) {
 }
 
 /* V.0.5 P0.6 — _onBackToCart declared at module top with other state vars. */
+
+/**
+ * V.0.7 P0.15 — visually highlight a form field that failed validation +
+ * scroll it into view + announce the error via aria-live for screen readers.
+ * Auto-clears after 4s or on next input/change. Idempotent across re-renders.
+ *
+ * @param {Element|null} el
+ * @param {string} errorMessage  Thai message to associate via aria-describedby
+ */
+function _highlightFieldError(el, errorMessage) {
+    if (!el || typeof document === "undefined") return;
+    const target = /** @type {HTMLElement} */ (el);
+    // Apply red border + outline (works on both <input> and <select>)
+    const prevBorder = target.style.borderColor;
+    const prevOutline = target.style.outline;
+    const prevShadow = target.style.boxShadow;
+    target.style.borderColor = "#dc2626";
+    target.style.outline = "2px solid #fecaca";
+    target.style.outlineOffset = "1px";
+    target.style.boxShadow = "0 0 0 3px rgba(220, 38, 38, 0.15)";
+    target.setAttribute("aria-invalid", "true");
+
+    // Inline error message via aria-describedby + small red text below field
+    const errId = (target.id || "b2f-field") + "-error";
+    let errEl = document.getElementById(errId);
+    if (!errEl) {
+        errEl = document.createElement("div");
+        errEl.id = errId;
+        errEl.setAttribute("role", "alert");
+        errEl.style.cssText =
+            "margin-top:4px;font-size:12px;color:#dc2626;font-weight:500";
+        if (target.parentNode) {
+            target.parentNode.insertBefore(errEl, target.nextSibling);
+        }
+    }
+    errEl.textContent = errorMessage;
+    target.setAttribute("aria-describedby", errId);
+
+    // Scroll target into view (mobile-friendly — center the field).
+    // jsdom + older browsers may not have scrollIntoView at all; guard fully.
+    if (typeof target.scrollIntoView === "function") {
+        try {
+            target.scrollIntoView({ behavior: "smooth", block: "center" });
+        } catch (_e) {
+            try { target.scrollIntoView(); } catch (_e2) { /* swallow */ }
+        }
+    }
+    // Focus for keyboard users
+    try { target.focus({ preventScroll: true }); }
+    catch (_e) {
+        try { target.focus(); } catch (_e2) { /* focus unavailable */ }
+    }
+
+    // Auto-clear on next user interaction OR after 4s
+    const clear = () => {
+        target.style.borderColor = prevBorder;
+        target.style.outline = prevOutline;
+        target.style.boxShadow = prevShadow;
+        target.removeAttribute("aria-invalid");
+        target.removeAttribute("aria-describedby");
+        if (errEl && errEl.parentNode) {
+            errEl.parentNode.removeChild(errEl);
+        }
+        target.removeEventListener("input", clear);
+        target.removeEventListener("change", clear);
+    };
+    target.addEventListener("input", clear, { once: true });
+    target.addEventListener("change", clear, { once: true });
+    setTimeout(clear, 4000);
+}
 
 /**
  * Open the V.7.11 review gate (alias for loadCartView with state.currentView=review).
