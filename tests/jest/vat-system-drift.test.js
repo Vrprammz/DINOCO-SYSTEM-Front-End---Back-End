@@ -162,7 +162,7 @@ describe('VAT System Drift Detector — 2026-05-18 V.1.0', () => {
     test('CSV escape neutralizes formula triggers =/+/-/@ via prefix-quote', () => {
         const src = read('vat_export');
         // escape function should match formula trigger chars
-        expect(src).toMatch(/strpbrk\s*\([^,]+,\s*["']=\+\-@/);
+        expect(src).toMatch(/strpbrk\s*\([^,]+,\s*["']=\+-@/);
     });
 
     test('CSV escape strips embedded CR/LF', () => {
