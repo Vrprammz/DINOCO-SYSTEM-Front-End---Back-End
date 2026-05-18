@@ -1,22 +1,21 @@
 /**
- * B2F Admin LIFF E-Catalog — Maker Home loader (V.0.5 Round 4)
+ * B2F Admin LIFF E-Catalog — Maker Home loader (V.0.6 — Dead-Workflow Spec V.1.0 P0.9)
+ *
+ * V.0.6 (2026-05-18) P0.9 — Error state now uses renderRetryableError() with
+ * 🔄 retry + ← back navigation. Previously a plain `<div class="b2f-error">` with
+ * the API message had no actions — user trapped on error screen.
+ *
+ * V.0.5 Round 4 contract: maker cards now emit `data-action="pick-maker"`
+ * + `data-maker-id` and rely on the central event-delegation listener
+ * wired in entry.js.
  *
  * MIGRATION SOURCE: `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.15
  *   - line 1601: loadMakers() — fetch + render maker dropdown
- *
- * Round 4 contract: maker cards now emit `data-action="pick-maker"`
- * + `data-maker-id` and rely on the central event-delegation listener
- * wired in entry.js. The previous per-card `addEventListener` loop is
- * removed (drift detector enforces no `addEventListener` here).
- *
- * `setupMakerHome({ api, state, onPick })` once at bootstrap;
- * `loadMakerHome()` triggers fetch + render. Mount-tolerant — when the
- * Vite container `#b2f-catalog-app` exists it injects markup; inline
- * V.7.15 keeps owning #b2fMakerSelect until Round 5 cutover.
  */
 
 import { showLoading, hideLoading, showToast } from "../utils/dom.js";
 import { escHtml } from "../utils/format.js";
+import { renderRetryableError } from "../../../shared/error-state.js";
 
 /** @type {{ getMakers: Function }|null} */
 let _api = null;
@@ -95,14 +94,32 @@ export async function loadMakerHome() {
         // touch it. Round 4 will add the cut-over guard.
     } catch (err) {
         hideLoading();
-        showToast("โหลดรายชื่อโรงงานไม่สำเร็จ", "error");
         const e = /** @type {{ message?: string }} */ (err || {});
         const msg = e.message ? String(e.message) : "";
         if (mountVite) {
-            mountVite.innerHTML =
-                '<div class="b2f-error">โหลดรายชื่อโรงงานไม่สำเร็จ' +
-                (msg ? ": " + escHtml(msg) : "") +
-                "</div>";
+            // V.0.6 P0.9 — render full ErrorState with retry + back navigation
+            // instead of dead-end "<div class='b2f-error'>" with no actions.
+            renderRetryableError(mountVite, {
+                title: "โหลดรายชื่อโรงงานไม่สำเร็จ",
+                message: "ไม่สามารถโหลดรายชื่อโรงงานได้ในขณะนี้ — ตรวจสอบสัญญาณอินเทอร์เน็ตแล้วลองอีกครั้ง",
+                reason: msg,
+                code: "MAKER_LIST_LOAD_FAIL",
+                onRetry: () => loadMakerHome(),
+                onBack: () => {
+                    // Best-effort back navigation — close LIFF if in-app, else history.back
+                    try {
+                        const w = /** @type {any} */ (window);
+                        if (w.liff && typeof w.liff.isInClient === "function" && w.liff.isInClient()) {
+                            w.liff.closeWindow();
+                        } else if (typeof window !== "undefined" && window.history) {
+                            window.history.back();
+                        }
+                    } catch (_e) { /* swallow */ }
+                },
+            });
+        } else {
+            // Fallback toast if no mount available
+            showToast("โหลดรายชื่อโรงงานไม่สำเร็จ" + (msg ? ": " + msg : ""), "error");
         }
     }
 }

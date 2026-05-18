@@ -221,13 +221,22 @@ describe("setDetail loader", () => {
         expect(mount.innerHTML).toMatch(/Crash Bar SET/);
     });
 
-    test("loadSetDetail unknown sku shows toast (no mount mutation)", async () => {
+    test("loadSetDetail unknown sku renders ErrorState with retry/back (V.0.5 P0.10)", async () => {
+        // P0.10 — previously this test expected "no mount mutation" (toast-only).
+        // Now: render full ErrorState IN the mount so user gets retry + back actions
+        // instead of silent toast that disappears + leaves stale screen below.
         const mount = mountVite();
-        const initialHtml = mount.innerHTML;
         const state = { products: [], cart: {}, currency: "THB" };
         setupSetDetail({ api: {}, state, onAddToCart: () => true });
         await loadSetDetail("NONEXISTENT");
-        expect(mount.innerHTML).toBe(initialHtml);
+        // ErrorState renders role=alert + the not-found Thai message
+        expect(mount.innerHTML).toMatch(/role=["']alert["']/);
+        expect(mount.innerHTML).toMatch(/ไม่พบรายการนี้|ไม่พบ SET/);
+        // Retry + back buttons present
+        expect(mount.innerHTML).toMatch(/ลองอีกครั้ง/);
+        expect(mount.innerHTML).toMatch(/กลับ/);
+        // SKU embedded in error code for support
+        expect(mount.innerHTML).toMatch(/NONEXISTENT/);
     });
 
     test("handleStepperChange increments qty via onAddToCart", () => {

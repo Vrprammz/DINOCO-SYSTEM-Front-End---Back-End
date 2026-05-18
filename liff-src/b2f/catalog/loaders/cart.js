@@ -1,17 +1,22 @@
 /**
- * B2F Admin LIFF E-Catalog — Cart + Submit-PO loader (V.0.4 Round 3)
+ * B2F Admin LIFF E-Catalog — Cart + Submit-PO loader (V.0.5 — Dead-Workflow Spec V.1.0 P0.6)
  *
- * MIGRATION SOURCE: `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.15
- *   - line 3115-3170: submitOrder(force) — POST /create-po
- *   - line 1322:      loadCartFromStorage()
- *   - line 2798:      cart total computation
+ * V.0.5 (2026-05-18) P0.6 — Replaced toast-only error on cart submit (409 DUPLICATE_PO,
+ * generic API error, network failure) with renderErrorState() showing 🔄 retry button
+ * + ← back + reason inline. Previously toast disappeared after 5s leaving cart sheet
+ * unresponsive with no next action.
  *
- * Round 3 contract:
+ * V.0.4 Round 3 contract:
  *   `setupCart({ api, state })` once at bootstrap;
  *   `loadCartView()` renders cart sheet + manufacturing summary;
  *   `loadReviewGate()` renders the V.7.11 a11y review gate;
  *   `handleSubmitOrder({ force })` POSTs /create-po with idempotency key
  *   + clears cart on success + transitions to success screen.
+ *
+ * MIGRATION SOURCE: `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.15
+ *   - line 3115-3170: submitOrder(force) — POST /create-po
+ *   - line 1322:      loadCartFromStorage()
+ *   - line 2798:      cart total computation
  */
 
 import {
@@ -25,6 +30,7 @@ import { escHtml } from "../utils/format.js";
 import { clearCart } from "../utils/cart.js";
 import { renderCartItems, renderCartManufacturingSummary } from "../pages/cart.js";
 import { renderReviewGate } from "../pages/reviewGate.js";
+import { renderRetryableError } from "../../../shared/error-state.js";
 
 /** @type {any} */
 let _api = null;
@@ -32,12 +38,15 @@ let _api = null;
 let _state = null;
 /** @type {((poNumber: string, poId: string|number, warnings?: string[]) => void)|null} */
 let _onSuccess = null;
+/** @type {(() => void)|null} V.0.5 P0.6 — back navigation hook for error-state */
+let _onBackToCart = null;
 
 /**
  * @param {{
  *   api: object,
  *   state: object,
- *   onSuccess?: (poNumber: string, poId: string|number, warnings?: string[]) => void
+ *   onSuccess?: (poNumber: string, poId: string|number, warnings?: string[]) => void,
+ *   onBackToCart?: () => void
  * }} deps
  */
 export function setupCart(deps) {
@@ -47,6 +56,7 @@ export function setupCart(deps) {
     _api = deps.api;
     _state = /** @type {any} */ (deps.state);
     _onSuccess = typeof deps.onSuccess === "function" ? deps.onSuccess : null;
+    _onBackToCart = typeof deps.onBackToCart === "function" ? deps.onBackToCart : null;
 }
 
 /**
@@ -199,23 +209,75 @@ export async function handleSubmitOrder(opts) {
             if (_onSuccess) _onSuccess(res.po_number || "", res.po_id || "", res.warnings || []);
             showToast("สร้าง PO สำเร็จ!", "success");
         } else if (res && res.code === "DUPLICATE_PO") {
-            showToast(
-                (res.error || "PO ซ้ำ") +
-                (res.existing_po ? " (" + res.existing_po + ")" : ""),
-                "error"
-            );
+            // V.0.5 P0.6 — render full ErrorState with retry instead of toast
+            _renderCartErrorState({
+                title: "PO ซ้ำในระบบ",
+                message:
+                    (res.error || "พบ PO นี้อยู่ในระบบแล้ว") +
+                    (res.existing_po ? "\n\nเลขที่ PO: " + res.existing_po : ""),
+                code: "DUPLICATE_PO",
+                onRetry: () => handleSubmitOrder({ force: true }),
+                onBack: _onBackToCart,
+            });
         } else {
-            showToast((res && res.error) || "เกิดข้อผิดพลาด", "error");
+            _renderCartErrorState({
+                title: "สร้าง PO ไม่สำเร็จ",
+                message: (res && res.error) || "ระบบไม่สามารถสร้าง PO ได้ในขณะนี้",
+                reason: res && res.detail ? String(res.detail) : "",
+                code: res && res.code ? String(res.code) : "API_ERROR",
+                onRetry: () => handleSubmitOrder({ force }),
+                onBack: _onBackToCart,
+            });
         }
     } catch (err) {
         hideLoading();
         const e = /** @type {{ message?: string }} */ (err || {});
         const msg = e.message ? String(e.message) : "เชื่อมต่อเซิร์ฟเวอร์ไม่ได้";
-        showToast(msg, "error");
+        // V.0.5 P0.6 — Network/exception failures get retry button too
+        _renderCartErrorState({
+            title: "เชื่อมต่อเซิร์ฟเวอร์ไม่ได้",
+            message: "ไม่สามารถส่งคำสั่งซื้อให้เซิร์ฟเวอร์ได้ — ตรวจสอบสัญญาณอินเทอร์เน็ตแล้วลองอีกครั้ง",
+            reason: msg,
+            code: "NETWORK_ERROR",
+            onRetry: () => handleSubmitOrder({ force }),
+            onBack: _onBackToCart,
+        });
     } finally {
         if (submitBtn) unlockBtn(submitBtn);
     }
 }
+
+/**
+ * V.0.5 P0.6 — Render error state in dedicated mount point above cart actions.
+ * Mount point auto-created (or reused) below cart items.
+ * @param {Object} opts — { title, message, reason, code, onRetry, onBack }
+ */
+function _renderCartErrorState(opts) {
+    if (typeof document === "undefined") {
+        // Server-side or test env — fall back to toast
+        showToast(opts.message || "เกิดข้อผิดพลาด", "error");
+        return;
+    }
+    let mountEl = document.querySelector("#b2f-cart-error-mount");
+    if (!mountEl) {
+        // Inject mount point above cart submit button (preserves layout)
+        const submitBtn = document.querySelector(".b2f-cart-submit");
+        const parent =
+            (submitBtn && submitBtn.parentNode) ||
+            document.querySelector(".b2f-cart-actions") ||
+            document.body;
+        mountEl = document.createElement("div");
+        mountEl.id = "b2f-cart-error-mount";
+        if (parent && submitBtn) {
+            parent.insertBefore(mountEl, submitBtn);
+        } else if (parent) {
+            parent.appendChild(mountEl);
+        }
+    }
+    renderRetryableError(/** @type {HTMLElement} */ (mountEl), opts);
+}
+
+/* V.0.5 P0.6 — _onBackToCart declared at module top with other state vars. */
 
 /**
  * Open the V.7.11 review gate (alias for loadCartView with state.currentView=review).

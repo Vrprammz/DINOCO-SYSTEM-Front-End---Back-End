@@ -142,10 +142,16 @@ export function renderCartNoteSection() {
  * @param {Array<object>} items - cart items
  * @param {{ products?: Array<object>, editMode?: boolean }} [ctx]
  * @returns {{ html: string, total: number, isEmpty: boolean,
- *             confirmLabel: string, confirmDisabled: boolean }}
+ *             confirmLabel: string, confirmDisabled: boolean,
+ *             confirmDisabledReason: string, editMode: boolean }}
+ *
+ * V.0.6 (2026-05-18) P0.8 — return `confirmDisabledReason` for tooltip
+ * accessibility + `editMode` so caller can render edit-mode badge. Previously
+ * disabled submit button had no aria-label explaining why → users guessed.
  */
 export function renderCartItems(items, ctx) {
     const list = items || [];
+    const editMode = !!(ctx && ctx.editMode);
     if (!list.length) {
         return {
             html: renderCartEmptyState(),
@@ -153,6 +159,8 @@ export function renderCartItems(items, ctx) {
             isEmpty: true,
             confirmLabel: "กลับไปเลือกสินค้า",
             confirmDisabled: true,
+            confirmDisabledReason: "ตะกร้าว่าง — เพิ่มสินค้าเพื่อสั่งซื้อ",
+            editMode,
         };
     }
     let total = 0;
@@ -162,13 +170,14 @@ export function renderCartItems(items, ctx) {
         html += renderCartModalItem(it, ctx || {});
     });
     html += renderCartNoteSection();
-    const editMode = !!(ctx && ctx.editMode);
     return {
         html,
         total,
         isEmpty: false,
         confirmLabel: editMode ? "ยืนยันแก้ไข" : "ยืนยันสั่งสินค้า",
         confirmDisabled: false,
+        confirmDisabledReason: "",
+        editMode,
     };
 }
 

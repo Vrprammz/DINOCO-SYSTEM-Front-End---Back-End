@@ -102,6 +102,35 @@ export function loadCartModal() {
     if (submitBtn) {
         submitBtn.textContent = result.confirmLabel;
         submitBtn.disabled = !!result.confirmDisabled;
+        // V.0.6 P0.8 — surface disabled reason via aria-label + title tooltip.
+        // Previously disabled button had no explanation → user confused.
+        if (result.confirmDisabled && result.confirmDisabledReason) {
+            submitBtn.setAttribute("aria-label", result.confirmDisabledReason);
+            submitBtn.setAttribute("title", result.confirmDisabledReason);
+        } else {
+            submitBtn.removeAttribute("aria-label");
+            submitBtn.removeAttribute("title");
+        }
+    }
+
+    // V.0.6 P0.8 — edit-mode badge: visually indicate user is modifying an
+    // existing order vs creating new. Previously silent → users didn't realize.
+    if (result.editMode) {
+        const cartHeader = document.querySelector(".cart-modal-header, #cartModalHeader");
+        if (cartHeader && !cartHeader.querySelector("[data-role=edit-mode-badge]")) {
+            const badge = document.createElement("span");
+            badge.setAttribute("data-role", "edit-mode-badge");
+            badge.textContent = "✏️ กำลังแก้ไข";
+            badge.style.cssText =
+                "display:inline-block;margin-left:8px;padding:2px 8px;background:#fef3c7;color:#b45309;border-radius:10px;font-size:11px;font-weight:600;vertical-align:middle";
+            cartHeader.appendChild(badge);
+        }
+    } else {
+        // Remove badge if exists (cart re-opened without editMode)
+        const existingBadge = document.querySelector("[data-role=edit-mode-badge]");
+        if (existingBadge && existingBadge.parentNode) {
+            existingBadge.parentNode.removeChild(existingBadge);
+        }
     }
 }
 

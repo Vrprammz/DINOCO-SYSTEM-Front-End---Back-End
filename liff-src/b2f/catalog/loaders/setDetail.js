@@ -1,20 +1,22 @@
 /**
- * B2F Admin LIFF E-Catalog — SET Detail loader (V.0.4 Round 3)
+ * B2F Admin LIFF E-Catalog — SET Detail loader (V.0.5 — Dead-Workflow Spec V.1.0 P0.10)
+ *
+ * V.0.5 (2026-05-18) P0.10 — "ไม่พบรายการนี้" now renders full ErrorState
+ * with 🔄 retry (reload products + re-lookup) + ← back to catalog. Previously
+ * only toast appeared then user trapped on whatever screen was below.
+ *
+ * V.0.4 Round 3 contract: setupSetDetail({ api, state, onAddToCart }) once;
+ * loadSetDetail(sku) looks up SET + injects detail HTML. Stepper +/- via
+ * handleStepperChange(sku, delta).
  *
  * MIGRATION SOURCE: `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.15
  *   - line 2283: openSetDetail(sku) — full-page overlay
  *   - line 2443-2517: per-SET detail rendering + qty stepper wiring
- *
- * Round 3 contract:
- *   `setupSetDetail({ api, state, onAddToCart })` once at bootstrap;
- *   `loadSetDetail(sku)` looks up the SET in `state.products` (already
- *   cached by loadCatalog) + injects rendered detail HTML.
- *   `handleStepperChange(sku, delta)` updates cart + re-renders the
- *   stepper.
  */
 
 import { showToast } from "../utils/dom.js";
 import { escHtml } from "../utils/format.js";
+import { renderRetryableError } from "../../../shared/error-state.js";
 import {
     renderSetDetailItems,
     renderSetDetailMainStepper,
@@ -26,12 +28,15 @@ let _api = null;
 let _state = null;
 /** @type {((sku: string, qty: number, mode?: string, src?: string) => boolean)|null} */
 let _onAddToCart = null;
+/** @type {(() => void)|null} V.0.5 P0.10 — back-to-catalog navigation hook */
+let _onBackToCatalog = null;
 
 /**
  * @param {{
  *   api: object,
  *   state: object,
- *   onAddToCart?: (sku: string, qty: number, mode?: string, src?: string) => boolean
+ *   onAddToCart?: (sku: string, qty: number, mode?: string, src?: string) => boolean,
+ *   onBackToCatalog?: () => void
  * }} deps
  */
 export function setupSetDetail(deps) {
@@ -41,6 +46,7 @@ export function setupSetDetail(deps) {
     _api = deps.api;
     _state = /** @type {any} */ (deps.state);
     _onAddToCart = typeof deps.onAddToCart === "function" ? deps.onAddToCart : null;
+    _onBackToCatalog = typeof deps.onBackToCatalog === "function" ? deps.onBackToCatalog : null;
 }
 
 /**
@@ -54,18 +60,36 @@ export async function loadSetDetail(sku) {
     if (!_state) return;
     const targetSku = String(sku || "");
     if (!targetSku) return;
+    const mount = (typeof document !== "undefined")
+        ? document.getElementById("b2f-catalog-app")
+        : null;
     const products = _state.products || [];
     const product = products.find(function (p) {
         return String(p.sku) === targetSku ||
             String(p.sku).toUpperCase() === targetSku.toUpperCase();
     });
     if (!product) {
-        showToast("ไม่พบรายการนี้", "error");
+        // V.0.5 P0.10 — render full ErrorState with retry + back navigation
+        // instead of orphan toast that leaves user on stale screen.
+        if (mount) {
+            renderRetryableError(mount, {
+                title: "ไม่พบรายการนี้",
+                message: "ไม่พบ SET รหัส " + targetSku + " — อาจเป็นเพราะ catalog ยังโหลดไม่เสร็จ หรือสินค้านี้ถูกยกเลิก",
+                code: "SET_NOT_FOUND:" + targetSku,
+                onRetry: () => loadSetDetail(targetSku),
+                onBack: () => {
+                    if (_onBackToCatalog) {
+                        _onBackToCatalog();
+                    } else if (typeof window !== "undefined" && window.history) {
+                        window.history.back();
+                    }
+                },
+            });
+        } else {
+            showToast("ไม่พบรายการนี้", "error");
+        }
         return;
     }
-    const mount = (typeof document !== "undefined")
-        ? document.getElementById("b2f-catalog-app")
-        : null;
     if (!mount) return;
     const cart = _state.cart || {};
     const skuRelations = _state.skuRelations || {};
