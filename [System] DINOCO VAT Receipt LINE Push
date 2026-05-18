@@ -1,0 +1,483 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [System] DINOCO VAT Receipt LINE Push                           ║
+ * ║  Version: V.1.0 (2026-05-18)                                     ║
+ * ║  DB_ID: (assign after creation in WP)                            ║
+ * ║                                                                   ║
+ * ║  Purpose:                                                         ║
+ * ║    Bind cron hook `dinoco_sn_marketplace_receipt_async` (fired   ║
+ * ║    by SN REST API V.0.50+ at warranty extension apply time) →    ║
+ * ║    render VAT receipt PNG → push to customer LINE via Flex card. ║
+ * ║                                                                   ║
+ * ║  Boss directive 2026-05-18 (project_vat_policy_split.md):        ║
+ * ║    B2C marketplace orders MUST receive Thai VAT 7% receipt.      ║
+ * ║                                                                   ║
+ * ║  Flow:                                                            ║
+ * ║    1. `dinoco_sn_marketplace_receipt_async` fires with ext_id    ║
+ * ║    2. Resolve customer line_uid from sn_pool.registered_user_id  ║
+ * ║       → user meta `line_uid`                                      ║
+ * ║    3. Check eligibility via dinoco_vat_receipt_extension_is_     ║
+ * ║       eligible() — early exit if not paid / VAT settings missing ║
+ * ║    4. Render PNG via dinoco_vat_receipt_render_png()             ║
+ * ║    5. Persist to wp-content/uploads/dinoco-vat-receipts/         ║
+ * ║       with deterministic filename (extension_id-receipt_no.png)  ║
+ * ║    6. Build Flex card (header + amount + thumbnail + "ดูใบกำกับ"   ║
+ * ║       button → HTML version)                                     ║
+ * ║    7. Push via b2b_push_guaranteed() (retry queue if fail)       ║
+ * ║                                                                   ║
+ * ║  Idempotency:                                                     ║
+ * ║    - Postmeta-style flag on extension row (`vat_receipt_pushed`) ║
+ * ║      via wp_options key `dinoco_vat_pushed_{extension_id}` —     ║
+ * ║      30-day TTL transient. Re-fire on same ext = no-op.          ║
+ * ║                                                                   ║
+ * ║  Defensive:                                                       ║
+ * ║    - All deps function_exists guarded — snippet works standalone  ║
+ * ║    - No-op silently if line_uid missing (boss may want manual     ║
+ * ║      fallback for non-LINE customers — captured in Sentry)        ║
+ * ║    - Best-effort push: render failure logged but not re-tried    ║
+ * ║      (one-shot per extension; admin can manually re-trigger via   ║
+ * ║      REST endpoint `/resend/{id}`)                                ║
+ * ║                                                                   ║
+ * ║  Dependencies:                                                    ║
+ * ║    - dinoco_vat_receipt_* (NEW VAT Receipt snippet V.1.0)        ║
+ * ║    - b2b_push_guaranteed (B2B Snippet 1 V.34.0+)                 ║
+ * ║    - dinoco_sn_table (Manager V.0.32+)                           ║
+ * ║                                                                   ║
+ * ║  REST endpoint:                                                   ║
+ * ║    POST /dinoco-vat/v1/resend/{extension_id}  (admin only)       ║
+ * ║      → manual re-trigger if first push failed/customer requests  ║
+ * ║                                                                   ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. UPLOAD DIR HELPER — ensures wp-content/uploads/dinoco-vat-receipts/
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_push_upload_dir' ) ) {
+    function dinoco_vat_push_upload_dir() {
+        $u = wp_upload_dir();
+        $dir = trailingslashit( $u['basedir'] ) . 'dinoco-vat-receipts';
+        if ( ! file_exists( $dir ) ) {
+            wp_mkdir_p( $dir );
+        }
+        $url_base = trailingslashit( $u['baseurl'] ) . 'dinoco-vat-receipts';
+        return array(
+            'dir'      => $dir,
+            'url_base' => $url_base,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_vat_push_persist_png' ) ) {
+    /**
+     * Write PNG bytes to upload dir → return public URL.
+     * Filename deterministic: {ext_id}-{receipt_no}.png so re-renders
+     * overwrite (no orphan accumulation).
+     *
+     * @param int    $extension_id
+     * @param string $png_binary
+     * @return string public URL (https), or '' on failure
+     */
+    function dinoco_vat_push_persist_png( $extension_id, $png_binary ) {
+        if ( $png_binary === '' ) return '';
+        $extension_id = (int) $extension_id;
+        if ( ! function_exists( 'dinoco_vat_receipt_generate_receipt_no' ) ) return '';
+        $receipt_no = dinoco_vat_receipt_generate_receipt_no( $extension_id );
+        if ( $receipt_no === '' ) return '';
+
+        $paths = dinoco_vat_push_upload_dir();
+        $fname = $extension_id . '-' . $receipt_no . '.png';
+        $fpath = trailingslashit( $paths['dir'] ) . $fname;
+        $written = file_put_contents( $fpath, $png_binary );
+        if ( $written === false ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'vat_receipt_write_failed', array(
+                    'extension_id' => $extension_id,
+                    'path'         => $fpath,
+                ) );
+            }
+            return '';
+        }
+        // Force HTTPS for LINE API (rejects http://)
+        $url = trailingslashit( $paths['url_base'] ) . $fname;
+        $url = preg_replace( '#^http://#', 'https://', $url );
+        return $url;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. IDEMPOTENCY GUARD
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_push_is_already_sent' ) ) {
+    function dinoco_vat_push_is_already_sent( $extension_id ) {
+        $key = 'dinoco_vat_pushed_' . (int) $extension_id;
+        return (bool) get_transient( $key );
+    }
+}
+
+if ( ! function_exists( 'dinoco_vat_push_mark_sent' ) ) {
+    function dinoco_vat_push_mark_sent( $extension_id, $line_uid = '' ) {
+        $key = 'dinoco_vat_pushed_' . (int) $extension_id;
+        $payload = array(
+            'sent_at'  => current_time( 'mysql' ),
+            'line_uid' => (string) $line_uid,
+        );
+        // 30 day TTL — long enough that idempotency holds for retry burst
+        set_transient( $key, $payload, 30 * DAY_IN_SECONDS );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. LINE UID RESOLVER — customer-side push target
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_push_resolve_line_uid' ) ) {
+    /**
+     * Resolve LINE UID for the customer who owns the extension.
+     * Lookup chain:
+     *   1. extension.user_id → WP user meta `line_uid`
+     *   2. sn_pool.registered_user_id (fallback if extension.user_id missing)
+     *
+     * @param int $extension_id
+     * @return string LINE UID (Uxxxxxxxx... format) or '' if not found
+     */
+    function dinoco_vat_push_resolve_line_uid( $extension_id ) {
+        global $wpdb;
+        $extension_id = (int) $extension_id;
+        if ( $extension_id <= 0 ) return '';
+
+        $tbl_ext = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'extensions' ) : '';
+        if ( $tbl_ext === '' ) return '';
+
+        $ext = $wpdb->get_row( $wpdb->prepare(
+            "SELECT user_id, sn FROM {$tbl_ext} WHERE id = %d LIMIT 1", $extension_id
+        ) );
+        if ( ! $ext ) return '';
+
+        $uid = (int) $ext->user_id;
+        if ( $uid <= 0 ) {
+            // Fallback: lookup via sn_pool
+            $tbl_pool = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'pool' ) : '';
+            if ( $tbl_pool !== '' ) {
+                $uid = (int) $wpdb->get_var( $wpdb->prepare(
+                    "SELECT registered_user_id FROM {$tbl_pool} WHERE sn = %s LIMIT 1",
+                    strtoupper( (string) $ext->sn )
+                ) );
+            }
+        }
+        if ( $uid <= 0 ) return '';
+
+        $line_uid = (string) get_user_meta( $uid, 'line_uid', true );
+        // Some installations use `dinoco_line_uid` — fallback
+        if ( $line_uid === '' ) {
+            $line_uid = (string) get_user_meta( $uid, 'dinoco_line_uid', true );
+        }
+        return trim( $line_uid );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. FLEX BUILDER — receipt summary card with image preview
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_push_build_flex' ) ) {
+    /**
+     * Build LINE Flex bubble for receipt push.
+     * Returns array suitable for b2b_line_push_raw() messages payload.
+     *
+     * @param int    $extension_id
+     * @param string $image_url   public HTTPS URL of receipt PNG
+     * @return array Flex message
+     */
+    function dinoco_vat_push_build_flex( $extension_id, $image_url ) {
+        $d = function_exists( 'dinoco_vat_receipt_assemble_data' )
+            ? dinoco_vat_receipt_assemble_data( $extension_id )
+            : null;
+        if ( ! $d ) return array();
+
+        $receipt_url = home_url( '/wp-json/dinoco-vat/v1/receipt/' . (int) $extension_id . '?format=html' );
+
+        return array(
+            // 1. Image-only bubble (the receipt itself as thumbnail)
+            array(
+                'type'    => 'flex',
+                'altText' => '🧾 ใบกำกับภาษีต่ออายุประกัน ' . $d['receipt_no'],
+                'contents' => array(
+                    'type' => 'bubble',
+                    'size' => 'mega',
+                    'hero' => array(
+                        'type'    => 'image',
+                        'url'     => $image_url,
+                        'size'    => 'full',
+                        'aspectRatio' => '800:1130',
+                        'aspectMode'  => 'fit',
+                        'backgroundColor' => '#ffffff',
+                        'action'  => array(
+                            'type'  => 'uri',
+                            'label' => 'View full size',
+                            'uri'   => $image_url,
+                        ),
+                    ),
+                    'body' => array(
+                        'type'   => 'box',
+                        'layout' => 'vertical',
+                        'spacing' => 'sm',
+                        'contents' => array(
+                            array(
+                                'type'   => 'text',
+                                'text'   => '🧾 ใบกำกับภาษี / ใบเสร็จ',
+                                'weight' => 'bold',
+                                'size'   => 'md',
+                                'color'  => '#1f2937',
+                            ),
+                            array(
+                                'type' => 'text',
+                                'text' => $d['receipt_no'],
+                                'size' => 'sm',
+                                'color' => '#6b7280',
+                            ),
+                            array(
+                                'type' => 'separator',
+                                'margin' => 'md',
+                            ),
+                            array(
+                                'type'   => 'box',
+                                'layout' => 'baseline',
+                                'margin' => 'md',
+                                'contents' => array(
+                                    array(
+                                        'type' => 'text', 'text' => 'รายการ', 'size' => 'sm',
+                                        'color' => '#6b7280', 'flex' => 2,
+                                    ),
+                                    array(
+                                        'type' => 'text',
+                                        'text' => mb_substr( $d['item_desc'], 0, 40 ),
+                                        'size' => 'sm', 'flex' => 5, 'wrap' => true,
+                                        'color' => '#111827',
+                                    ),
+                                ),
+                            ),
+                            array(
+                                'type'   => 'box',
+                                'layout' => 'baseline',
+                                'margin' => 'sm',
+                                'contents' => array(
+                                    array(
+                                        'type' => 'text', 'text' => 'ยอดรวม (รวม VAT)',
+                                        'size' => 'sm', 'color' => '#6b7280', 'flex' => 3,
+                                    ),
+                                    array(
+                                        'type'   => 'text',
+                                        'text'   => '฿' . number_format( $d['grand_total'], 2 ),
+                                        'weight' => 'bold', 'size' => 'md',
+                                        'color' => '#16a34a', 'align' => 'end', 'flex' => 3,
+                                    ),
+                                ),
+                            ),
+                            array(
+                                'type' => 'text',
+                                'text' => 'VAT ' . number_format( $d['vat_rate'] * 100, 0 ) . '% = ฿' . number_format( $d['vat_amount'], 2 ),
+                                'size' => 'xs', 'color' => '#6b7280', 'align' => 'end',
+                            ),
+                        ),
+                    ),
+                    'footer' => array(
+                        'type'   => 'box',
+                        'layout' => 'vertical',
+                        'spacing' => 'sm',
+                        'contents' => array(
+                            array(
+                                'type'   => 'button',
+                                'style'  => 'primary',
+                                'color'  => '#1f2937',
+                                'height' => 'sm',
+                                'action' => array(
+                                    'type'  => 'uri',
+                                    'label' => '📄 ดูใบกำกับภาษีฉบับเต็ม',
+                                    'uri'   => $receipt_url,
+                                ),
+                            ),
+                            array(
+                                'type'   => 'text',
+                                'text'   => 'เก็บเอกสารนี้ไว้สำหรับยื่นภาษี',
+                                'size'   => 'xs',
+                                'color'  => '#6b7280',
+                                'align'  => 'center',
+                                'margin' => 'sm',
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. CORE HANDLER — bound to cron hook
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_vat_push_send_receipt' ) ) {
+    /**
+     * Main entry. Returns array { sent: bool, reason: string, image_url: string }.
+     * Idempotent — re-firing on same ext returns sent:true reason:already_sent.
+     *
+     * @param int $extension_id
+     * @return array
+     */
+    function dinoco_vat_push_send_receipt( $extension_id ) {
+        $extension_id = (int) $extension_id;
+        if ( $extension_id <= 0 ) {
+            return array( 'sent' => false, 'reason' => 'invalid_extension_id' );
+        }
+
+        // Idempotency — guard against duplicate cron fires
+        if ( dinoco_vat_push_is_already_sent( $extension_id ) ) {
+            return array( 'sent' => true, 'reason' => 'already_sent' );
+        }
+
+        // Eligibility check via VAT Receipt snippet
+        if ( ! function_exists( 'dinoco_vat_receipt_extension_is_eligible' ) ) {
+            return array( 'sent' => false, 'reason' => 'vat_receipt_snippet_missing' );
+        }
+        $eligible = dinoco_vat_receipt_extension_is_eligible( $extension_id );
+        if ( ! $eligible['eligible'] ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'info', 'vat_receipt_skip', array(
+                    'extension_id' => $extension_id,
+                    'reason'       => $eligible['reason'],
+                ) );
+            }
+            return array( 'sent' => false, 'reason' => $eligible['reason'] );
+        }
+
+        // LINE UID resolution
+        $line_uid = dinoco_vat_push_resolve_line_uid( $extension_id );
+        if ( $line_uid === '' ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'warning', 'vat_receipt_no_line_uid', array(
+                    'extension_id' => $extension_id,
+                    'hint'         => 'customer not linked via LINE — admin may need manual fallback',
+                ) );
+            }
+            return array( 'sent' => false, 'reason' => 'no_line_uid' );
+        }
+
+        // Render + persist PNG
+        if ( ! function_exists( 'dinoco_vat_receipt_render_png' ) ) {
+            return array( 'sent' => false, 'reason' => 'png_renderer_missing' );
+        }
+        $png = dinoco_vat_receipt_render_png( $extension_id );
+        if ( $png === '' ) {
+            return array( 'sent' => false, 'reason' => 'png_render_failed' );
+        }
+        $image_url = dinoco_vat_push_persist_png( $extension_id, $png );
+        if ( $image_url === '' ) {
+            return array( 'sent' => false, 'reason' => 'png_persist_failed' );
+        }
+
+        // Build Flex + push
+        $messages = dinoco_vat_push_build_flex( $extension_id, $image_url );
+        if ( empty( $messages ) ) {
+            return array( 'sent' => false, 'reason' => 'flex_build_failed' );
+        }
+
+        $push_ok = false;
+        if ( function_exists( 'b2b_push_guaranteed' ) ) {
+            // ticket_id=0 — extensions live in custom table, no CPT; failure logs
+            // to error_log via b2b_log but no auto-retry persistence (acceptable
+            // per "one-shot per extension" design).
+            $push_ok = (bool) b2b_push_guaranteed( $line_uid, $messages, 0, 'vat_receipt_extension' );
+        } elseif ( function_exists( 'b2b_line_push_raw' ) ) {
+            $r = b2b_line_push_raw( $line_uid, $messages );
+            $push_ok = is_array( $r ) && isset( $r['code'] ) && (int) $r['code'] === 200;
+        }
+
+        if ( $push_ok ) {
+            dinoco_vat_push_mark_sent( $extension_id, $line_uid );
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                $tbl_ext = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'extensions' ) : '';
+                global $wpdb;
+                $sn = $tbl_ext ? (string) $wpdb->get_var( $wpdb->prepare(
+                    "SELECT sn FROM {$tbl_ext} WHERE id = %d", $extension_id
+                ) ) : '';
+                if ( $sn !== '' ) {
+                    dinoco_sn_audit_log( strtoupper( $sn ), 'vat_receipt_pushed', null, null, array(
+                        'extension_id' => $extension_id,
+                        'line_uid'     => substr( $line_uid, 0, 4 ) . '****',
+                        'image_url'    => $image_url,
+                    ), 0, null, '', 'vat_receipt_line_push', false );
+                }
+            }
+            return array( 'sent' => true, 'reason' => 'ok', 'image_url' => $image_url );
+        }
+
+        if ( function_exists( 'dinoco_obs_capture' ) ) {
+            dinoco_obs_capture( 'warning', 'vat_receipt_push_failed', array(
+                'extension_id' => $extension_id,
+                'line_uid'     => substr( $line_uid, 0, 4 ) . '****',
+            ) );
+        }
+        return array( 'sent' => false, 'reason' => 'line_push_failed', 'image_url' => $image_url );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. CRON HOOK BINDING — wired to existing SN REST API V.0.50+ scheduler
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+add_action( 'dinoco_sn_marketplace_receipt_async', 'dinoco_vat_push_send_receipt', 10, 1 );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. REST ENDPOINT — admin manual resend (e.g. customer reports lost receipt)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+add_action( 'rest_api_init', function() {
+    register_rest_route( 'dinoco-vat/v1', '/resend/(?P<id>\d+)', array(
+        'methods'             => 'POST',
+        'callback'            => function( $req ) {
+            $id = (int) $req['id'];
+            // Force resend — clear idempotency guard first
+            delete_transient( 'dinoco_vat_pushed_' . $id );
+            $result = dinoco_vat_push_send_receipt( $id );
+            return rest_ensure_response( $result );
+        },
+        'permission_callback' => function() {
+            return current_user_can( 'manage_options' );
+        },
+        'args' => array(
+            'id' => array( 'sanitize_callback' => 'absint' ),
+        ),
+    ) );
+
+    // Admin diagnostic: dry-run check (does NOT push, just resolves data)
+    register_rest_route( 'dinoco-vat/v1', '/push-dry-run/(?P<id>\d+)', array(
+        'methods'             => 'GET',
+        'callback'            => function( $req ) {
+            $id = (int) $req['id'];
+            $eligibility = function_exists( 'dinoco_vat_receipt_extension_is_eligible' )
+                ? dinoco_vat_receipt_extension_is_eligible( $id )
+                : array( 'eligible' => false, 'reason' => 'vat_receipt_snippet_missing' );
+            $line_uid = dinoco_vat_push_resolve_line_uid( $id );
+            $already_sent = dinoco_vat_push_is_already_sent( $id );
+            return rest_ensure_response( array(
+                'extension_id' => $id,
+                'eligibility'  => $eligibility,
+                'line_uid_resolved' => $line_uid !== '',
+                'line_uid_mask' => $line_uid !== '' ? substr( $line_uid, 0, 4 ) . '****' : '',
+                'already_sent' => $already_sent,
+                'would_push'   => ! $already_sent && $eligibility['eligible'] && $line_uid !== '',
+            ) );
+        },
+        'permission_callback' => function() {
+            return current_user_can( 'manage_options' );
+        },
+        'args' => array(
+            'id' => array( 'sanitize_callback' => 'absint' ),
+        ),
+    ) );
+} );
