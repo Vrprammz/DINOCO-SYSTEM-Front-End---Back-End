@@ -127,7 +127,29 @@ LIMIT 10;
 
 ## Step 1 — Backup (MANDATORY, ~15 min)
 
-### 1.1 — Full junction + CPT dump
+### 1.0 — ใช้ DINOCO COMMAND v6.8 (boss's existing tool — recommended)
+
+บอสมี backup tool ของตัวเอง ที่ดีกว่า (full DB + files + WP-admin-auth + secret key gate):
+
+**URL**: `https://dinoco.in.th/manual_trigger.php?key={SECRET_KEY}`
+
+(secret key อยู่ใน `manual_trigger.php` constant `SECRET_KEY` — boss เก็บไว้)
+
+**ขั้นตอน** (boss-side, no SSH needed):
+
+1. Login เป็น WP admin ก่อน (`/wp-admin/`)
+2. เปิด URL `https://dinoco.in.th/manual_trigger.php?key=...`
+3. กดปุ่ม **"🚀 START SYSTEM"**
+4. รอ progress bar → ดู terminal log realtime
+5. หลัง `✅ ALL DONE` → backup file อยู่ที่ `/home/dinocoth/www/domains/dinoco.in.th/backups_script/` (path ตาม `daily_backup.php` config)
+
+**ครอบ**: junction + CPT + ทุก table ใน DB + WP files ครบ → safe สำหรับ destructive ops ทั้งหมด
+
+ถ้า DINOCO COMMAND v6.8 ไม่ work หรือบอสต้องการ alternative — ใช้ path 1.A / 1.B ด้านล่าง
+
+---
+
+### 1.A — ผ่าน WP CLI / SSH (alternative ถ้ามี SSH access)
 
 **ใช้ WP CLI (recommended — ปลอดภัยกว่า grep cut)** — `wp db` รัน mysqldump โดยอ่าน credentials จาก wp-config.php ตรงๆ ผ่าน WP loader, ไม่ต้อง parse password manually:
 
@@ -201,6 +223,41 @@ grep -c "^INSERT INTO" cpt-posts-2026-05-16.sql || echo "0 INSERT lines (multi-r
 ```
 
 ⚠️ **DO NOT proceed to Step 2** until all 3 .sql files verified non-empty + valid SQL syntax.
+
+---
+
+### 1.B — ผ่าน phpMyAdmin (no-SSH, มี cPanel)
+
+ถ้าบอส SSH ไม่ได้แต่มี cPanel/hosting control panel:
+
+1. เปิด **cPanel → phpMyAdmin** (เลือก database ของ DINOCO — น่าจะชื่อ `dinoco_main` หรือเปิดมาเลย default)
+2. เลือก **2 tables ที่ต้อง backup** (junction):
+   - คลิกตาราง `wp_dinoco_product_makers` → tab **Export** → format **SQL** → กด **Go** → save ไฟล์ `junction-product-makers-2026-05-18.sql`
+   - คลิกตาราง `wp_dinoco_maker_product_observations` → tab Export → SQL → Go → save
+3. Backup **CPT posts + postmeta** (filter by post_type):
+   - tab **SQL** บนสุด (ไม่ใช่ table-level)
+   - Run query:
+     ```sql
+     SELECT * FROM wp_posts WHERE post_type = 'b2f_maker_product';
+     ```
+   - หลัง query เสร็จ → ปุ่ม **"Export"** ที่ด้านล่าง → format SQL → save `cpt-posts-2026-05-18.sql`
+   - ทำซ้ำสำหรับ postmeta:
+     ```sql
+     SELECT * FROM wp_postmeta
+     WHERE post_id IN (SELECT ID FROM wp_posts WHERE post_type='b2f_maker_product');
+     ```
+   - Export → save `cpt-postmeta-2026-05-18.sql`
+4. Download ทั้ง 4 ไฟล์ลง Mac/PC บอส
+5. Verify: เปิดไฟล์ด้วย text editor → ขึ้นต้นด้วย `--` หรือ `CREATE TABLE` / `INSERT INTO` = OK
+
+**Recommendation สำหรับ DINOCO**:
+
+- **Primary**: ใช้ **DINOCO COMMAND v6.8** (Section 1.0 ด้านบน) — boss tool ที่ดีกว่า
+- Fallback (ถ้า DINOCO COMMAND ไม่ work):
+  - มี SSH → 1.A (wp-cli — เร็วสุด)
+  - มี cPanel → 1.B (phpMyAdmin)
+
+---
 
 ## Step 2 — Disable shadow_write (1 min)
 

@@ -1,233 +1,212 @@
-# Sentry Activation — Boss Step-by-Step Guide
+# Sentry Activation — Boss Guide (WP Sentry Integration Plugin Path)
 
-[← Runbooks index](../) · [← Original setup runbook](./SENTRY-ACTIVATION.md)
+[← Runbooks index](../)
 
-> **Status**: Ready to execute · Boss decision approved 2026-05-16 (#2 = "ใช้")
-> **Pre-req**: SSH access to WP server + WP admin
-> **Time to complete**: ~15-20 นาที (รวมเปิดบัญชี Sentry)
-> **Risk**: ต่ำ — flag default OFF, ทุก call site guarded by `class_exists('\Sentry\Client')`
+> **Status**: Ready · Boss installed **WP Sentry Integration** plugin already (verified 2026-05-18 screenshot)
+> **Revision**: V.4 (2026-05-18) — matches actual plugin UI ที่บอสเปิด `/wp-admin/tools.php?page=wp-sentry`
+> **Time to complete**: ~10-15 นาที (ทั้งหมดผ่าน WP admin + Code Snippets)
+> **Risk**: ต่ำ — plugin auto-load, ปิดได้ตลอด
 
 ---
 
-## ทำไมต้องใช้ Sentry
+## สถานะปัจจุบัน (จาก screenshot)
 
-- เวลา PHP fatal/exception เกิดบน production → ส่ง stack trace + ลูกค้าคนไหนเจอ + URL อะไร → dashboard
-- ปัจจุบันใช้แค่ `error_log` → ดูได้บน server console เท่านั้น + ไม่มี aggregation
-- Sentry = aggregator + alert + trends + release tracking
-- Free tier: 5,000 events/month — เพียงพอสำหรับ DINOCO ขนาดปัจจุบัน
+บอสเปิด WP Sentry Integration plugin settings แล้ว เห็น:
 
-## ขั้นตอน 5 step
+- ✅ Plugin installed + Sentry SDK for PHP `4.18.1` loaded
+- ✅ Browser SDK `8.55.0` loaded
+- ❌ **Integration** = Disabled (ทุก toggle ปิดอยู่)
+- ❌ `WP_SENTRY_PHP_DSN` constant ไม่ได้ตั้ง
+- ❌ `WP_SENTRY_BROWSER_DSN` constant ไม่ได้ตั้ง
+- ❌ "Send PHP test event" + "Send PHP test exception" buttons disabled (ต้อง enable integration ก่อน)
 
-### Step 1 — เปิดบัญชี Sentry (5 นาที)
+ต้องทำ 3 ขั้น: ตั้ง DSN constants → enable integration → test → wire DINOCO Observability
 
-1. ไป https://sentry.io/signup/
-2. Sign up ฟรี (เลือก "I'm using PHP")
-3. สร้าง project ใหม่ — เลือก platform **PHP** (ไม่ใช่ Laravel/Symfony)
-4. ตั้งชื่อ project: `dinoco-wp`
-5. Copy **DSN URL** (รูป `https://abc123@oXXXXX.ingest.sentry.io/YYYYY`)
-6. (Optional) สร้าง slack notification ใน Sentry Settings → Integrations
+---
 
-### Step 2 — Install Sentry PHP SDK บน WP server (5 นาที)
+## Step 1 — ตั้ง DSN constants ผ่าน Code Snippets (no-SSH, ~3 นาที)
 
-⚠️ **สำคัญ**: WordPress install ไม่มี `composer.json` ที่ root โดย default → ติดตั้ง composer require ที่ root อาจจะสร้าง `composer.json` + `vendor/` ใหม่ที่ WP root ซึ่ง autoload จะไม่ถูกพิจารณาเว้นแต่จะ require ตรง.
+WP Sentry Integration plugin อ่าน DSN จาก PHP constants (`WP_SENTRY_PHP_DSN` + `WP_SENTRY_BROWSER_DSN`). ปกติตั้งใน `wp-config.php` แต่บอส SSH ไม่ได้ → ใช้ Code Snippets แทน (โหลดเป็น must-use plugin → fire ก่อน Sentry plugin init)
 
-**Observability snippet V.1.2 มี `require_once vendor/autoload.php` แล้ว** (line ~104-107 ของ snippet — explicit `file_exists` guard + load) — รองรับ 2 path:
-
-1. `wp-content/vendor/autoload.php` (recommended location)
-2. `wp-content/plugins/sentry/vendor/autoload.php` (alternative)
-
-**Option A — Install ที่ `wp-content/` (recommended — ตรงกับ snippet expectation)**:
-
-SSH เข้า WP server แล้วรัน:
-
-```bash
-cd /var/www/dinoco.in.th/wp-content   # ปรับ path ถ้าต่าง
-
-# ติดตั้ง composer ถ้ายังไม่มี
-if ! command -v composer &>/dev/null; then
-    curl -sS https://getcomposer.org/installer | php
-    mv composer.phar /usr/local/bin/composer
-    chmod +x /usr/local/bin/composer
-fi
-
-# ติดตั้ง Sentry SDK
-composer require sentry/sentry
-
-# Verify autoload + class loaded
-php -r "require 'vendor/autoload.php'; echo class_exists('\\Sentry\\Client') ? 'OK\\n' : 'FAIL\\n';"
-# Expected: OK
-```
-
-**Option B — Install เป็น mu-plugin (alternative)**:
-
-```bash
-mkdir -p /var/www/dinoco.in.th/wp-content/mu-plugins/sentry-bootstrap
-cd /var/www/dinoco.in.th/wp-content/mu-plugins/sentry-bootstrap
-composer require sentry/sentry
-# จากนั้นเพิ่มไฟล์ loader.php ที่ require '../wp-content/mu-plugins/sentry-bootstrap/vendor/autoload.php';
-```
-
-(Option A เร็วและตรงกับ snippet code path ปัจจุบัน — แนะนำ unless มี constraint ที่ใส่ที่ `wp-content/vendor/` ไม่ได้)
-
-**Verify ก่อนไป Step 3**:
-
-```bash
-# Check class exists from WP context (loads wp-config.php + plugins)
-wp --path=/var/www/dinoco.in.th eval 'echo class_exists("\\Sentry\\Client") ? "OK" : "FAIL — vendor autoload path mismatch";'
-# Expected: OK
-
-# Check Observability snippet has proper autoload code
-wp --path=/var/www/dinoco.in.th eval 'echo function_exists("dinoco_obs_capture") ? "OK" : "FAIL — Observability snippet not active";'
-# Expected: OK
-```
-
-### Step 3 — เพิ่ม DSN constant ใน wp-config.php (2 นาที)
-
-แก้ไฟล์ `wp-config.php`:
-
-```bash
-sudo nano /var/www/dinoco.in.th/wp-config.php
-```
-
-เพิ่ม **ก่อน** บรรทัด `/* That's all, stop editing! */`:
+1. WP admin → **Snippets → Add New**
+2. ตั้งชื่อ: `🔬 Set Sentry DSN constants`
+3. Type: **PHP Snippet**
+4. Run: **Everywhere** (สำคัญ — ต้อง run ตลอดทุก request, ไม่ใช่ run once)
+5. Paste โค้ดนี้ (แทน `YOUR_DSN_HERE` ด้วย DSN ที่บอสได้จาก Sentry):
 
 ```php
-// ========== Sentry Error Tracking ==========
-define( 'DINOCO_SENTRY_DSN', 'https://abc123@oXXXXX.ingest.sentry.io/YYYYY' );
-define( 'DINOCO_SENTRY_ENV', 'production' );            // 'staging' ถ้า test ก่อน
-define( 'DINOCO_SENTRY_SAMPLE_RATE', 0.1 );             // 10% transactions
-```
-
-แทนที่ DSN ด้วยอันจริงจาก Step 1.5
-
-### Step 4 — Flip flag ON (1 นาที)
-
-ทางใดทางหนึ่ง:
-
-**ทาง A — WP CLI** (เร็วสุด):
-```bash
-wp option update dinoco_obs_sentry_enabled '1'
-wp option update dinoco_obs_correlation_enabled '1'    # bonus — X-Request-ID headers
-```
-
-**ทาง B — phpMyAdmin** (ถ้าไม่มี WP CLI):
-```sql
-INSERT INTO wp_options (option_name, option_value, autoload)
-VALUES ('dinoco_obs_sentry_enabled', '1', 'no')
-ON DUPLICATE KEY UPDATE option_value = '1';
-
-INSERT INTO wp_options (option_name, option_value, autoload)
-VALUES ('dinoco_obs_correlation_enabled', '1', 'no')
-ON DUPLICATE KEY UPDATE option_value = '1';
-```
-
-**ทาง C — Admin Command Center** (ถ้าหน้า Config Layer Viewer พร้อม):
-- `/admin-command-center/#config`
-- หา `obs.sentry_enabled` → toggle ON
-- หา `obs.correlation_enabled` → toggle ON
-
-### Step 5 — Verify (5 นาที)
-
-**Test 1 — Trigger test event via WP CLI** (ไม่ต้องสร้างไฟล์ — ปลอดภัยกว่า):
-
-```bash
-# Run จาก SSH session
-wp --path=/var/www/dinoco.in.th eval '
-if ( function_exists( "dinoco_obs_capture" ) ) {
-    dinoco_obs_capture( "error", "Sentry test " . current_time( "mysql" ), array( "context" => "boss_manual_test" ) );
-    echo "Sent! Check Sentry dashboard ภายใน 1 นาที\\n";
-} else {
-    echo "ERROR: dinoco_obs_capture not found — Observability snippet ไม่ sync\\n";
+// Set DSN constants for WP Sentry Integration plugin
+// Same DSN ใช้ทั้ง PHP + Browser (Sentry แยก project แต่ DINOCO ใช้รวม)
+if ( ! defined( 'WP_SENTRY_PHP_DSN' ) ) {
+    define( 'WP_SENTRY_PHP_DSN', 'YOUR_DSN_HERE' );
 }
-'
+if ( ! defined( 'WP_SENTRY_BROWSER_DSN' ) ) {
+    define( 'WP_SENTRY_BROWSER_DSN', 'YOUR_DSN_HERE' );
+}
+// Optional — Send PII (user info attached to errors — useful for debug)
+if ( ! defined( 'WP_SENTRY_SEND_DEFAULT_PII' ) ) {
+    define( 'WP_SENTRY_SEND_DEFAULT_PII', true );
+}
+// Optional — Traces sample rate (0.1 = 10% transactions for performance monitoring)
+if ( ! defined( 'WP_SENTRY_TRACES_SAMPLE_RATE' ) ) {
+    define( 'WP_SENTRY_TRACES_SAMPLE_RATE', 0.1 );
+}
 ```
 
-✅ Pattern นี้ปลอดภัยกว่า "drop test PHP file ใน wp-content" เพราะ:
+6. กด **Save Changes and Activate**
 
-- ไม่มี publicly-accessible file ค้าง (race condition กับ bot scan)
-- ไม่มี risk ของ wp-load.php path สมมุติผิด (multisite / Bedrock / hardened install)
-- WP CLI โหลด full WP context ครบ + ไม่ต้องลบไฟล์ทีหลัง
+**ห้าม Run Once** — ต้อง snippet active ตลอด (define constant ทุก request)
 
-**Test 2 — เช็ค Sentry dashboard**:
+### Verify constants ตั้งสำเร็จ
 
-- ไป <https://sentry.io> → project `dinoco-wp` → Issues
-- ภายใน 30 วินาที จะเห็น event "Sentry test ..."
+1. กลับไปที่ **Tools → Sentry** (หน้าเดิมที่บอสเปิด screenshot)
+2. Refresh หน้า (Cmd+R)
+3. ดูที่ **PHP integration** section → ตรง "WP_SENTRY_PHP_DSN contains a valid DSN" — ข้อความจะหายไป (เพราะ DSN valid แล้ว)
+4. ดูที่ **Browser integration** — เหมือนกัน ข้อความ DSN warning หายไป
 
-**Test 3 — เช็ค X-Request-ID header** (correlation):
+ถ้ายังเห็น warning → snippet save ไม่สำเร็จ หรือ "Run Everywhere" ไม่ได้เลือก
 
-```bash
-# Test ทั้ง authenticated + unauthenticated paths
-# Unauthenticated (จะคืน 401 — แต่ header X-Request-ID ก็ต้อง emit):
-curl -I https://dinoco.in.th/wp-json/dinoco-stock/v1/stock/list?per_page=1
+---
 
-# Authenticated (ต้อง pass nonce + cookie):
-curl -I -H "Cookie: wordpress_logged_in_XXX=..." \
-     -H "X-WP-Nonce: ..." \
-     https://dinoco.in.th/wp-json/dinoco-stock/v1/stock/list?per_page=1
+## Step 2 — Enable Integration toggles (~1 นาที)
 
-# Response headers ต้องมี:  X-Request-ID: req_XXXXXXXX
-# Header นี้ emit ผ่าน rest_post_dispatch filter ใน Observability snippet
-# — fire บน ทั้ง 200 และ 401/403/4xx responses
+ที่หน้า **Tools → Sentry**:
+
+1. Section **PHP integration** → คลิก ✅ Enabled checkbox
+2. Section **Browser integration** → คลิก ✅ Enabled checkbox
+3. (Optional) Section **Tracing** → ✅ Enabled (สำหรับ performance monitoring)
+4. (Optional) Section **Identify Users** → ✅ Enabled (attach user info to errors — useful)
+5. Save (อาจ auto-save แล้วแต่ plugin version)
+
+---
+
+## Step 3 — Test ว่า Sentry รับ event (~2 นาที)
+
+**Test A — ปุ่มในหน้า plugin** (เร็วสุด):
+
+1. ที่หน้า **Tools → Sentry** → scroll หา "Test PHP integration" section
+2. กดปุ่ม **"Send PHP test event"** (จะ enable ได้แล้วหลัง Step 2)
+3. กดปุ่ม **"Send PHP test exception"**
+4. ภายใน 30 วินาที → ไปดู Sentry dashboard → **Issues** tab → ต้องเห็น 2 events
+
+**Test B — ผ่าน Code Snippets** (ทดสอบ DINOCO function):
+
+1. Snippets → Add New → ชื่อ `🧪 Sentry test DINOCO capture`
+2. Type: PHP Snippet, Run: **Only run once**
+3. Paste:
+
+```php
+if ( function_exists( 'dinoco_obs_capture' ) ) {
+    dinoco_obs_capture(
+        'error',
+        'DINOCO Sentry test from boss — ' . current_time( 'mysql' ),
+        array( 'context' => 'manual_test', 'source' => 'code_snippets' )
+    );
+    echo '✅ Sent! Check Sentry dashboard ภายใน 30 วินาที';
+} else {
+    echo '❌ ERROR: dinoco_obs_capture() not found — DINOCO Observability snippet ไม่ active';
+}
 ```
 
-**หมายเหตุ cache layer**: หลัง flip flag `dinoco_obs_correlation_enabled='1'` Observability snippet V.1.2 มี H7 alloptions cache bust (static guard) — แต่ถ้า WordPress cache plugin มี aggressive caching ที่ stale value → flush manually:
+4. กด **Run Once**
+5. ดู Sentry dashboard
 
-```bash
-wp --path=/var/www/dinoco.in.th cache flush
+✅ ถ้าเห็น 3 events (PHP test + exception test + DINOCO capture) = setup สำเร็จครบ
+
+ลบ snippet "🧪 Sentry test" หลังเทสเสร็จ
+
+---
+
+## Step 4 — Activate DINOCO Observability flag (~1 นาที)
+
+ตอนนี้ WP Sentry plugin ทำงานแล้ว แต่ DINOCO Observability snippet ยัง flag OFF — ต้อง flip flag เพื่อให้ `dinoco_obs_capture()` calls ส่งเข้า Sentry จริง
+
+Snippets → Add New → ชื่อ `🔬 Activate DINOCO Observability flags`
+Type: PHP Snippet, Run: **Only run once**
+
+```php
+update_option( 'dinoco_obs_sentry_enabled', '1', false );
+update_option( 'dinoco_obs_correlation_enabled', '1', false );
+// Bust alloptions cache (V.1.2 H7 fix)
+wp_cache_delete( 'alloptions', 'options' );
+echo '✅ DINOCO Sentry + Correlation IDs ON';
 ```
+
+กด **Run Once** → ลบ snippet
+
+หลังจากนี้:
+
+- DINOCO snippets เรียก `dinoco_obs_capture()` → ส่ง event เข้า Sentry
+- REST response มี `X-Request-ID: req_XXX` header (ตามได้ใน log)
+
+---
+
+## Step 5 — Verify end-to-end (~1 นาที)
+
+DevTools → Network tab → refresh `/admin-command-center/`:
+
+- หา REST request ใดก็ได้ → Response Headers → ต้องมี `X-Request-ID: req_XXXXXXXX`
+
+ถ้ามี = correlation working ✅
+
+---
 
 ## Troubleshooting
 
-| Symptom | สาเหตุ | แก้ |
+| อาการ | สาเหตุ | แก้ |
 |---|---|---|
-| Test 1 echo "ERROR: dinoco_obs_capture not found" | Observability snippet (V.1.2+) ไม่อยู่ใน WP | ตรวจ Sync Dashboard ว่า snippet sync แล้ว |
-| Test 1 echo "Sent!" แต่ Sentry ไม่มี event | DSN ผิด หรือ network block | ดู error_log: `tail -f /var/log/php-fpm/error.log` หา `[DINOCO_OBS]` |
-| Test 3 ไม่มี `X-Request-ID` header | flag `obs.correlation_enabled` ยังเป็น `'0'` | re-run Step 4 ทาง B |
-| Sentry dashboard มี event แต่ stack trace empty | normal สำหรับ manual capture | จะมี stack เต็มเฉพาะ exception ที่เกิดจริง |
-| Event count กระโดด >100/วัน | ระบบ broken บางจุด — ดู top events | แก้ root cause ก่อน เพราะ Sentry free tier 5K/เดือน |
+| Step 1 — Constants ไม่ถูกตั้ง (refresh แล้วยังเห็น warning) | Snippet save ไม่สำเร็จ หรือ Run scope ไม่ใช่ Everywhere | กลับไปแก้ snippet → ตั้ง Run = Everywhere → Save again |
+| Step 3A — Test buttons ยัง disabled | Integration toggles ยังไม่ Enabled (Step 2) | re-check Step 2 toggles |
+| Step 3 — Test event ส่งแล้ว Sentry ไม่เห็น | DSN ผิด หรือ network block | (1) ตรวจ DSN ใน Sentry project settings ว่าตรง (2) curl test: `curl -sv https://[ingest_host]/api/...` (3) Sentry dashboard → Project Settings → Inbound Filters: ตรวจไม่มี filter ที่ block |
+| Step 5 — ไม่มี X-Request-ID header | Step 4 flag ยังไม่ flip | re-run Step 4 snippet |
+| Sentry dashboard มี duplicate events | Both WP plugin + DINOCO snippet capture event เดียวกัน | OK ไม่ใช่บัค — DINOCO `dinoco_obs_capture()` ส่ง event เพิ่มจาก WP plugin auto-capture. ถ้าอยาก dedupe → ใช้ Sentry fingerprint rules ใน dashboard |
 
-## Rollback (ถ้าเกิดปัญหา)
+## Rollback (instant — no SSH)
 
-ปิด instant ทาง WP CLI:
-```bash
-wp option update dinoco_obs_sentry_enabled '0'
-wp option update dinoco_obs_correlation_enabled '0'
+Snippets → Add New → ชื่อ `🛑 Rollback Sentry`:
+
+```php
+update_option( 'dinoco_obs_sentry_enabled', '0', false );
+update_option( 'dinoco_obs_correlation_enabled', '0', false );
+echo '✅ Rolled back';
 ```
 
-หรือ phpMyAdmin: `UPDATE wp_options SET option_value='0' WHERE option_name IN ('dinoco_obs_sentry_enabled', 'dinoco_obs_correlation_enabled');`
+Run Once → ลบ snippet
+
+ปิด integration ทั้งหมด:
+
+1. Tools → Sentry → uncheck Enabled toggles
+2. Plugins → WP Sentry Integration → Deactivate (เก็บได้ ใช้ทีหลัง — หรือ Delete ถ้าไม่ใช้)
+3. Snippets → deactivate "🔬 Set Sentry DSN constants"
 
 **ผลของ rollback**:
-- `dinoco_obs_capture()` กลายเป็น no-op (skip Sentry SDK call)
+
+- DINOCO `dinoco_obs_capture()` กลายเป็น no-op
 - `X-Request-ID` header หยุด emit
-- ระบบทำงานเหมือนเดิม (ก่อน activate)
+- WP Sentry plugin ก็ปิด → ไม่ส่ง event อะไรทั้งสิ้น
 
 ## Monitoring after launch
 
-วันแรก: ดู Sentry dashboard ทุก 2-3 ชม. ดูว่ามี error storm หรือไม่
-สัปดาห์แรก: ดู daily — focus top 3 issues
-หลังจากนั้น: Sentry จะส่ง weekly digest email
-
-## Boss decision pending
-
-หลัง 1 สัปดาห์ใช้งาน:
-- ถ้า event < 500/วัน → free tier เพียงพอ ตลอด
-- ถ้า event > 1000/วัน → upgrade Team plan ($26/mo) เพิ่ม retention + integrations
-- ถ้า top issues = noise (เช่น bot scan 404) → filter rules ใน Sentry
+- วันแรก: ดู Sentry dashboard ทุก 2-3 ชม. ดูว่ามี error storm ไหม
+- สัปดาห์แรก: ดู daily — focus top 3 issues
+- หลังจากนั้น: Sentry ส่ง weekly digest email อัตโนมัติ
+- ถ้า events > 5K/เดือน → consider upgrade Team plan ($26/mo)
+- ถ้า top issues = noise (bot scan 404) → set "Inbound Filters" ใน Sentry project settings
 
 ## Related files
 
 - [`[Admin System] DINOCO Observability`](../../%5BAdmin%20System%5D%20DINOCO%20Observability) V.1.2+ (H7-safe)
-- [Original setup runbook](./SENTRY-ACTIVATION.md) (more technical detail)
-- [`docs/compliance/PDPA-BASICS.md`](../compliance/PDPA-BASICS.md) (PII redact rules — already wired in `dinoco_obs_redact_context()`)
+- WP Sentry Integration plugin: <https://wordpress.org/plugins/wp-sentry-integration/>
+- [`docs/compliance/PDPA-BASICS.md`](../compliance/PDPA-BASICS.md) (PII redact rules — `dinoco_obs_redact_context()`)
 
 ## Audit notes
 
-This runbook was **revised V.2 (2026-05-17)** after audit found V.1 had:
+V.4 (2026-05-18) — boss installed WP Sentry Integration plugin successfully (verified screenshot) แต่ยังไม่ได้ตั้ง DSN constants หรือ enable toggles. Runbook V.3 (general WP plugin install) replaced with V.4 (specific to actual plugin บอสใช้)
 
-- ⚠️ Vague composer install location (assumed WP root has `composer.json` — most installs don't) → V.2 specifies `wp-content/vendor/` ตรงกับ Observability snippet expectation + Option B alternative
-- ⚠️ Test file drop in `wp-content/sentry-test.php` posed security risk (publicly-accessible PHP, race condition with bot scans, wp-load.php path assumption) → V.2 uses `wp cli eval` instead (no file artifact, full WP context, no cleanup needed)
-- ⚠️ Missing pre-Step 3 verify (class_exists + function_exists check) → V.2 adds `wp eval` smoke test after install
-- ⚠️ Missing cache flush note after flag flip (alloptions cache may serve stale '0') → V.2 adds `wp cache flush` step
-- ⚠️ Test 3 curl assumed authenticated but didn't pass nonce → V.2 documents both auth + unauth paths (header should emit on both)
+V.3 → V.4 changes:
 
-V.2 corrected to safer install pattern + WP CLI testing + cache flush awareness. Verified Observability snippet V.1.2 autoload code path (line ~104-107 file_exists guard) + H7 alloptions bust (line ~58-60 static guard).
+- Step 1 specifies exact constants `WP_SENTRY_PHP_DSN` + `WP_SENTRY_BROWSER_DSN` (จาก plugin UI screenshot)
+- Step 2 added Enable Integration toggles step (plugin defaults to disabled)
+- Step 3 uses plugin's built-in "Send PHP test event" + "Send PHP test exception" buttons + DINOCO capture function for triple verification
+- All steps use Code Snippets (no SSH needed throughout)
+- Rollback path documented ทุก layer (plugin / constants / DINOCO flags)
